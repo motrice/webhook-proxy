@@ -170,10 +170,13 @@ clippy:
 test:
     cargo test --workspace --all-targets
 
-# Hexagonal boundaries. Fails if the dependency arrows stop pointing inward.
+# The executable architecture rules: `boundaries` proves the dependency arrows
+# point inward, `purity` proves the domain reaches for no effects. Run the whole
+# crate rather than one test file, so a new rule is enforced the moment it lands
+# instead of waiting for someone to remember to add it here.
 [group('rust')]
 arch:
-    cargo test -p architecture --test boundaries
+    cargo test -p architecture
 
 # Unused dependencies — often the first sign of a layer drifting.
 [group('rust')]

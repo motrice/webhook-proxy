@@ -93,9 +93,10 @@ no more than this:
 - **You may** commit, and push to a `bead/*` branch, and open a PR.
 - **You must not** merge a PR, push to `main`, force-push a branch anyone else
   may have, or edit CI workflow files without a `decision` bead.
-- **You must not** widen a boundary in `crates/architecture/tests/boundaries.rs`
-  in the same commit as a feature. Separate commit, referencing a `decision`
-  bead, so review sees that the architecture changed.
+- **You must not** weaken a rule in `crates/architecture/` — widening
+  `allowed_external`, or adding an exemption to the forbidden-effects list — in
+  the same commit as a feature. Separate commit, referencing a `decision` bead,
+  so review sees that the architecture changed.
 
 If the gate will not go green, stop and report the failure. Do not disable a
 test, add `#[ignore]`, loosen an assertion, or reach for `--no-verify`. A red
@@ -114,8 +115,19 @@ Hexagonal, enforced by `cargo test -p architecture`:
 | `crates/app` | all of the above | composition root; wiring only |
 
 Adapters may not depend on each other. Nothing may depend on `architecture`.
-The test fails the build with an explanation naming the fix, so read the message
-before changing a manifest.
+
+Two rules, both executable:
+
+- **`boundaries`** reads the dependency graph from `cargo metadata` and fails if
+  an arrow points outward.
+- **`purity`** reads the source text of `crates/domain` and fails on
+  `SystemTime`, `Instant`, `std::env`, `std::fs`, `std::net`, `std::io`,
+  `std::thread` or `std::process`. These live in `std`, so they need no
+  dependency entry and `boundaries` is blind to them. Test modules are not
+  exempt: a domain test that needs the clock is evidence the logic is not pure.
+
+Both fail with the file, the line and what to do instead, so read the message
+before changing a manifest or reaching for an exemption.
 
 Time, randomness, I/O and serialisation are effects and live behind ports —
 see the `port-and-adapter` skill. `GLOSSARY.md` is a hard constraint on naming,
@@ -162,6 +174,6 @@ Load the skill before doing the thing, not after:
 | Doing | Skill |
 | ----- | ----- |
 | writing or changing any production code | `red-green-refactor` |
-| adding a domain concept, type or invariant | `domain-modeling` |
+| adding a domain concept, type or invariant | `domain-modelling` |
 | anything touching I/O, time, or randomness | `port-and-adapter` |
 | turning a request into beads; splitting an epic | `bead-grooming` |
