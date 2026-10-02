@@ -64,12 +64,14 @@ jobs:
       - name: just check
         run: just check
 
-  # The hexagon, called out as its own required check so a boundary change is
-  # visible in the PR's check list rather than buried in the check job's log.
+  # The hexagon, called out as its own required check so an architectural change
+  # is visible in the PR's check list rather than buried in the check job's log.
+  # Covers both rules: dependency direction and the domain's freedom from
+  # effects.
   architecture:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Dependency direction
-        run: cargo test -p architecture --test boundaries -- --nocapture
+      - name: Architecture rules
+        run: cargo test -p architecture -- --nocapture
