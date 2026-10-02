@@ -5,3 +5,10 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Rust
+/target/
+*.pdb
+
+# Generated artefacts
+/sbom.spdx.json

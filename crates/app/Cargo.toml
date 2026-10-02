@@ -1,0 +1,21 @@
+[package]
+name = "app"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+application = { path = "../application" }
+domain = { path = "../domain" }
+
+
+# `domain` is a structural dependency: it expresses the hexagon even while the
+# core is still empty. Delete this block once the domain has types that are
+# actually imported — after that, cargo-machete is telling the truth again.
+[package.metadata.cargo-machete]
+ignored = ["domain", "application"]
+
+[lints]
+workspace = true
