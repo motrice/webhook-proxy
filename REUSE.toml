@@ -1,0 +1,33 @@
+version = 1
+
+# Blanket annotations keep SPDX headers out of every source file while staying
+# REUSE-compliant, which is what reusable-ci's devbasecheck verifies.
+#
+# ASSUMPTION — confirm before the first public push: copyright holder and
+# licence. To change the licence:
+#   reuse download <SPDX-ID> && rm LICENSES/EUPL-1.2.txt
+#   then update SPDX-License-Identifier below and `license` in Cargo.toml.
+
+[[annotations]]
+path = "crates/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Motrice AB"
+SPDX-License-Identifier = "EUPL-1.2"
+
+[[annotations]]
+path = ["Cargo.toml", "Cargo.lock", "justfile", "rust-toolchain.toml", "REUSE.toml"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Motrice AB"
+SPDX-License-Identifier = "EUPL-1.2"
+
+[[annotations]]
+path = ["**.md", "docs/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Motrice AB"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = [".github/**", ".forgejo/**", ".claude/**", ".beads/**", ".agents/**", ".codex/**", ".cursor/**", ".gitignore"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Motrice AB"
+SPDX-License-Identifier = "CC0-1.0"

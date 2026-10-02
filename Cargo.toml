@@ -1,0 +1,23 @@
+# Hexagonal workspace. The dependency direction is enforced by a test, not by
+# convention: see crates/architecture/tests/boundaries.rs
+#
+#   domain       <- pure. zero dependencies. no I/O, no async, no frameworks.
+#   application  <- use cases + ports (traits). depends on domain only.
+#   adapters/*   <- implement ports. depend on application + domain. never on each other.
+#   app          <- composition root. the only crate allowed to wire adapters.
+[workspace]
+resolver = "3"
+members = ["crates/domain", "crates/application", "crates/app", "crates/architecture"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "EUPL-1.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

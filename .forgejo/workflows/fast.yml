@@ -1,0 +1,43 @@
+# The fast inner loop. Runs on the local Forgejo for every push, including
+# bead branches, so an agent gets an answer in seconds without spending
+# GitHub Actions minutes.
+#
+# This job runs `just gate` and nothing else. The compliance and security
+# layer lives on GitHub (see .github/workflows/pr.yml) and is not duplicated
+# here: two definitions of "green" is how the two drift apart.
+name: gate
+
+on:
+  push:
+    branches: ["**"]
+
+jobs:
+  gate:
+    runs-on: docker
+    container:
+      image: rust:1.95-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install just
+        run: |
+          set -euo pipefail
+          cargo install just --locked --version 1.50.0
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gate-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: gate-${{ runner.os }}-
+
+      # Identical to what an agent runs locally. If this passes and GitHub
+      # fails, the difference is policy, never correctness.
+      - name: just gate
+        run: just gate

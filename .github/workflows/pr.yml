@@ -1,0 +1,73 @@
+# GitHub is the primary remote and owns the policy layer: conventional commits,
+# REUSE/licence compliance, SAST, dependency review, OpenSSF-friendly pinning.
+#
+# diggsweden/reusable-ci is pinned to a tag's full commit SHA, not a moving ref.
+# Update deliberately, in its own commit:
+#   v3.0.0 = 997d7dc2238b40c79798fda309d8061b0707a3e5
+name: pull request
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Policy and security. reusable-ci has no cargo build workflow, so it checks
+  # everything about the change except whether the code works.
+  policy:
+    uses: diggsweden/reusable-ci/.github/workflows/pullrequest-orchestrator.yml@997d7dc2238b40c79798fda309d8061b0707a3e5
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    with:
+      project-type: cargo
+      # v3.0.0: devbasecheck supersedes the commitlint/licenselint/megalint
+      # trio, which are deprecated. Enabling both would double-report.
+      linters.devbasecheck: true
+      linters.commitlint: false
+      linters.licenselint: false
+      linters.megalint: false
+      linters.dependencyreview: true
+      security.sast-opengrep: true
+      security.sast-opengrep-fail-on-severity: medium
+
+  # Correctness. Byte-identical to what an agent runs locally, and to the
+  # Forgejo job: one definition of green, three places it is checked.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain from rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just and cargo-machete
+        run: |
+          set -euo pipefail
+          cargo install just --locked --version 1.50.0
+          cargo install cargo-machete --locked
+
+      - name: just gate
+        run: just gate
+
+  # The hexagon, called out as its own required check so a boundary change is
+  # visible in the PR's check list rather than buried in the gate's log.
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependency direction
+        run: cargo test -p architecture --test boundaries -- --nocapture

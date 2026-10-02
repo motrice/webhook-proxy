@@ -1,0 +1,15 @@
+[package]
+name = "architecture"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

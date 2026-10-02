@@ -58,20 +58,104 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 
 
-## Build & Test
+## What this repo is
 
-_Add your build and test commands here_
+A Rust product built by agents, under a workflow designed so that a human can
+trust a PR without reading every line of it. Three mechanisms do that work:
+a dependency-direction test, acceptance criteria written as tests, and one
+command that defines "green".
 
-```bash
-# Example:
-# npm install
-# npm test
+## How work flows
+
+```
+bd ready  ->  claim  ->  worktree  ->  red/green/refactor  ->  just gate  ->  PR  ->  human merges
 ```
 
-## Architecture Overview
+1. **Take work from the ledger, never from prose.** `just ready` shows what is
+   workable; `just next` claims the top of it atomically. If the user asks for
+   something not in the ledger, groom it into beads first (`bead-grooming`).
+2. **One bead, one worktree, one branch, one PR.** `just start <id>` does all
+   three, so parallel agents never share a checkout.
+3. **Code arrives only as the answer to a failing test** (`red-green-refactor`).
+4. **`just gate` is the definition of done.** CI runs the same recipe, so local
+   and CI cannot disagree.
+5. **You open the PR. A human merges it.** Always.
 
-_Add a brief overview of your project architecture_
+## Authority
 
-## Conventions & Patterns
+This repository explicitly grants more than the conservative default above, and
+no more than this:
 
-_Add your project-specific conventions here_
+- **You may** commit, and push to a `bead/*` branch, and open a PR.
+- **You must not** merge a PR, push to `main`, force-push a branch anyone else
+  may have, or edit CI workflow files without a `decision` bead.
+- **You must not** widen a boundary in `crates/architecture/tests/boundaries.rs`
+  in the same commit as a feature. Separate commit, referencing a `decision`
+  bead, so review sees that the architecture changed.
+
+If the gate will not go green, stop and report the failure. Do not disable a
+test, add `#[ignore]`, loosen an assertion, or reach for `--no-verify`. A red
+gate honestly reported is a good outcome; a green gate obtained by weakening the
+evidence is the one failure mode this whole setup exists to prevent.
+
+## Architecture
+
+Hexagonal, enforced by `cargo test -p architecture`:
+
+| Crate | May depend on | Holds |
+| ----- | ------------- | ----- |
+| `crates/domain` | **nothing** | pure rules, invariants, ubiquitous language |
+| `crates/application` | `domain` (+ `thiserror`, `async-trait`) | use cases and ports (traits) |
+| `crates/adapters/*` | `domain`, `application`, anything external | implementations of ports |
+| `crates/app` | all of the above | composition root; wiring only |
+
+Adapters may not depend on each other. Nothing may depend on `architecture`.
+The test fails the build with an explanation naming the fix, so read the message
+before changing a manifest.
+
+Time, randomness, I/O and serialisation are effects and live behind ports —
+see the `port-and-adapter` skill. `GLOSSARY.md` is a hard constraint on naming,
+not documentation of it.
+
+## Commands
+
+```bash
+just            # list everything
+just quick      # arch + tests — the inner loop
+just gate       # fmt, arch, clippy -D warnings, tests, unused deps == CI
+just ready      # workable beads
+just start <id> # claim a bead and create its worktree
+just pr <id>    # gate, push the branch, open the PR
+```
+
+Never run `cargo test` as your final check — run `just gate`. It is strictly
+more than the tests and it is what CI will run.
+
+## Conventions
+
+- **Conventional commits**, enforced by CI. The bead goes in a trailer, so the
+  ledger and the diff stay linked:
+
+  ```
+  feat(domain): reject withdrawals that would overdraw an account
+
+  Bead: gc-a1c9
+  ```
+
+- **Clippy pedantic is denied, not warned.** Fix the lint rather than
+  `#[allow]`-ing it; if an allow is genuinely right, the comment above it says
+  why in terms of this code, not in terms of the lint.
+- **`unsafe` is forbidden** workspace-wide.
+- **No new dependency without a reason in the commit message.** In `domain`, no
+  new dependency at all.
+
+## Skills
+
+Load the skill before doing the thing, not after:
+
+| Doing | Skill |
+| ----- | ----- |
+| writing or changing any production code | `red-green-refactor` |
+| adding a domain concept, type or invariant | `domain-modeling` |
+| anything touching I/O, time, or randomness | `port-and-adapter` |
+| turning a request into beads; splitting an epic | `bead-grooming` |
