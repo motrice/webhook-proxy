@@ -28,6 +28,8 @@ that as the defect, ahead of anything about the code.
 | ---- | ------- | ----------------------- |
 | **Origin** | An external system permitted to send us webhooks, together with the identity of the secret its signatures are checked against. GitHub is the first. | *Provider* — not used; pick Origin. |
 | **Delivery** | One webhook as it arrived from an Origin: raw body bytes, headers, arrival time. Unverified by definition. | *Event* — a Delivery is a transport fact, an Event is a business fact. |
+| **Body** | A Delivery's payload exactly as it arrived, as raw bytes. Never a `String`: a signature covers the bytes that were sent, so re-encoding destroys the evidence. | *Event* — the Body is bytes, the Event is meaning. |
+| **Signature** | A signature over a Body, as raw bytes, independent of algorithm or encoding. The domain compares signatures; adapters compute them. | The *secret* — a Signature is public, the key that produced it is not. |
 | **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
 | **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` is the first. | *Delivery*, and any Origin's own event name. |
 | **Destination** | An internal system that should be told about Events: an Element room, Forgejo, GitLab. | *Origin* — Origins send to us, Destinations receive from us. |
