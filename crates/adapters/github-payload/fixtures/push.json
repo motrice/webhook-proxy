@@ -1,0 +1,31 @@
+{
+  "ref": "refs/heads/main",
+  "before": "9049f1265b7d61be4a8904a9a27120d2064dab3b",
+  "after": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "repository": {
+    "id": 1035219,
+    "name": "webhook-proxy",
+    "full_name": "motrice/webhook-proxy",
+    "private": true,
+    "default_branch": "main"
+  },
+  "pusher": { "name": "bjornmolin", "email": "bjorn.molin@motrice.se" },
+  "sender": { "login": "bjornmolin", "type": "User" },
+  "commits": [
+    {
+      "id": "aa11bb22cc33dd44ee55ff6677889900aabbccdd",
+      "message": "feat(domain): reject overdrawn withdrawals\n\nA longer body that must not reach the room.",
+      "timestamp": "2026-10-02T12:00:00+02:00",
+      "author": { "name": "Bjorn Molin", "email": "bjorn.molin@motrice.se" }
+    },
+    {
+      "id": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+      "message": "docs: tidy the glossary",
+      "timestamp": "2026-10-02T12:05:00+02:00",
+      "author": { "name": "Bjorn Molin", "email": "bjorn.molin@motrice.se" }
+    }
+  ]
+}
