@@ -15,11 +15,13 @@ mod event;
 mod origin;
 mod routing;
 mod signature;
+mod time;
 
-pub use delivery::{Body, Delivery, VerifiedDelivery};
+pub use delivery::{Body, Delivery, DeliveryId, VerifiedDelivery};
 pub use event::{Blank, BranchName, Commit, CommitId, Event, Pusher, RepositoryName, Summary};
 pub use origin::{Origin, OriginId, SecretId};
 pub use routing::{
     Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,
 };
 pub use signature::{Signature, SignatureMismatch};
+pub use time::Timestamp;

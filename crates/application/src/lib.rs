@@ -10,3 +10,8 @@
 //! in `domain`.
 //!
 //! Tests here use in-memory fakes of the ports, not mocks of a database.
+
+pub mod ports;
+mod relay;
+
+pub use relay::{Refused, Relay, Relayed};
