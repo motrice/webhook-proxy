@@ -32,6 +32,9 @@ that as the defect, ahead of anything about the code.
 | **Signature** | A signature over a Body, as raw bytes, independent of algorithm or encoding. The domain compares signatures; adapters compute them. | The *secret* — a Signature is public, the key that produced it is not. |
 | **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
 | **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` is the first. | *Delivery*, and any Origin's own event name. |
+| **Commit** | One commit, reduced to what a Destination needs to show: an identity and a one-line summary. | The full git object — the domain keeps no tree, no diff, no parents. |
+| **Pusher** | Whoever pushed, as a name to show a reader. | *Origin* — an Origin is the system that told us, a Pusher is the person who acted. |
+| **Summary** | A commit's first non-blank line. | The commit message — the body is deliberately discarded at the boundary. |
 | **Destination** | An internal system that should be told about Events: an Element room, Forgejo, GitLab. | *Origin* — Origins send to us, Destinations receive from us. |
 | **Subscription** | A rule binding a set of Events to one Destination, with the filter that decides whether a given Event matches. | *Destination* — one Destination may have several Subscriptions. |
 | **Dispatch** | One attempt to deliver one Event to one Destination. Succeeds or fails on its own; a sibling's failure never affects it. | *Delivery* — opposite direction. Dispatch goes out, Delivery comes in. |

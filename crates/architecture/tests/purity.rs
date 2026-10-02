@@ -63,6 +63,52 @@ const FORBIDDEN: &[Forbidden] = &[
     },
 ];
 
+/// Vendor vocabulary that must not reach the core. An `Event` is a business
+/// fact; the moment a domain type is named after whoever reported it, the
+/// anti-corruption layer has leaked and every future Origin inherits the first
+/// one's worldview.
+///
+/// Matched case-insensitively, because `GitHub`, `Github` and `GITHUB` are the
+/// same mistake.
+///
+/// Deliberately absent: `element` and `matrix`. Both are ordinary English words
+/// that appear in honest code — an element of a collection, a matrix of cases —
+/// and a gate with false positives gets switched off. Those two stay the
+/// glossary's job and review's job.
+const VENDOR: &[Forbidden] = &[
+    Forbidden {
+        needle: "github",
+        why: "translate the payload into an Event in the inbound adapter; the \
+              domain must not know who reported the fact",
+    },
+    Forbidden {
+        needle: "gitlab",
+        why: "see the inbound adapter; the domain names facts, not reporters",
+    },
+    Forbidden {
+        needle: "forgejo",
+        why: "see the inbound adapter; the domain names facts, not reporters",
+    },
+    Forbidden {
+        needle: "gitea",
+        why: "see the inbound adapter; the domain names facts, not reporters",
+    },
+    Forbidden {
+        needle: "hookshot",
+        why: "a Destination is identified by kind, never by the product that \
+              happens to implement it",
+    },
+    Forbidden {
+        needle: "bitbucket",
+        why: "see the inbound adapter; the domain names facts, not reporters",
+    },
+    Forbidden {
+        needle: "slack",
+        why: "a Destination is identified by kind, never by the product that \
+              happens to implement it",
+    },
+];
+
 /// Where a forbidden effect was found.
 #[derive(Debug, PartialEq, Eq)]
 struct Violation {
@@ -249,17 +295,21 @@ fn opens_char_literal(chars: &[char], i: usize) -> bool {
     chars.get(i + 1) == Some(&'\\') || chars.get(i + 2) == Some(&'\'')
 }
 
-/// Every forbidden effect reachable in the code of one file.
-fn violations_in(src: &str) -> Vec<Violation> {
+fn scan(src: &str, rules: &[Forbidden], fold_case: bool) -> Vec<Violation> {
     let code = code_only(src);
     let mut found = Vec::new();
     for (index, line) in code.lines().enumerate() {
-        for forbidden in FORBIDDEN {
-            if line.contains(forbidden.needle) {
+        let haystack = if fold_case {
+            line.to_lowercase()
+        } else {
+            line.to_owned()
+        };
+        for rule in rules {
+            if haystack.contains(rule.needle) {
                 found.push(Violation {
                     line: index + 1,
-                    needle: forbidden.needle,
-                    why: forbidden.why,
+                    needle: rule.needle,
+                    why: rule.why,
                 });
             }
         }
@@ -267,9 +317,19 @@ fn violations_in(src: &str) -> Vec<Violation> {
     found
 }
 
+/// Every forbidden effect reachable in the code of one file.
+fn violations_in(src: &str) -> Vec<Violation> {
+    scan(src, FORBIDDEN, false)
+}
+
+/// Every vendor name appearing in the code of one file.
+fn vendor_names_in(src: &str) -> Vec<Violation> {
+    scan(src, VENDOR, true)
+}
+
 #[cfg(test)]
 mod scanner {
-    use super::{code_only, violations_in};
+    use super::{code_only, vendor_names_in, violations_in};
 
     #[test]
     fn a_clock_read_is_a_violation() {
@@ -355,6 +415,48 @@ mod scanner {
     }
 
     #[test]
+    fn a_vendor_name_in_code_is_a_violation() {
+        let v = vendor_names_in("pub struct GitHubPush;");
+
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].needle, "github");
+    }
+
+    #[test]
+    fn a_vendor_name_is_caught_whatever_its_casing() {
+        assert_eq!(vendor_names_in("let x = GITHUB_EVENT;").len(), 1);
+        assert_eq!(vendor_names_in("let x = github_event;").len(), 1);
+    }
+
+    #[test]
+    fn a_vendor_name_in_prose_is_not_a_violation() {
+        // The domain is allowed to *explain* that it does not know about
+        // GitHub — signature.rs does exactly that — it just may not name it in
+        // a type, a field or a function.
+        let src = "/// Nothing here knows that GitHub uses HMAC-SHA256.\n\
+                   pub struct Signature;\n";
+
+        assert!(
+            vendor_names_in(src).is_empty(),
+            "{:?}",
+            vendor_names_in(src)
+        );
+    }
+
+    #[test]
+    fn ordinary_english_words_are_not_treated_as_vendors() {
+        // `element` and `matrix` are deliberately not banned: a gate that cries
+        // wolf on honest code is a gate someone will switch off.
+        let src = "for element in rows { let matrix = element; }\n";
+
+        assert!(
+            vendor_names_in(src).is_empty(),
+            "{:?}",
+            vendor_names_in(src)
+        );
+    }
+
+    #[test]
     fn blanking_preserves_line_count_so_numbers_stay_honest() {
         let src = "a\n// comment\n/* b\nc */\nd\n";
 
@@ -410,6 +512,45 @@ fn domain_src() -> PathBuf {
         .join("src");
     assert!(src.is_dir(), "{} is not a directory", src.display());
     src
+}
+
+/// The core speaks its own language, or the anti-corruption layer has leaked.
+#[test]
+fn the_domain_names_no_vendor() {
+    let src = domain_src();
+    let files = rust_files(&src);
+    assert!(
+        !files.is_empty(),
+        "no Rust files found under {}",
+        src.display()
+    );
+
+    let mut reported = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read domain source file");
+        let name = file
+            .strip_prefix(&src)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        for v in vendor_names_in(&text) {
+            reported.push(format!(
+                "  {name}:{} names `{}` — {}",
+                v.line, v.needle, v.why
+            ));
+        }
+    }
+
+    assert!(
+        reported.is_empty(),
+        "the domain must not name a vendor — {} occurrence(s):\n{}\n\n\
+         Translation from a vendor's payload into an Event belongs in that \
+         Origin's inbound adapter, and translation from an Event into whatever \
+         a product accepts belongs in that Destination's adapter. Naming it \
+         here makes every future Origin inherit the first one's vocabulary.",
+        reported.len(),
+        reported.join("\n")
+    );
 }
 
 /// Test modules are **not** exempt, by decision.
