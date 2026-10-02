@@ -106,7 +106,8 @@ just start gc-xxx   # claim a bead, get a worktree and a branch
 just quick          # inner loop: boundaries + tests
 just check          # correctness only
 just verify         # check + hygiene linters. green == mergeable
-just pr gc-xxx      # gate, push, open the PR
+just pr gc-xxx      # verify, push (retrying), open the PR
+just ci             # watch CI for the commit you are on
 ```
 
 An agent may open a pull request. Only a human merges one.
