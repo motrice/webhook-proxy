@@ -37,6 +37,8 @@ that as the defect, ahead of anything about the code.
 | **Pusher** | Whoever pushed, as a name to show a reader. | *Origin* — an Origin is the system that told us, a Pusher is the person who acted. |
 | **Summary** | A commit's first non-blank line. | The commit message — the body is deliberately discarded at the boundary. |
 | **Destination** | An internal system that should be told about Events: an Element room, Forgejo, GitLab. | *Origin* — Origins send to us, Destinations receive from us. |
+| **DestinationKind** | What shape an Event takes for a Destination: prose for people (a Notice) or structure for a machine. Decides which adapter handles it. | The product at the other end — a chat room is a chat room whichever vendor serves it. |
+| **Filter** | The rule inside a Subscription that decides whether a Destination cares about a given Event. | *Subscription* — the Subscription binds, the Filter selects. |
 | **Subscription** | A rule binding a set of Events to one Destination, with the filter that decides whether a given Event matches. | *Destination* — one Destination may have several Subscriptions. |
 | **Dispatch** | One attempt to deliver one Event to one Destination. Succeeds or fails on its own; a sibling's failure never affects it. | *Delivery* — opposite direction. Dispatch goes out, Delivery comes in. |
 | **Notice** | An Event rendered for a human-readable Destination such as a chat room. | *Event* — the Event is structured, the Notice is prose. |
