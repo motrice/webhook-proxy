@@ -1,0 +1,19 @@
+{
+  "ref": "refs/heads/main",
+  "before": "9049f1265b7d61be4a8904a9a27120d2064dab3b",
+  "after": "0000000000000000000000000000000000000000",
+  "repository": {
+    "name": "webhook-proxy",
+    "full_name": "motrice/webhook-proxy",
+    "private": true
+  },
+  "pusher": { "name": "bjornmolin", "email": "bjorn.molin@motrice.se" },
+  "deleted": false,
+  "commits": [
+    {
+      "id": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+      "message": "feat(domain): reject withdrawals that would overdraw\n\nlonger body",
+      "author": { "name": "Bjorn Molin" }
+    }
+  ]
+}
