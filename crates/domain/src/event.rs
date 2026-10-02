@@ -69,8 +69,8 @@ pub enum Event {
 }
 
 /// Trim and reject blank, so every one of these types means the same thing by
-/// "present". Written once rather than five times.
-fn present(value: &str, concept: &'static str) -> Result<String, Blank> {
+/// "present". Written once rather than five times, and shared with `routing`.
+pub(crate) fn present(value: &str, concept: &'static str) -> Result<String, Blank> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(Blank(concept));
