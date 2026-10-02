@@ -133,6 +133,24 @@ Time, randomness, I/O and serialisation are effects and live behind ports —
 see the `port-and-adapter` skill. `GLOSSARY.md` is a hard constraint on naming,
 not documentation of it.
 
+## The delivery promise
+
+Best-effort, in memory. Nothing is persisted, so a dispatch that exhausts its
+attempts or outlives the process is lost. README states the promise in full; two
+consequences bind the code:
+
+- **A Delivery carries an identity** (`DeliveryId`), generated at the inbound
+  boundary through an `Ids` port. It exists now rather than later because a loss
+  report that cannot name what was lost is not a loss report, and because replay
+  and deduplication would both need this key retrofitted through every layer.
+- **A failed dispatch never fails the inbound response.** It is logged with the
+  delivery identity, the destination identity and the reason — never with a
+  destination's URL or secret — then counted, then dropped.
+
+Do not add persistence, a retry queue, or a durable store under this promise
+without the `Durable delivery` epic and a `decision` bead. Changing what a
+sender may rely on is not an implementation detail.
+
 ## Commands
 
 ```bash
