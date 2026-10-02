@@ -45,6 +45,43 @@ they can be added without reshaping the domain — see the `Durable delivery`
 epic in `bd ready`. They are deliberately unscheduled until the loss counters
 above say how much is actually being dropped.
 
+## The security boundary
+
+**This proxy is the authentication boundary, not a convenience.** The destination
+it relays into — a hookshot generic webhook — supports no inbound
+authentication at all: no token, no signature, no header check, no IP allowlist.
+Possession of the URL is the only credential it has. That endpoint is gated by
+internal network rules rather than by the open internet, which is what makes the
+arrangement workable: this proxy is what lets an external sender reach an
+internal alert channel, and it is therefore the thing that decides whether a
+request is genuine.
+
+Three obligations follow, and they are not negotiable:
+
+- **Verification happens before anything else, and nothing can switch it off.**
+  There is no configuration flag, environment variable, or debug mode that skips
+  a signature check. `Delivery::verify` is the only route to a
+  `VerifiedDelivery`, and translation is a port precisely so that nothing is
+  parsed before its signature matched.
+- **Unknown senders are refused, and failure is closed.** An Origin we hold no
+  secret for is `SecretUnavailable` — never "allow it through". A body larger
+  than the configured limit is rejected before any work is done on it.
+- **Content reaching a room is attacker-influenced even when the request is
+  genuine.** Commit messages, branch names and repository names are written by
+  whoever can push, not by the sender we authenticated. A Notice therefore
+  renders them as text, never as markup, or the room becomes an injection
+  target for anyone with commit access.
+
+The hookshot URL is still handled as a secret — injected from the environment or
+a k3s Secret, never defaulted in code, never logged, never in a test fixture —
+because the network perimeter is one line of defence and leaking the URL would
+let anything already inside it post freely.
+
+Rotation and expiry live on the hookshot instance and are not ours to set.
+Accepted deliberately: the rooms in scope carry notifications, so the worst case
+is nuisance or a convincing fake message, and whoever runs that instance owns the
+fix if it ever becomes a problem.
+
 ## Layout
 
 ```text
