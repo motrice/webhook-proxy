@@ -40,6 +40,7 @@ that as the defect, ahead of anything about the code.
 | **DestinationKind** | What shape an Event takes for a Destination: prose for people (a Notice) or structure for a machine. Decides which adapter handles it. | The product at the other end — a chat room is a chat room whichever vendor serves it. |
 | **Filter** | The rule inside a Subscription that decides whether a Destination cares about a given Event. | *Subscription* — the Subscription binds, the Filter selects. |
 | **Subscription** | A rule binding a set of Events to one Destination, with the filter that decides whether a given Event matches. | *Destination* — one Destination may have several Subscriptions. |
+| **Timestamp** | A moment, as milliseconds since the Unix epoch. Always an argument, never read from the clock inside the core. | The clock itself — that is a port. |
 | **Dispatch** | One attempt to deliver one Event to one Destination. Succeeds or fails on its own; a sibling's failure never affects it. | *Delivery* — opposite direction. Dispatch goes out, Delivery comes in. |
 | **Notice** | An Event rendered for a human-readable Destination such as a chat room. | *Event* — the Event is structured, the Notice is prose. |
 
