@@ -1,0 +1,18 @@
+{
+  "ref": "refs/heads/bead/gc-old",
+  "before": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+  "after": "0000000000000000000000000000000000000000",
+  "created": false,
+  "deleted": true,
+  "forced": false,
+  "repository": {
+    "id": 1035219,
+    "name": "webhook-proxy",
+    "full_name": "motrice/webhook-proxy",
+    "private": true,
+    "default_branch": "main"
+  },
+  "pusher": { "name": "bjornmolin", "email": "bjorn.molin@motrice.se" },
+  "sender": { "login": "bjornmolin", "type": "User" },
+  "commits": []
+}
