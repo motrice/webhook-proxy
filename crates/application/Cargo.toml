@@ -8,13 +8,15 @@ license.workspace = true
 
 [dependencies]
 domain = { path = "../domain" }
+# Only the Dispatcher port is async — it is the only one that touches a network.
+# The architecture test's allowlist already permits this for exactly that reason.
+async-trait = "0.1"
 
-
-# `domain` is a structural dependency: it expresses the hexagon even while the
-# core is still empty. Delete this block once the domain has types that are
-# actually imported — after that, cargo-machete is telling the truth again.
-[package.metadata.cargo-machete]
-ignored = ["domain"]
+[dev-dependencies]
+# Dev-dependencies are deliberately unrestricted by the architecture test: a
+# test may use whatever it needs to prove the production path. A runtime is
+# needed only to poll the async Dispatcher in use-case tests.
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

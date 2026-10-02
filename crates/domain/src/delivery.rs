@@ -1,6 +1,34 @@
 //! What arrived, and what we are willing to act on.
 
-use crate::{Origin, OriginId, Signature, SignatureMismatch};
+use crate::event::present;
+use crate::{Blank, Origin, OriginId, Signature, SignatureMismatch, Timestamp};
+
+/// A Delivery's identity, minted at the inbound boundary.
+///
+/// It exists so that a loss can be reported: per the delivery promise a dropped
+/// Dispatch is logged and counted, and a loss report that cannot name what was
+/// lost is not a loss report. Replay and deduplication would both need this key
+/// later, and retrofitting it once adapters exist would mean touching every
+/// layer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeliveryId(String);
+
+impl DeliveryId {
+    /// Names a Delivery.
+    ///
+    /// # Errors
+    ///
+    /// [`Blank`] if the identity is empty or only whitespace.
+    pub fn new(id: &str) -> Result<Self, Blank> {
+        present(id, "a delivery identity").map(Self)
+    }
+
+    /// The identity as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// The body of a [`Delivery`], exactly as it arrived.
 ///
@@ -13,8 +41,10 @@ pub struct Body(Vec<u8>);
 /// One webhook as it arrived from an [`Origin`]. Unverified by definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
+    id: DeliveryId,
     origin: OriginId,
     body: Body,
+    received_at: Timestamp,
 }
 
 /// A [`Delivery`] whose signature has been checked and matched.
@@ -59,8 +89,25 @@ impl core::fmt::Debug for Body {
 impl Delivery {
     /// Records a webhook as it arrived.
     #[must_use]
-    pub fn new(origin: OriginId, body: Body) -> Self {
-        Self { origin, body }
+    pub fn new(id: DeliveryId, origin: OriginId, body: Body, received_at: Timestamp) -> Self {
+        Self {
+            id,
+            origin,
+            body,
+            received_at,
+        }
+    }
+
+    /// Which Delivery this is.
+    #[must_use]
+    pub fn id(&self) -> &DeliveryId {
+        &self.id
+    }
+
+    /// When it arrived.
+    #[must_use]
+    pub fn received_at(&self) -> Timestamp {
+        self.received_at
     }
 
     /// Which Origin claims to have sent this.
@@ -103,6 +150,18 @@ impl Delivery {
 }
 
 impl VerifiedDelivery {
+    /// Which Delivery this is.
+    #[must_use]
+    pub fn id(&self) -> &DeliveryId {
+        self.delivery.id()
+    }
+
+    /// When it arrived.
+    #[must_use]
+    pub fn received_at(&self) -> Timestamp {
+        self.delivery.received_at()
+    }
+
     /// Which Origin sent this, now established rather than claimed.
     #[must_use]
     pub fn origin(&self) -> &OriginId {
@@ -128,15 +187,23 @@ impl Origin {
 
 #[cfg(test)]
 mod tests {
-    use super::{Body, Delivery};
-    use crate::{Origin, OriginId, SecretId, Signature};
+    use super::{Body, Delivery, DeliveryId};
+    use crate::{Origin, OriginId, SecretId, Signature, Timestamp};
 
     fn an_origin() -> OriginId {
         OriginId::new("github")
     }
 
+    fn an_id() -> DeliveryId {
+        DeliveryId::new("d-1").expect("a non-blank identity")
+    }
+
+    fn arrived_at() -> Timestamp {
+        Timestamp::from_millis_since_epoch(1_759_000_000_000)
+    }
+
     fn delivery_of(bytes: impl Into<Vec<u8>>) -> Delivery {
-        Delivery::new(an_origin(), Body::from_bytes(bytes))
+        Delivery::new(an_id(), an_origin(), Body::from_bytes(bytes), arrived_at())
     }
 
     #[test]
@@ -193,9 +260,38 @@ mod tests {
 
         assert!(origin.sent(&delivery_of(b"x".to_vec())));
         assert!(!origin.sent(&Delivery::new(
+            an_id(),
             OriginId::new("gitlab"),
-            Body::from_bytes(b"x".to_vec())
+            Body::from_bytes(b"x".to_vec()),
+            arrived_at()
         )));
+    }
+
+    #[test]
+    fn a_delivery_carries_its_identity_and_when_it_arrived() {
+        let delivery = delivery_of(b"payload".to_vec());
+
+        assert_eq!(delivery.id(), &an_id());
+        assert_eq!(delivery.received_at(), arrived_at());
+    }
+
+    #[test]
+    fn a_verified_delivery_keeps_the_identity_and_arrival_it_was_given() {
+        // The identity has to survive verification, because the loss report that
+        // names it is written after a Dispatch has failed, long past this point.
+        let signature = Signature::from_bytes([7, 7, 7]);
+
+        let verified = delivery_of(b"payload".to_vec())
+            .verify(&signature, &signature)
+            .expect("matching signatures are accepted");
+
+        assert_eq!(verified.id(), &an_id());
+        assert_eq!(verified.received_at(), arrived_at());
+    }
+
+    #[test]
+    fn a_delivery_identity_cannot_be_blank() {
+        assert!(DeliveryId::new("   ").is_err());
     }
 
     #[test]
