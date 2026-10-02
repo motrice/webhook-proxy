@@ -22,7 +22,7 @@ bd close <id>         # Complete work
 - Run `bd prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md for details and anti-patterns.
+**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See <https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md> for details and anti-patterns.
 
 ## Agent Context Profiles
 
@@ -40,6 +40,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
 4. **Handle git/sync by active profile**:
+
    ```bash
    # Conservative/minimal/default: report status and proposed commands; wait for approval.
    git status
@@ -49,14 +50,15 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
    git push
    git status
    ```
+
 5. **Hand off** - Summarize changes, validation, issue status, and any blocked sync/commit/push step
 
 **Critical rules:**
+
 - Explicit user or orchestrator instructions override this Beads block.
 - Do not commit or push without clear authority from the active profile or the current user request.
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
-
 
 ## What this repo is
 
@@ -67,8 +69,8 @@ command that defines "green".
 
 ## How work flows
 
-```
-bd ready  ->  claim  ->  worktree  ->  red/green/refactor  ->  just gate  ->  PR  ->  human merges
+```text
+bd ready -> claim -> worktree -> red/green/refactor -> just verify -> PR -> human merges
 ```
 
 1. **Take work from the ledger, never from prose.** `just ready` shows what is
@@ -77,8 +79,10 @@ bd ready  ->  claim  ->  worktree  ->  red/green/refactor  ->  just gate  ->  PR
 2. **One bead, one worktree, one branch, one PR.** `just start <id>` does all
    three, so parallel agents never share a checkout.
 3. **Code arrives only as the answer to a failing test** (`red-green-refactor`).
-4. **`just gate` is the definition of done.** CI runs the same recipe, so local
-   and CI cannot disagree.
+4. **`just verify` is the definition of done.** It is `check` (correctness:
+   formatting, boundaries, clippy, tests, unused deps) plus `lint-all` (hygiene:
+   the devbase linters). CI composes the same two halves as two jobs, because
+   they need different toolchains — one definition of green, checked twice.
 5. **You open the PR. A human merges it.** Always.
 
 ## Authority
@@ -122,21 +126,23 @@ not documentation of it.
 ```bash
 just            # list everything
 just quick      # arch + tests — the inner loop
-just gate       # fmt, arch, clippy -D warnings, tests, unused deps == CI
+just check      # correctness: fmt, arch, clippy -D warnings, tests, unused deps
+just verify     # check + hygiene linters == everything CI runs
 just ready      # workable beads
 just start <id> # claim a bead and create its worktree
 just pr <id>    # gate, push the branch, open the PR
 ```
 
-Never run `cargo test` as your final check — run `just gate`. It is strictly
-more than the tests and it is what CI will run.
+Never run `cargo test` as your final check — run `just verify`. It is strictly
+more than the tests and it is what CI will run. `just install` is needed once,
+to fetch the mise-pinned hygiene tools.
 
 ## Conventions
 
 - **Conventional commits**, enforced by CI. The bead goes in a trailer, so the
   ledger and the diff stay linked:
 
-  ```
+  ```text
   feat(domain): reject withdrawals that would overdraw an account
 
   Bead: gc-a1c9

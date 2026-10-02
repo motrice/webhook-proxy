@@ -34,7 +34,7 @@ bd create "Reject withdrawals that would overdraw an account" \
 - [ ] domain test: a rejected withdrawal leaves the balance unchanged
 - [ ] domain test: withdrawal of exactly the balance succeeds
 - [ ] Overdraft and any new term are in GLOSSARY.md
-- [ ] just gate is green" \
+- [ ] just verify is green" \
   --description "Why: the ledger currently permits a negative balance, which the
 business says can never exist. Where: crates/domain, Account aggregate.
 Out of scope: overdraft *facilities* (a separate concept, not yet modelled)."
