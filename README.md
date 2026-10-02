@@ -15,6 +15,36 @@ one command, and the work queue is a dependency graph rather than a conversation
 What is left for the human is the only thing a human is actually better at —
 deciding whether this was the right thing to build.
 
+## What it promises
+
+**A webhook is acknowledged once its signature is verified, then delivered to
+each matching destination on a bounded number of attempts; nothing is persisted,
+so a dispatch that exhausts its attempts or outlives the process is lost — and
+every loss is logged and counted.**
+
+That is best-effort, stated plainly, and the rest follows from it:
+
+- **Acknowledgement means accepted, not delivered.** The sender gets a 2xx once
+  the signature checks out. A destination failing afterwards must not turn into
+  a 5xx, because the sender would retry and re-deliver to the destinations that
+  already succeeded.
+- **Losses are visible.** A dropped dispatch is logged with the delivery's
+  identity, the destination's identity and the reason, and counted. A
+  best-effort system whose losses are invisible is indistinguishable from a
+  broken one; the log is what makes "best-effort" an engineering decision rather
+  than an excuse.
+- **Duplicates are possible.** Inside the attempt budget a destination can see
+  the same notice twice, when it accepted a request whose response was lost. For
+  a chat room that is a cosmetic duplicate rather than corruption, but nothing
+  downstream should assume exactly-once.
+- **Order is not promised.** Destinations are dispatched to independently, so
+  two events can reach one destination out of order.
+
+Durability and replay are wanted eventually, and the shape here is chosen so
+they can be added without reshaping the domain — see the `Durable delivery`
+epic in `bd ready`. They are deliberately unscheduled until the loss counters
+above say how much is actually being dropped.
+
 ## Layout
 
 ```text

@@ -30,6 +30,7 @@ that as the defect, ahead of anything about the code.
 | **Delivery** | One webhook as it arrived from an Origin: raw body bytes, headers, arrival time. Unverified by definition. | *Event* — a Delivery is a transport fact, an Event is a business fact. |
 | **Body** | A Delivery's payload exactly as it arrived, as raw bytes. Never a `String`: a signature covers the bytes that were sent, so re-encoding destroys the evidence. | *Event* — the Body is bytes, the Event is meaning. |
 | **Signature** | A signature over a Body, as raw bytes, independent of algorithm or encoding. The domain compares signatures; adapters compute them. | The *secret* — a Signature is public, the key that produced it is not. |
+| **DeliveryId** | A Delivery's identity, minted at the inbound boundary. What a log line, and one day a replay, refers to. | A sender's own event id — that is theirs, this is ours. |
 | **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
 | **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` is the first. | *Delivery*, and any Origin's own event name. |
 | **Commit** | One commit, reduced to what a Destination needs to show: an identity and a one-line summary. | The full git object — the domain keeps no tree, no diff, no parents. |
