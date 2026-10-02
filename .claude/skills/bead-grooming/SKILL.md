@@ -29,7 +29,7 @@ grooming is where the quality of everything downstream is decided.
 bd create "Reject withdrawals that would overdraw an account" \
   --type feature \
   --priority 1 \
-  --skills "domain-modeling,red-green-refactor" \
+  --skills "domain-modelling,red-green-refactor" \
   --acceptance "- [ ] domain test: withdrawal above balance returns Overdraft::InsufficientFunds
 - [ ] domain test: a rejected withdrawal leaves the balance unchanged
 - [ ] domain test: withdrawal of exactly the balance succeeds
@@ -71,7 +71,7 @@ rather than creating beads one at a time and linking them afterwards.
 
 ```bash
 bd create "Account ledger" --type epic
-bd create "Model Money and Currency" --parent gc-e001 --skills domain-modeling
+bd create "Model Money and Currency" --parent gc-e001 --skills domain-modelling
 bd create "Accounts port"            --parent gc-e001 --skills port-and-adapter
 ```
 

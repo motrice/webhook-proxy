@@ -1,5 +1,5 @@
 ---
-name: domain-modeling
+name: domain-modelling
 description: How to add or change a concept in crates/domain. Use when introducing a new domain type, aggregate, invariant or state machine; when a bead describes a business rule; or when you catch yourself writing validation, `Option`-heavy structs, or a type named *Manager/Service/Data*.
 ---
 
@@ -95,9 +95,14 @@ port. If a rule depends on "now", take the timestamp as an argument — the use
 case gets it from a `Clock` port and passes it in. That single habit is what lets
 domain tests run in microseconds and never flake.
 
-`crates/architecture` enforces the dependency half of this mechanically. It
-cannot catch `std::time::SystemTime::now()`, so that part is on you and on
-review.
+`crates/architecture` enforces both halves of this mechanically. `boundaries`
+reads the dependency graph; `purity` reads the source text, because effects like
+`SystemTime::now()` and `std::fs` live in `std` and so need no dependency entry
+to sneak in. A violation names the file, the line and what to do instead.
+
+Test modules are not exempt. A domain test that needs the clock or the
+filesystem is evidence the logic under test is not pure, which is the thing the
+rule exists to catch.
 
 ## Checklist before you commit
 
