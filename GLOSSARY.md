@@ -24,16 +24,31 @@ that as the defect, ahead of anything about the code.
 
 ## Terms
 
-_Empty until the first domain concept lands. The first bead that introduces a
-real concept populates this table._
-
 | Term | Meaning | Not to be confused with |
 | ---- | ------- | ----------------------- |
+| **Origin** | An external system permitted to send us webhooks, together with the identity of the secret its signatures are checked against. GitHub is the first. | *Provider* — not used; pick Origin. |
+| **Delivery** | One webhook as it arrived from an Origin: raw body bytes, headers, arrival time. Unverified by definition. | *Event* — a Delivery is a transport fact, an Event is a business fact. |
+| **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
+| **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` is the first. | *Delivery*, and any Origin's own event name. |
+| **Destination** | An internal system that should be told about Events: an Element room, Forgejo, GitLab. | *Origin* — Origins send to us, Destinations receive from us. |
+| **Subscription** | A rule binding a set of Events to one Destination, with the filter that decides whether a given Event matches. | *Destination* — one Destination may have several Subscriptions. |
+| **Dispatch** | One attempt to deliver one Event to one Destination. Succeeds or fails on its own; a sibling's failure never affects it. | *Delivery* — opposite direction. Dispatch goes out, Delivery comes in. |
+| **Notice** | An Event rendered for a human-readable Destination such as a chat room. | *Event* — the Event is structured, the Notice is prose. |
+
+Deliberately absent: *Message*, *Payload*, *Hook*, *Handler*, *Processor*. The
+first three are ambiguous about direction, and the last two name mechanisms.
 
 ## Bounded contexts
 
-_Empty. Add one row per context once there is more than one, naming the
-translation that happens at each boundary._
+One context for now. A webhook relay this size does not have two languages in it,
+and splitting it early would buy ceremony instead of clarity. What it does have is
+an anti-corruption layer at every edge: each Origin adapter translates a foreign
+payload into an `Event`, and each Destination adapter translates an `Event` into
+whatever that system accepts. No foreign vocabulary crosses into the core.
 
 | Context | Owns | Talks to |
 | ------- | ---- | -------- |
+| Relay | Origin, Delivery, VerifiedDelivery, Event, Subscription, Destination, Dispatch, Notice | GitHub (inbound), Element / Forgejo / GitLab (outbound) |
+
+Revisit this the moment a second language appears — for example if scheduling or
+retention grows rules of its own.
