@@ -89,6 +89,7 @@ lint-commits:
 
 # Refuses to pass while the working tree is dirty, so a green `verify` always
 # describes committed state rather than whatever happens to be on disk.
+[doc("Refuse to pass while the working tree is dirty")]
 [group('lint')]
 lint-version-control:
     @{{ mise }} {{ lint }}/version-control.sh
@@ -106,6 +107,7 @@ lint-yaml:
 # that block repeats headings. We cannot fix it and we should not hand-edit a
 # generated file, so the rule goes rather than the file — excluding AGENTS.md
 # entirely would also drop the rules it *does* pass.
+[doc("Markdown, with MD013 and MD024 disabled (see above)")]
 [group('lint')]
 lint-markdown:
     @{{ mise }} {{ lint }}/markdown.sh check MD013,MD024
@@ -174,6 +176,7 @@ test:
 # point inward, `purity` proves the domain reaches for no effects. Run the whole
 # crate rather than one test file, so a new rule is enforced the moment it lands
 # instead of waiting for someone to remember to add it here.
+[doc("Executable architecture rules: boundaries and domain purity")]
 [group('rust')]
 arch:
     cargo test -p architecture
@@ -234,30 +237,89 @@ abandon id reason:
 # ==========================================================================
 
 # ▪ Open the PR for a bead. Requires `gh` and `jq`.
+#
+# `base` defaults to main. Pass a bead branch to stack on an unmerged PR — and
+# then do not delete that branch when merging it, because GitHub closes a PR
+# whose base is gone and a closed PR with no base cannot be reopened.
+[doc("Open the PR for a bead. Pass a base to stack on an unmerged PR")]
 [group('ship')]
-pr id: verify
+pr id base="main": verify
     #!/usr/bin/env bash
     set -euo pipefail
     id="{{ id }}"
+    base="{{ base }}"
     bead=$(bd show "$id" --json)
     # bd show --json may return the issue or a single-element array.
     norm='if type=="array" then .[0] else . end'
     title=$(jq -r "$norm"' | .title // empty' <<<"$bead")
     accept=$(jq -r "$norm"' | .acceptance_criteria // empty' <<<"$bead")
     [[ -n "$title" ]] || { echo "bead $id has no title; is the id right?" >&2; exit 1; }
-    git push -u origin "bead/$id"
-    gh pr create --title "$title" --body "Closes bead $id.
 
-    ## Acceptance
-    $accept
+    just _push "bead/$id"
 
-    ## Evidence
-    \`just verify\` green locally: correctness (fmt, boundaries, clippy -D warnings,
-    tests, unused deps) and hygiene (devbase base linters).
+    body="Closes bead $id."
+    body+=$'\n\n## Acceptance\n'"$accept"
+    body+=$'\n\n## Evidence\n'
+    body+='`just verify` green locally: correctness (fmt, boundaries, clippy -D '
+    body+=$'warnings, tests, unused deps) and hygiene (devbase base linters).'
+    body+=$'\n\n## Review focus\n'
+    body+='Any diff under `crates/architecture/` widens an architectural boundary '
+    body+=$'on purpose and deserves the most scrutiny in this PR.'
+    if [[ "$base" != "main" ]]; then
+        body+=$'\n\n## Stacked\n'
+        body+="Based on \`$base\`, so the diff here is only this bead's work. "
+        body+=$'Merge that PR first, and do not delete its branch while this PR is '
+        body+=$'open: GitHub closes a PR whose base branch is deleted, and it '
+        body+=$'cannot be reopened afterwards.'
+    fi
 
-    ## Review focus
-    Any diff under \`crates/architecture/\` widens an architectural boundary on
-    purpose and deserves the most scrutiny in this PR."
+    gh pr create --base "$base" --title "$title" --body "$body"
+
+# ▪ Watch CI for the commit you are actually on.
+#
+# Resolves the run by head SHA rather than taking the newest run on the branch: a
+# run needs a few seconds to appear after a push, so "newest" is often the
+# previous commit's, and reading that as this commit's result has twice reported
+# a stale failure as current.
+[doc("Watch CI for the commit you are on, resolved by head SHA")]
+[group('ship')]
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    head=$(git rev-parse HEAD)
+    branch=$(git branch --show-current)
+    run=""
+    for _ in $(seq 1 20); do
+        run=$(gh run list --branch "$branch" --limit 20 --json databaseId,headSha \
+              --jq "[.[] | select(.headSha==\"$head\")] | .[0].databaseId // empty")
+        [[ -n "$run" ]] && break
+        sleep 3
+    done
+    if [[ -z "$run" ]]; then
+        printf 'no CI run for %s on %s after 60s\n' "${head:0:7}" "$branch" >&2
+        exit 1
+    fi
+    printf 'watching run %s for %s\n' "$run" "${head:0:7}"
+    gh run watch "$run" --exit-status --interval 15
+
+# Push a branch, retrying a transient failure.
+#
+# GitHub's SSH endpoint drops connections often enough from here that a single
+# attempt loses work: four beads hit `git exit 128` and every one succeeded on a
+# manual retry. A genuine failure still fails, after three tries.
+[private]
+_push branch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for attempt in 1 2 3; do
+        if git push -u origin "{{ branch }}"; then
+            exit 0
+        fi
+        printf 'push failed (attempt %d of 3), retrying\n' "$attempt" >&2
+        sleep $((attempt * 3))
+    done
+    printf 'push failed three times; this is not a transient problem\n' >&2
+    exit 1
 
 # Mirror main to the local Forgejo remote for the fast gate.
 [group('ship')]

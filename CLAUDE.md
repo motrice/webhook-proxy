@@ -91,6 +91,9 @@ This repository explicitly grants more than the conservative default above, and
 no more than this:
 
 - **You may** commit, and push to a `bead/*` branch, and open a PR.
+- **When a bead builds on an unmerged one**, pass its branch as the base:
+  `just pr <id> bead/<parent>`. Do not delete a base branch while a PR targets
+  it — GitHub closes that PR and it cannot be reopened once the base is gone.
 - **You must not** merge a PR, push to `main`, force-push a branch anyone else
   may have, or edit CI workflow files without a `decision` bead.
 - **You must not** weaken a rule in `crates/architecture/` — widening
@@ -175,7 +178,8 @@ just check      # correctness: fmt, arch, clippy -D warnings, tests, unused deps
 just verify     # check + hygiene linters == everything CI runs
 just ready      # workable beads
 just start <id> # claim a bead and create its worktree
-just pr <id>    # gate, push the branch, open the PR
+just pr <id>    # verify, push the branch, open the PR
+just ci         # watch CI for this commit, resolved by head SHA
 ```
 
 Never run `cargo test` as your final check — run `just verify`. It is strictly
