@@ -2,7 +2,7 @@
 # bead branches, so an agent gets an answer in seconds without spending
 # GitHub Actions minutes.
 #
-# This job runs `just gate` and nothing else. The compliance and security
+# This job runs `just check` — correctness only. The hygiene and security
 # layer lives on GitHub (see .github/workflows/pr.yml) and is not duplicated
 # here: two definitions of "green" is how the two drift apart.
 # Actions are pinned by commit SHA, like the GitHub side: a tag can be moved to
@@ -13,14 +13,14 @@
 # host it is configured for. If it does not resolve these GitHub SHAs, pin the
 # equivalent Codeberg actions here instead rather than reverting to tags —
 # see bead gc-fle, which stands up this runner.
-name: gate
+name: check
 
 on:
   push:
     branches: ["**"]
 
 jobs:
-  gate:
+  check:
     runs-on: docker
     container:
       image: rust:1.95-bookworm
@@ -42,10 +42,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: gate-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: gate-${{ runner.os }}-
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
 
       # Identical to what an agent runs locally. If this passes and GitHub
       # fails, the difference is policy, never correctness.
-      - name: just gate
-        run: just gate
+      - name: just check
+        run: just check

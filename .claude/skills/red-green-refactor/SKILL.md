@@ -89,7 +89,7 @@ means the test is checking implementation instead of behaviour.
 ## Before you say you are done
 
 ```bash
-just gate
+just verify
 ```
 
 Green gate or it is not done. If the gate fails on something you believe is

@@ -17,7 +17,7 @@ deciding whether this was the right thing to build.
 
 ## Layout
 
-```
+```text
 crates/domain          pure rules. zero dependencies, enforced.
 crates/application     use cases and ports (traits).
 crates/adapters/*      implementations of ports. none yet.
@@ -26,7 +26,7 @@ crates/architecture    the dependency-direction test.
 
 CLAUDE.md              the contract agents work under.
 GLOSSARY.md            ubiquitous language. a constraint, not a document.
-justfile               every command. `just gate` is the definition of done.
+justfile               every command. `just verify` is the definition of done.
 .claude/skills/        how to do the four recurring kinds of work.
 .beads/                the work ledger (Dolt-backed).
 ```
@@ -37,7 +37,8 @@ justfile               every command. `just gate` is the definition of done.
 just ready          # what is workable now
 just start gc-xxx   # claim a bead, get a worktree and a branch
 just quick          # inner loop: boundaries + tests
-just gate           # what CI runs. green == mergeable
+just check          # correctness only
+just verify         # check + hygiene linters. green == mergeable
 just pr gc-xxx      # gate, push, open the PR
 ```
 
@@ -55,17 +56,18 @@ test, which turns an architectural drift into a visible, reviewable act.
 exist and pass. Grooming therefore hands the agent its red-green list, and review
 becomes: do these tests exist, and do they assert what the criterion says.
 
-**3. One definition of green.** `just gate` runs formatting, the boundary test,
-clippy with pedantic denied, the suite, and an unused-dependency check. The
-Forgejo job and the GitHub job both run that same recipe, so "works on my
-machine" has nowhere to hide.
+**3. One definition of green.** `just verify` is `check` — formatting, the
+boundary test, clippy with pedantic denied, the suite, unused dependencies —
+plus `lint-all`, the devbase hygiene linters. CI runs the same two halves as two
+jobs because they need different toolchains, so "works on my machine" has
+nowhere to hide while neither job has to install the other's tools.
 
 ## CI
 
 | Where | Runs | Why |
 | ----- | ---- | --- |
-| Forgejo (local) | `just gate` | seconds, on every push, including bead branches |
-| GitHub | `just gate` + `diggsweden/reusable-ci` | correctness plus the policy layer: conventional commits, REUSE, SAST, dependency review |
+| Forgejo (local) | `just check` | seconds, on every push, including bead branches |
+| GitHub | `just check` + `diggsweden/reusable-ci` | correctness plus the policy layer: commit health, REUSE, SAST, dependency review, markdown/YAML/shell hygiene |
 
 `reusable-ci` is pinned to a tag's full commit SHA (v3.0.0), never a moving ref.
 It has no cargo build workflow, so it checks everything about a change except
@@ -74,12 +76,17 @@ whether the code works — which is what our own gate job is for.
 ## Prerequisites
 
 ```bash
-brew install just gh        # gh is currently missing; `just pr` needs it
-cargo install cargo-machete # required by `just gate`
+brew install just gh mise   # mise pins the hygiene linters
+cargo install cargo-machete # required by `just check`
+just install                # fetch the pinned linters and devbase-check
 ```
 
-`bd` (beads), `reuse`, `jq` and the Rust toolchain in `rust-toolchain.toml` are
-already present.
+`bd` (beads) and the Rust toolchain in `rust-toolchain.toml` do the rest.
+
+One environment caveat worth knowing: on this machine `~/.local/bin/jq`,
+`kubectl` and friends are wrappers that run inside the `k3s-toolbox` container
+(`docker exec -i k3s-toolbox ...`). They read stdin fine but cannot see host
+file paths, so pipe into them rather than passing a filename.
 
 ## Open decisions
 

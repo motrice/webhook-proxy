@@ -1,0 +1,26 @@
+# Tool versions for the hygiene linters that devbase-check drives.
+#
+# Deliberately absent: rust, cargo, rustfmt, clippy. `rust-toolchain.toml` owns
+# the compiler and rustup honours it everywhere — locally, in CI, and in the
+# editor — so adding rust here would be a second pin that silently drifts from
+# the first. The devbase convention and the Rust convention each keep the half
+# they are good at.
+#
+# Versions match diggsweden/devbase-check v0.6.0. java and bats are omitted:
+# no JVM, no bats tests. hadolint is kept even though there is no Dockerfile
+# yet — devbase reports a *missing tool* as a failure rather than as "nothing
+# to do", so the tool has to be present for the check to come back clean.
+
+[settings]
+experimental = true
+
+[tools]
+"aqua:rhysd/actionlint" = "v1.7.12"
+"forgejo:itiquette/gommitlint" = "0.9.10"
+"aqua:zricethezav/gitleaks" = "v8.30.1"
+"aqua:rvben/rumdl" = "v0.2.77"
+"aqua:koalaman/shellcheck" = "v0.11.0"
+"aqua:mvdan/sh" = "v3.14.1"
+"aqua:google/yamlfmt" = "v0.21.0"
+"aqua:hadolint/hadolint" = "v2.15.1"
+"pipx:reuse" = "6.2.0"

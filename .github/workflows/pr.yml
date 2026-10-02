@@ -38,9 +38,11 @@ jobs:
       security.sast-opengrep: true
       security.sast-opengrep-fail-on-severity: medium
 
-  # Correctness. Byte-identical to what an agent runs locally, and to the
-  # Forgejo job: one definition of green, three places it is checked.
-  gate:
+  # Correctness. `just check` is the same recipe an agent runs locally and the
+  # same one the Forgejo gate runs. Together with the hygiene linting in the
+  # policy job above, these two jobs compose to `just verify` — one definition
+  # of green, checked in two places because they need different toolchains.
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -59,11 +61,11 @@ jobs:
           cargo install just --locked --version 1.50.0
           cargo install cargo-machete --locked
 
-      - name: just gate
-        run: just gate
+      - name: just check
+        run: just check
 
   # The hexagon, called out as its own required check so a boundary change is
-  # visible in the PR's check list rather than buried in the gate's log.
+  # visible in the PR's check list rather than buried in the check job's log.
   architecture:
     runs-on: ubuntu-latest
     steps:
