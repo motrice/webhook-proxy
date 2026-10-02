@@ -131,12 +131,12 @@ mod tests {
     use super::{Body, Delivery};
     use crate::{Origin, OriginId, SecretId, Signature};
 
-    fn github() -> OriginId {
+    fn an_origin() -> OriginId {
         OriginId::new("github")
     }
 
     fn delivery_of(bytes: impl Into<Vec<u8>>) -> Delivery {
-        Delivery::new(github(), Body::from_bytes(bytes))
+        Delivery::new(an_origin(), Body::from_bytes(bytes))
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
             .verify(&claimed, &computed)
             .expect("matching signatures are accepted");
 
-        assert_eq!(verified.origin(), &github());
+        assert_eq!(verified.origin(), &an_origin());
         assert_eq!(verified.body().as_bytes(), raw.as_slice());
     }
 
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn an_origin_recognises_only_deliveries_that_claim_to_be_from_it() {
-        let origin = Origin::new(github(), SecretId::new("github-webhook-secret"));
+        let origin = Origin::new(an_origin(), SecretId::new("github-webhook-secret"));
 
         assert!(origin.sent(&delivery_of(b"x".to_vec())));
         assert!(!origin.sent(&Delivery::new(
