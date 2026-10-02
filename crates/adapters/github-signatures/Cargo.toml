@@ -1,0 +1,22 @@
+[package]
+name = "github-signatures"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain" }
+application = { path = "../../application" }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+# Used only to re-serialise a captured payload, proving the verifier works on
+# the bytes that arrived rather than on a round-tripped copy of them.
+serde_json = "1"
+
+[lints]
+workspace = true

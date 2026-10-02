@@ -7,7 +7,13 @@
 #   app          <- composition root. the only crate allowed to wire adapters.
 [workspace]
 resolver = "3"
-members = ["crates/domain", "crates/application", "crates/app", "crates/architecture"]
+members = [
+    "crates/domain",
+    "crates/application",
+    "crates/adapters/github-signatures",
+    "crates/app",
+    "crates/architecture",
+]
 
 [workspace.package]
 edition = "2024"

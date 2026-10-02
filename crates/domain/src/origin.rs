@@ -34,6 +34,16 @@ impl SecretId {
     }
 }
 
+impl SecretId {
+    /// The name as text, so an adapter can look the secret up. This is a
+    /// lookup key and safe to print; the value it names never enters the
+    /// domain at all.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl Origin {
     /// Registers an Origin and the secret its signatures are checked against.
     #[must_use]
@@ -71,6 +81,14 @@ mod tests {
         // name, and that the name is all it has.
         assert_eq!(origin.secret(), &SecretId::new("github-webhook-secret"));
         assert_eq!(origin.id(), &OriginId::new("github"));
+    }
+
+    #[test]
+    fn a_secret_id_can_be_read_as_text_because_an_adapter_must_look_it_up() {
+        assert_eq!(
+            SecretId::new("github-webhook-secret").as_str(),
+            "github-webhook-secret"
+        );
     }
 
     #[test]
