@@ -9,3 +9,11 @@
 //! Terms used here MUST appear in `GLOSSARY.md` with the same meaning.
 //! Tests for this crate are unit tests in-module; they need no fixtures,
 //! no I/O and no async, which is what makes the TDD loop fast.
+
+mod delivery;
+mod origin;
+mod signature;
+
+pub use delivery::{Body, Delivery, VerifiedDelivery};
+pub use origin::{Origin, OriginId, SecretId};
+pub use signature::{Signature, SignatureMismatch};
