@@ -71,4 +71,11 @@
 # - linear.api_key  → use LINEAR_API_KEY env var instead
 # - github.token    → use GITHUB_TOKEN env var instead
 
-sync.remote: "git+ssh://git@github.com/motrice/webhook-proxy.git"
+# sync.remote is deliberately UNSET. `bd dolt push` had put the whole bead
+# database on the GitHub remote as refs/dolt/data, which `git ls-remote` lists to
+# anyone — so publishing this repository would have published every bead note,
+# including ones describing third-party infrastructure. The refs were deleted and
+# this is left empty so bd cannot republish them by accident; with no remote
+# configured, `bd dolt push` refuses rather than adopting one. See bead gc-60e.
+#
+# Cross-machine sync, if it is ever wanted, belongs on a private remote.

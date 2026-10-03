@@ -8,4 +8,4 @@
 #
 # This file is committed so that changing who may approve is a reviewable diff
 # rather than somebody's local git config.
-sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAILz0bbDs14N8pzU8kxuaWv1BByd9T4RIahCKIbaZbGIsAAAAEXNzaDptb3RyaWNlLXRvdWNo bjorn@motrice yubikey-25563157 touch-only
+sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAILz0bbDs14N8pzU8kxuaWv1BByd9T4RIahCKIbaZbGIsAAAAEXNzaDptb3RyaWNlLXRvdWNo maintainer approval key (hardware, touch required)
