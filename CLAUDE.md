@@ -208,10 +208,14 @@ to fetch the mise-pinned hygiene tools.
   A body explaining why, and what was decided.
 
   Bead: gc-a1c9
-  Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
   Signed-off-by: Bjorn Molin <bjorn.molin@motrice.se>
   ```
 
+- **No `Co-Authored-By` trailer, for Claude or any other tool.** The maintainer's
+  decision, applied to the whole history: `main` was rewritten to remove them.
+  Authorship of agent work is recorded by the bead it came from and by the
+  maintainer's signature on the landing, both of which say more than a trailer
+  naming a model.
 - **Every commit is signed off** (`git commit -s`), which is a DCO attestation
   that the committer has the right to submit the work. Agent commits carry the
   maintainer's sign-off by explicit decision, because the maintainer reviews and
