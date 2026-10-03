@@ -189,12 +189,20 @@ to fetch the mise-pinned hygiene tools.
 ## Conventions
 
 - **Conventional commits**, enforced by CI. The bead goes in a trailer, so the
-  ledger and the diff stay linked:
+  ledger and the diff stay linked. Every trailer must be in **one unbroken block
+  at the very end** — git reads only the final paragraph as trailers, so a blank
+  line above `Co-Authored-By` silently demotes `Bead:` to body text. The first
+  sixteen commits here were written that way and their `Bead:` trailers do not
+  parse; `git log --format='%(trailers:key=Bead,valueonly)'` is how to check:
 
   ```text
   feat(domain): reject withdrawals that would overdraw an account
 
+  A body explaining why, and what was decided.
+
   Bead: gc-a1c9
+  Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+  Signed-off-by: Bjorn Molin <bjorn.molin@motrice.se>
   ```
 
 - **Clippy pedantic is denied, not warned.** Fix the lint rather than
