@@ -1,6 +1,12 @@
 //! What the application needs from the outside world, stated as what it needs
 //! rather than as what will provide it.
 //!
+//! Every port requires `Send + Sync`. These are driven from an HTTP server that
+//! handles requests concurrently, so a port that could not cross a thread would
+//! be unusable in the only place it is ever used — and the compiler would report
+//! it as an inscrutable "handler does not implement Handler" rather than as the
+//! design mistake it is.
+//!
 //! Every trait here is declared by the side that *needs* the capability, never
 //! by the side that implements it. That inversion is the whole mechanism: it is
 //! why `crates/architecture` can prove the arrows point inward, and why these
@@ -21,7 +27,7 @@ use domain::{
 /// Nothing here names a header, an encoding or an algorithm. An implementation
 /// that needed to would be telling you it is a transport detail wearing a port's
 /// clothes.
-pub trait Signatures {
+pub trait Signatures: Send + Sync {
     /// The signature this Origin's secret produces over these bytes.
     ///
     /// # Errors
@@ -30,6 +36,34 @@ pub trait Signatures {
     /// deliberately not the same outcome as a mismatch: one means we could not
     /// check, the other means we checked and it was wrong.
     fn expected(&self, origin: &Origin, body: &Body) -> Result<Signature, SecretUnavailable>;
+
+    /// Read the signature a sender claimed, from whatever it presented.
+    ///
+    /// The application knows that a sender presents *something*; only the
+    /// adapter knows how that something is spelled. Taking the presented value
+    /// as text keeps the scheme — a prefix, an encoding, a digest length — on
+    /// the adapter's side of the boundary.
+    ///
+    /// This lives on the same port as `expected` because reading a signature and
+    /// computing one are halves of a single scheme. Splitting them would leave
+    /// an inbound adapter needing to depend on a signature adapter, which the
+    /// architecture test forbids and which would be wrong anyway.
+    ///
+    /// # Errors
+    ///
+    /// [`MalformedSignature`] if the value is not a signature we can compare.
+    /// Distinct from a mismatch: the sender presented nothing usable, so no
+    /// comparison was possible.
+    fn claimed(&self, presented: &str) -> Result<Signature, MalformedSignature>;
+}
+
+/// A sender presented something that is not a signature we can compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedSignature {
+    /// The scheme is absent or not one we recognise.
+    UnknownScheme,
+    /// The scheme was recognised, but the value could not be read.
+    Unreadable,
 }
 
 /// An Origin's secret could not be obtained, so no judgement was possible.
@@ -45,7 +79,7 @@ pub struct SecretUnavailable;
 ///
 /// The implementation lives in the adapter for each Origin, because mapping a
 /// foreign payload onto an `Event` is exactly the anti-corruption layer.
-pub trait Translator {
+pub trait Translator: Send + Sync {
     /// The Events this Delivery reports.
     ///
     /// An empty result is success: a Delivery describing something we do not
@@ -67,7 +101,7 @@ pub struct Untranslatable;
 /// synchronous on purpose: a Clock that must be awaited buys nothing and costs
 /// every caller.
 #[async_trait]
-pub trait Dispatcher {
+pub trait Dispatcher: Send + Sync {
     /// Deliver this Event to this Destination.
     ///
     /// The `delivery` identity is passed so an implementation can correlate its
@@ -104,13 +138,13 @@ pub enum DispatchFailed {
 /// A port because reading the clock is an effect, and `purity` fails the build
 /// if the domain or this crate tries it directly. A fixed implementation in a
 /// test is what makes these tests fast and never flaky.
-pub trait Clock {
+pub trait Clock: Send + Sync {
     /// The current moment.
     fn now(&self) -> Timestamp;
 }
 
 /// Fresh identities.
-pub trait Ids {
+pub trait Ids: Send + Sync {
     /// A Delivery identity that has not been used before.
     ///
     /// Infallible by contract: an implementation that cannot produce a usable

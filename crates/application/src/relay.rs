@@ -168,8 +168,8 @@ mod tests {
 
     use super::{Refused, Relay};
     use crate::ports::{
-        Clock, DispatchFailed, Dispatcher, Ids, SecretUnavailable, Signatures, Translator,
-        Untranslatable,
+        Clock, DispatchFailed, Dispatcher, Ids, MalformedSignature, SecretUnavailable, Signatures,
+        Translator, Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
@@ -178,6 +178,12 @@ mod tests {
     impl Signatures for Secret {
         fn expected(&self, _origin: &Origin, _body: &Body) -> Result<Signature, SecretUnavailable> {
             self.0.clone()
+        }
+
+        /// The use case never calls this — an inbound adapter does, before it has
+        /// anything to relay — so the fake is honest about not being exercised.
+        fn claimed(&self, _presented: &str) -> Result<Signature, MalformedSignature> {
+            unreachable!("the relay is given a claimed signature, it does not read one")
         }
     }
 
