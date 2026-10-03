@@ -316,6 +316,16 @@ _ensure-devtools:
 #
 # The tip is amended rather than added to, so CI runs on the exact object that
 # will become main.
+# Mirror main to the local Forgejo remote, which runs the fast gate.
+#
+# Deleted by accident in 568b71e and restored: the gate checks that this file
+# parses, never that a recipe still exists, so a lost recipe is invisible until
+# somebody reaches for it.
+[doc("Push main to Forgejo, which runs the fast gate")]
+[group('ship')]
+mirror:
+    git push forgejo main
+
 [doc("Sign a reviewed bead tip with the YubiKey (maintainer only)")]
 [group('ship')]
 approve id:
