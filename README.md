@@ -187,9 +187,6 @@ file paths, so pipe into them rather than passing a filename.
 
 `bd ready` is the real list. The ones worth knowing about up front:
 
-- **Licence and copyright holder are assumed, not confirmed** — EUPL-1.2 for
-  code, CC-BY-4.0 for docs, CC0-1.0 for config, "Motrice AB" as the holder.
-  Settle before the first public push (`gc-7kg`).
 - **`main` is not yet protected**, so the human-merges rule is currently only a
   sentence in `CLAUDE.md` (`gc-rdz`).
 - **The boundary test cannot see inside source files.** A domain file calling

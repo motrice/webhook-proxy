@@ -3,9 +3,11 @@ version = 1
 # Blanket annotations keep SPDX headers out of every source file while staying
 # REUSE-compliant, which is what reusable-ci's devbasecheck verifies.
 #
-# ASSUMPTION — confirm before the first public push: copyright holder and
-# licence. To change the licence:
-#   reuse download <SPDX-ID> && rm LICENSES/EUPL-1.2.txt
+# Confirmed by the copyright holder (bead gc-7kg): EUPL-1.2 for code, CC-BY-4.0
+# for documentation, CC0-1.0 for configuration, "Motrice AB" as the holder. These
+# were originally a guess chosen to match the diggsweden ecosystem; they are no
+# longer. To change one:
+#   reuse download <SPDX-ID> && rm LICENSES/<old>.txt
 #   then update SPDX-License-Identifier below and `license` in Cargo.toml.
 
 [[annotations]]
