@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use application::ports::{SecretUnavailable, Signatures};
+use application::ports::{MalformedSignature, SecretUnavailable, Signatures};
 use domain::{Body, Origin, Signature};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -27,18 +27,6 @@ const SCHEME: &str = "sha256=";
 /// can reach a log line by way of a `Debug` on a domain value.
 pub struct GithubSignatures {
     secrets: HashMap<String, Vec<u8>>,
-}
-
-/// A claimed signature header could not be read.
-///
-/// Not the same thing as a mismatch: this means the request did not present
-/// something we could compare at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MalformedSignature {
-    /// Missing or unrecognised `sha256=` prefix.
-    UnknownScheme,
-    /// The part after the prefix is not a hex-encoded SHA-256 digest.
-    NotHex,
 }
 
 impl GithubSignatures {
@@ -66,34 +54,27 @@ impl Signatures for GithubSignatures {
             mac.finalize().into_bytes().as_slice().to_vec(),
         ))
     }
-}
 
-/// Reads the signature a request claims, from the value GitHub sends in
-/// `X-Hub-Signature-256`.
-///
-/// Lives here rather than in the HTTP adapter because the spelling of a
-/// signature is part of GitHub's scheme, not part of being an HTTP server.
-///
-/// # Errors
-///
-/// [`MalformedSignature`] if the value is absent a known scheme or is not a
-/// hex-encoded SHA-256 digest. A malformed header is never treated as a match,
-/// and never panics: it arrives from the open internet.
-pub fn claimed(header: &str) -> Result<Signature, MalformedSignature> {
-    let digest = header
-        .strip_prefix(SCHEME)
-        .ok_or(MalformedSignature::UnknownScheme)?;
+    /// Reads the value GitHub sends in `X-Hub-Signature-256`.
+    ///
+    /// A malformed value is never treated as a match and never panics: these
+    /// arrive from the open internet.
+    fn claimed(&self, presented: &str) -> Result<Signature, MalformedSignature> {
+        let digest = presented
+            .strip_prefix(SCHEME)
+            .ok_or(MalformedSignature::UnknownScheme)?;
 
-    // Check the length before decoding so a short-but-valid hex string cannot
-    // produce a shorter signature that happens to compare equal to a truncated
-    // one. The domain rejects differing lengths too; both is cheap.
-    if digest.len() != HEX_DIGEST {
-        return Err(MalformedSignature::NotHex);
+        // Check the length before decoding, so a short-but-valid hex string
+        // cannot produce a shorter signature that happens to compare equal to a
+        // truncated one. The domain rejects differing lengths too; both is cheap.
+        if digest.len() != HEX_DIGEST {
+            return Err(MalformedSignature::Unreadable);
+        }
+
+        hex::decode(digest)
+            .map(Signature::from_bytes)
+            .map_err(|_| MalformedSignature::Unreadable)
     }
-
-    hex::decode(digest)
-        .map(Signature::from_bytes)
-        .map_err(|_| MalformedSignature::NotHex)
 }
 
 #[cfg(test)]
@@ -103,7 +84,9 @@ mod tests {
     use application::ports::Signatures;
     use domain::{Body, Origin, OriginId, SecretId};
 
-    use super::{GithubSignatures, MalformedSignature, claimed};
+    use application::ports::MalformedSignature;
+
+    use super::GithubSignatures;
 
     /// A real-shaped GitHub push payload, byte for byte as it would arrive.
     const BODY: &[u8] = include_bytes!("../fixtures/push.json");
@@ -132,7 +115,7 @@ mod tests {
             .expected(&origin(), &Body::from_bytes(BODY.to_vec()))
             .expect("the secret is known");
 
-        assert!(expected.matches(&claimed(SIGNATURE).expect("a well-formed header")));
+        assert!(expected.matches(&verifier().claimed(SIGNATURE).expect("a well-formed header")));
     }
 
     #[test]
@@ -145,7 +128,7 @@ mod tests {
             .expected(&origin(), &Body::from_bytes(tampered))
             .expect("the secret is known");
 
-        assert!(!expected.matches(&claimed(SIGNATURE).expect("a well-formed header")));
+        assert!(!expected.matches(&verifier().claimed(SIGNATURE).expect("a well-formed header")));
     }
 
     #[test]
@@ -165,7 +148,7 @@ mod tests {
             .expected(&origin(), &Body::from_bytes(reserialised))
             .expect("the secret is known");
 
-        assert!(!expected.matches(&claimed(SIGNATURE).expect("a well-formed header")));
+        assert!(!expected.matches(&verifier().claimed(SIGNATURE).expect("a well-formed header")));
     }
 
     #[test]
@@ -181,21 +164,33 @@ mod tests {
     fn a_header_without_the_scheme_is_malformed() {
         let digest = SIGNATURE.trim_start_matches("sha256=");
 
-        assert_eq!(claimed(digest), Err(MalformedSignature::UnknownScheme));
-        assert_eq!(claimed(""), Err(MalformedSignature::UnknownScheme));
         assert_eq!(
-            claimed(&format!("sha1={digest}")),
+            verifier().claimed(digest),
+            Err(MalformedSignature::UnknownScheme)
+        );
+        assert_eq!(
+            verifier().claimed(""),
+            Err(MalformedSignature::UnknownScheme)
+        );
+        assert_eq!(
+            verifier().claimed(&format!("sha1={digest}")),
             Err(MalformedSignature::UnknownScheme)
         );
     }
 
     #[test]
     fn a_header_that_is_not_a_sha256_digest_is_malformed() {
-        assert_eq!(claimed("sha256="), Err(MalformedSignature::NotHex));
-        assert_eq!(claimed("sha256=abcd"), Err(MalformedSignature::NotHex));
         assert_eq!(
-            claimed(&format!("sha256={}", "z".repeat(64))),
-            Err(MalformedSignature::NotHex)
+            verifier().claimed("sha256="),
+            Err(MalformedSignature::Unreadable)
+        );
+        assert_eq!(
+            verifier().claimed("sha256=abcd"),
+            Err(MalformedSignature::Unreadable)
+        );
+        assert_eq!(
+            verifier().claimed(&format!("sha256={}", "z".repeat(64))),
+            Err(MalformedSignature::Unreadable)
         );
     }
 
@@ -208,7 +203,10 @@ mod tests {
             "sha256=\u{00e9}",
             "sha256= 3c44f4b37e605fd32cbdf163352a8b98e088640043c79542c153281943fb1c4",
         ] {
-            assert!(claimed(value).is_err(), "{value:?} should be rejected");
+            assert!(
+                verifier().claimed(value).is_err(),
+                "{value:?} should be rejected"
+            );
         }
     }
 
