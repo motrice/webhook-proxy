@@ -302,54 +302,113 @@ ci:
     printf 'watching run %s for %s\n' "$run" "${head:0:7}"
     gh run watch "$run" --exit-status --interval 15
 
-# Push a branch, retrying a transient failure.
-#
-# GitHub's SSH endpoint drops connections often enough from here that a single
-# attempt loses work: four beads hit `git exit 128` and every one succeeded on a
-# manual retry. A genuine failure still fails, after three tries.
-[private]
-_push branch:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for attempt in 1 2 3; do
-        if git push -u origin "{{ branch }}"; then
-            exit 0
-        fi
-        printf 'push failed (attempt %d of 3), retrying\n' "$attempt" >&2
-        sleep $((attempt * 3))
-    done
-    printf 'push failed three times; this is not a transient problem\n' >&2
-    exit 1
-
-# Mirror main to the local Forgejo remote for the fast gate.
-[group('ship')]
-mirror:
-    git push forgejo main
-
 [private]
 _ensure-devtools:
     @just setup-devtools
 
-# ▪ MAINTAINER ONLY. Land a reviewed bead on main, preserving its signatures.
+# ▪ MAINTAINER ONLY. Approve a reviewed bead by signing its tip with the YubiKey.
 #
-# A fast-forward creates no commit, so the signed objects from the branch become
-# main's history unchanged. GitHub's merge buttons cannot do this: "Rebase and
-# merge" rewrites every commit and does not re-sign it, which is why main carried
-# twenty-one unsigned commits while every branch was signed.
+# This is the only step in the workflow that cannot be automated, and that is the
+# point. Every agent commit already carries the maintainer's name and email, so
+# authorship distinguishes nothing; a FIDO2 signature cannot exist unless somebody
+# physically touched the authenticator. Re-signing the tip is therefore the proof
+# that a human was in the loop, and `land` refuses to proceed without it.
 #
-# Refuses anything that is not a true fast-forward, so a branch that has fallen
-# behind must be rebased first rather than quietly becoming a merge commit.
+# The tip is amended rather than added to, so CI runs on the exact object that
+# will become main.
+[doc("Sign a reviewed bead tip with the YubiKey (maintainer only)")]
+[group('ship')]
+approve id:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch="bead/{{ id }}"
+    key="${APPROVAL_KEY:-$HOME/.ssh/id_ed25519_sk_touch.pub}"
+    if [[ ! -f "$key" ]]; then
+        printf 'no approval key at %s\n' "$key" >&2
+        printf 'set APPROVAL_KEY, or see docs/approval-keys for what land accepts\n' >&2
+        exit 1
+    fi
+    git switch --quiet "$branch"
+    printf 'touch the YubiKey when it blinks\n'
+    git -c user.signingkey="$key" commit --amend --no-edit --quiet
+    printf 'approved: %s\n' "$(git log --format='%h %G? signed-by=%GK' -1)"
+    just _push "$branch"
+    printf 'wait for CI to pass, then: just land %s\n' "{{ id }}"
+
+# ▪ MAINTAINER ONLY. Land an approved bead on main, preserving its signature.
+#
+# Refuses unless the tip carries a good signature from a key in
+# docs/approval-keys — all of which are hardware-backed, so landing without a
+# human present is not merely discouraged but impossible.
+#
+# A fast-forward creates no commit, so the approved object becomes main unchanged.
+# GitHub's merge buttons cannot do this: "Rebase and merge" rewrites every commit
+# and does not re-sign it, which is how main came to carry twenty-one unsigned
+# commits while every branch was signed.
+[doc("Fast-forward main from an approved bead (maintainer only)")]
 [group('ship')]
 land id:
     #!/usr/bin/env bash
     set -euo pipefail
     branch="bead/{{ id }}"
     git fetch --quiet origin
+    tip="origin/$branch"
+
+    status=$(git log --format='%G?' -1 "$tip")
+    signer=$(git log --format='%GK' -1 "$tip")
+    if [[ "$status" != "G" ]]; then
+        printf 'the tip of %s carries no good signature (git reports %s)\n' "$branch" "$status" >&2
+        exit 1
+    fi
+    if ! ssh-keygen -lf docs/approval-keys | awk '{print $2}' | grep -qxF "$signer"; then
+        printf 'the tip of %s is signed by %s,\n' "$branch" "$signer" >&2
+        printf 'which is not a key listed in docs/approval-keys.\n' >&2
+        printf 'a human has not approved this: just approve %s\n' "{{ id }}" >&2
+        exit 1
+    fi
+
     git switch --quiet main
-    git merge --ff-only "origin/$branch" || {
+    if ! git merge --ff-only "$tip"; then
         printf 'not a fast-forward. rebase %s onto main first:\n' "$branch" >&2
         printf '  git switch %s && git rebase origin/main && just verify\n' "$branch" >&2
         exit 1
-    }
+    fi
     printf 'main is now %s\n' "$(git log --format='%h %G? %s' -1)"
     just _push main
+
+# Push a branch, retrying only what is worth retrying.
+#
+# A bead branch is amended constantly while iterating, and approving amends it
+# again, so pushing one is a force-push by nature — with a lease, so a push that
+# would discard somebody else's work still fails. main is never force-pushed: a
+# fast-forward is the only way it is meant to move.
+#
+# A rejection by the remote is permanent and is reported as such. The previous
+# version retried one three times and then announced "this is not a transient
+# problem", which read as a network verdict and sent me off testing SSH while the
+# actual cause was an amended commit.
+[private]
+_push branch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch="{{ branch }}"
+    if [[ "$branch" == bead/* ]]; then
+        args=(--force-with-lease -u origin "$branch")
+    else
+        args=(-u origin "$branch")
+    fi
+    for attempt in 1 2 3; do
+        if output=$(git push "${args[@]}" 2>&1); then
+            printf '%s\n' "$output"
+            exit 0
+        fi
+        printf '%s\n' "$output" >&2
+        if grep -qE 'rejected|non-fast-forward|stale info|fetch first' <<<"$output"; then
+            printf 'the remote rejected this; that is not a connection problem, so not retrying\n' >&2
+            exit 1
+        fi
+        printf 'push failed (attempt %d of 3), retrying\n' "$attempt" >&2
+        sleep $((attempt * 3))
+    done
+    printf 'push failed three times\n' >&2
+    exit 1
