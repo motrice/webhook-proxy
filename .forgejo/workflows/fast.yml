@@ -9,10 +9,16 @@
 # point at different code, which is the same supply-chain exposure one layer
 # down from pinning the reusable workflow.
 #
-# Caveat for this runner: Forgejo resolves bare action names against whichever
-# host it is configured for. If it does not resolve these GitHub SHAs, pin the
-# equivalent Codeberg actions here instead rather than reverting to tags —
-# see bead gc-fle, which stands up this runner.
+# Forgejo resolves bare action names against its own mirror at
+# https://data.forgejo.org. For these tags the mirror shares upstream's history,
+# so the SHAs below are the same objects .github/workflows/pr.yml pins — that is
+# not a coincidence to be tidied away, it is why one SHA can serve both.
+#
+# Version choice is constrained by the runner, not by taste: forgejo-runner 9.0.3
+# accepts `runs.using` of node12, node16 or node20 only. The mirror's newer tags
+# declare node24, and a job using one dies immediately with
+# "The runs.using key in action.yml must be one of: [...], got node24".
+# So these are pinned at the newest versions that still declare node20.
 name: check
 
 on:
@@ -23,17 +29,17 @@ jobs:
   check:
     runs-on: docker
     container:
-      image: rust:1.95-bookworm
+      # Built from deploy/ci-image/Containerfile and present in the runner's own
+      # Docker storage — there is no registry behind this tag. See that
+      # directory's README: the image must be rebuilt if the runner pod is
+      # replaced, because its storage is ephemeral.
+      #
+      # It carries rust, node, just and cargo-machete, so this job installs
+      # nothing. Installing a toolchain per run would make the fast gate slower
+      # than the GitHub gate it exists to pre-empt.
+      image: webhook-proxy-ci:1
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install just
-        run: |
-          set -euo pipefail
-          cargo install just --locked --version 1.50.0
-
-      - name: Install cargo-machete
-        run: cargo install cargo-machete --locked
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Cache cargo registry and target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
