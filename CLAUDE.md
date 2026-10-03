@@ -94,8 +94,10 @@ no more than this:
 - **When a bead builds on an unmerged one**, pass its branch as the base:
   `just pr <id> bead/<parent>`. Do not delete a base branch while a PR targets
   it — GitHub closes that PR and it cannot be reopened once the base is gone.
-- **You must not** merge a PR, push to `main`, force-push a branch anyone else
-  may have, or edit CI workflow files without a `decision` bead.
+- **You must not** merge a PR, run `just land`, push to `main`, force-push a
+  branch anyone else may have, or edit CI workflow files without a `decision`
+  bead. `just land` is the maintainer's command; a branch that is not a
+  fast-forward is rebased by you and landed by them.
 - **You must not** weaken a rule in `crates/architecture/` — widening
   `allowed_external`, or adding an exemption to the forbidden-effects list — in
   the same commit as a feature. Separate commit, referencing a `decision` bead,
@@ -205,6 +207,21 @@ to fetch the mise-pinned hygiene tools.
   Signed-off-by: Bjorn Molin <bjorn.molin@motrice.se>
   ```
 
+- **Every commit is signed off** (`git commit -s`), which is a DCO attestation
+  that the committer has the right to submit the work. Agent commits carry the
+  maintainer's sign-off by explicit decision, because the maintainer reviews and
+  merges every one.
+- **Every commit is cryptographically signed.** `commit.gpgsign` is set
+  repo-locally with a dedicated SSH signing key, and `.gommitlint.yaml` sets
+  `crypto_signature.required`, so an unsigned commit fails the gate. The default
+  is `required: false`, which made the rule report a tick on sixteen unsigned
+  commits — a check that cannot fail is worse than no check.
+- **Land with a fast-forward, never with a merge button.** `gh pr merge --rebase`
+  rewrites every commit and GitHub does not re-sign it, which is how `main` came
+  to carry twenty-one unsigned commits while every branch was signed. A
+  fast-forward creates no commit, so the signed objects become `main` unchanged
+  and history stays linear. `just land <id>` does it and refuses anything that is
+  not a true fast-forward.
 - **Clippy pedantic is denied, not warned.** Fix the lint rather than
   `#[allow]`-ing it; if an allow is genuinely right, the comment above it says
   why in terms of this code, not in terms of the lint.
