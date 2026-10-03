@@ -329,3 +329,27 @@ mirror:
 [private]
 _ensure-devtools:
     @just setup-devtools
+
+# ▪ MAINTAINER ONLY. Land a reviewed bead on main, preserving its signatures.
+#
+# A fast-forward creates no commit, so the signed objects from the branch become
+# main's history unchanged. GitHub's merge buttons cannot do this: "Rebase and
+# merge" rewrites every commit and does not re-sign it, which is why main carried
+# twenty-one unsigned commits while every branch was signed.
+#
+# Refuses anything that is not a true fast-forward, so a branch that has fallen
+# behind must be rebased first rather than quietly becoming a merge commit.
+[group('ship')]
+land id:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch="bead/{{ id }}"
+    git fetch --quiet origin
+    git switch --quiet main
+    git merge --ff-only "origin/$branch" || {
+        printf 'not a fast-forward. rebase %s onto main first:\n' "$branch" >&2
+        printf '  git switch %s && git rebase origin/main && just verify\n' "$branch" >&2
+        exit 1
+    }
+    printf 'main is now %s\n' "$(git log --format='%h %G? %s' -1)"
+    just _push main

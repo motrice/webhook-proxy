@@ -1,0 +1,18 @@
+# Commit-health rules beyond gommitlint's defaults.
+#
+# The defaults ship crypto_signature with `required: false`, which means the rule
+# passes when a commit carries no signature at all. It reported a tick on the
+# first sixteen commits here, every one of them unsigned — a check that cannot
+# fail is worse than no check, because its tick gets read as evidence.
+gommitlint:
+  crypto_signature:
+    # The signature must exist. This is the whole point.
+    required: true
+    # And it must be an SSH signature, which is what this project uses
+    # (gpg.format=ssh with a dedicated signing key — see bead gc-9p1).
+    require_ssh: true
+    # Deliberately NOT set: verify_format and allowed_signers. Verifying that a
+    # signature is *trusted* rather than merely present needs the accepted public
+    # keys available wherever gommitlint runs, which means committing an
+    # allowed_signers file and deciding whose keys belong in it. Worth doing, and
+    # a separate decision from requiring a signature at all.
