@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forgejo-runner-config
+  namespace: forgejo-runner
+data:
+  config.yaml: |
+    # job_level is the point of this file. Without it the runner logs that a task
+    # started and that its network was cleaned up, and nothing about why the job
+    # failed — and Forgejo's API exposes no endpoint for job logs, so a failing
+    # gate is undiagnosable from outside the UI.
+    log:
+      level: info
+      job_level: debug
+    runner:
+      file: /data/.runner
+      capacity: 1
+    container:
+      # Already the default; stated because the job image is built straight into
+      # this runner's Docker storage and no registry serves that tag. A forced
+      # pull would fail every run.
+      force_pull: false

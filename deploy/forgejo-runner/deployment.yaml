@@ -1,0 +1,176 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forgejo-runner
+  namespace: forgejo-runner
+spec:
+  # One. Two runners would both claim jobs from the same queue, which is fine,
+  # but they would also both register under the same name and make the admin
+  # view hard to read. Scale up deliberately, with distinct names.
+  replicas: 1
+  strategy:
+    # The PVC is ReadWriteOnce, so a rolling update would deadlock waiting for a
+    # second pod to mount it.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: forgejo-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: forgejo-runner
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        # Registers once and writes .runner to the volume. On a restart the file
+        # is already there and this exits immediately, so Forgejo does not
+        # accumulate a new runner record per pod.
+        - name: register
+          image: code.forgejo.org/forgejo/runner:9.0.3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          command:
+            - sh
+            - -ec
+            - |
+              if [ -f /data/.runner ]; then
+                echo "already registered; leaving .runner alone"
+                exit 0
+              fi
+              forgejo-runner register \
+                --no-interactive \
+                --instance "$FORGEJO_INSTANCE_URL" \
+                --token "$FORGEJO_RUNNER_REGISTRATION_TOKEN" \
+                --name "$FORGEJO_RUNNER_NAME" \
+                --labels "$FORGEJO_RUNNER_LABELS"
+          env:
+            # The in-cluster service, deliberately not https://forgejo.dev.test:8443.
+            # The external name is served with an mkcert certificate that only the
+            # developer machine trusts, so a runner using it would need that CA
+            # mounted. Talking to the service directly avoids the problem rather
+            # than solving it.
+            - name: FORGEJO_INSTANCE_URL
+              value: http://forgejo.forgejo.svc.cluster.local:3000
+            - name: FORGEJO_RUNNER_NAME
+              value: k3s-docker
+            # `runs-on: docker` in .forgejo/workflows/fast.yml must match a label
+            # here. The image after the `//` is only the default when a workflow
+            # names no container of its own; fast.yml names rust:1.95-bookworm,
+            # which overrides it.
+            - name: FORGEJO_RUNNER_LABELS
+              value: docker:docker://alpine:3.20
+            - name: FORGEJO_RUNNER_REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: forgejo-runner-token
+                  key: token
+          volumeMounts:
+            - name: state
+              mountPath: /data
+      containers:
+        - name: runner
+          image: code.forgejo.org/forgejo/runner:9.0.3
+          # Only the dind sidecar needs privilege. This container talks to it
+          # over a socket, which needs no capability at all.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          # Waits for the sidecar before starting, because the daemon does not
+          # retry: it pings Docker once and exits. dockerd needs several seconds
+          # to load containers, so without this the runner reliably dies before
+          # Docker is listening and the pod crash-loops its way to working.
+          command:
+            - sh
+            - -ec
+            - |
+              until nc -z localhost 2375; do
+                echo "waiting for the docker daemon"
+                sleep 1
+              done
+              exec forgejo-runner daemon --config /config/config.yaml
+          workingDir: /data
+          env:
+            # TCP on the pod's own network namespace, not a shared unix socket.
+            # The socket route fails on permissions: dockerd creates it owned by
+            # root:docker, and this container runs unprivileged in a different
+            # group, so it cannot open it. TCP has no such problem and needs no
+            # supplemental group guesswork about the sidecar's gids.
+            - name: DOCKER_HOST
+              value: tcp://localhost:2375
+          volumeMounts:
+            - name: state
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              memory: 2Gi
+        # Docker-in-Docker, and the reason this namespace is separate.
+        #
+        # k3s runs containerd, not Docker, so there is no host Docker socket to
+        # mount — the usual lighter alternative is simply not available here. A
+        # workflow using `container:` therefore needs a Docker daemon, and that
+        # daemon needs privileged.
+        #
+        # The alternative, if privileged is unacceptable: change fast.yml to
+        # `runs-on: host`, drop its `container:` block, and build a runner image
+        # with the Rust toolchain baked in. That removes the privileged container
+        # at the cost of pinning the toolchain in an image rather than in
+        # rust-toolchain.toml, which is a worse place for it.
+        - name: dind
+          image: docker:27-dind
+          # The only suppressed security finding in this repository, and it is
+          # suppressed rather than fixed because there is nothing here to fix:
+          # k3s offers no non-privileged container runtime for CI jobs, so a
+          # workflow using `container:` requires a Docker daemon and a Docker
+          # daemon requires this. The exposure is bounded by keeping the runner
+          # in a namespace of its own, in a development cluster, serving one
+          # repository.
+          #
+          # The alternative was weighed and rejected: `runs-on: host` removes the
+          # privileged container, but the runner image is Alpine/musl while
+          # GitHub builds on ubuntu/glibc, so the fast gate would stop predicting
+          # the slow one — which is the only reason the fast gate exists.
+          #
+          # Revisit if this cluster gains a sandboxed runtime, or if the runner
+          # ever serves something that matters more than a test repository.
+          securityContext: # nosemgrep: yaml.kubernetes.security.allow-privilege-escalation.allow-privilege-escalation
+            privileged: true # nosemgrep: yaml.kubernetes.security.privileged-container.privileged-container
+          env:
+            # Empty disables TLS, which makes the entrypoint listen on
+            # tcp://0.0.0.0:2375. dockerd prints a loud deprecation warning about
+            # an unencrypted API, and it is right in general: that port is root
+            # access. Here it is reachable only from this pod's own network
+            # namespace, which is the same trust boundary a shared socket would
+            # have had.
+            - name: DOCKER_TLS_CERTDIR
+              value: ""
+          volumeMounts:
+            - name: docker-storage
+              mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 4Gi
+      volumes:
+        - name: config
+          configMap:
+            name: forgejo-runner-config
+        - name: state
+          persistentVolumeClaim:
+            claimName: forgejo-runner-state
+        - name: docker-storage
+          # Build layers and the Rust target directory live here. Deliberately
+          # ephemeral: a cold cache costs minutes, a corrupted one costs an
+          # afternoon.
+          emptyDir: {}

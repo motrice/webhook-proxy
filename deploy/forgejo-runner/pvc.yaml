@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forgejo-runner-state
+  namespace: forgejo-runner
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Holds only the .runner registration file. It exists so that a restart
+      # reuses the existing registration instead of creating a new runner record
+      # in Forgejo every time the pod moves.
+      storage: 64Mi
+  # No storageClassName: take the cluster default. k3s ships local-path, which is
+  # right for this — the file is cheap to lose and re-register.

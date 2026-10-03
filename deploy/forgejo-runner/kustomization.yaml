@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The Secret is deliberately absent. See README.md: the registration token is
+# created with `kubectl create secret`, so no placeholder for it ever lives in
+# this repository and gitleaks has nothing to find.
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml

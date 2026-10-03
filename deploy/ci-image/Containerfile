@@ -1,0 +1,35 @@
+# The job container for .forgejo/workflows/fast.yml.
+#
+# It exists because the fast gate must be fast. Installing a Rust toolchain,
+# just and cargo-machete on every run would make the "fast" gate slower than the
+# GitHub one it is supposed to pre-empt.
+#
+# Node is here for a reason that is easy to miss: actions/checkout is a
+# JavaScript action, and Forgejo's runner executes JS actions with a node binary
+# inside *this* container. Without it a job dies in six seconds with
+# `exec: "node": executable file not found in $PATH`, before anything is built.
+
+# Only the binary is taken. The runner needs to execute JS actions, not to build
+# anything with npm, and both images are Debian 12 so the glibc matches.
+FROM node:22-bookworm-slim AS node
+
+# Debian rather than Alpine on purpose: GitHub's runner is ubuntu/glibc, and a
+# gate that builds against musl would stop predicting the gate it exists to
+# predict.
+FROM rust:1.95-bookworm
+
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+
+# One layer, and the registry cache is dropped afterwards: it is build-time
+# scaffolding worth about 200MB in the final image.
+RUN cargo install just --locked --version 1.50.0 \
+    && cargo install cargo-machete --locked --version 0.8.0 \
+    && rm -rf "${CARGO_HOME:-/usr/local/cargo}/registry"
+
+# Proves at build time that everything the gate needs is present, so a broken
+# image fails here rather than in a confusing CI log.
+RUN node --version \
+    && just --version \
+    && cargo machete --version \
+    && cargo --version \
+    && git --version
