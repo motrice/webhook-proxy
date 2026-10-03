@@ -1,4 +1,4 @@
-# bjorn-gas-city
+# webhook-proxy
 
 A Rust product, built by agents, under a workflow where the evidence is
 mechanical rather than social: you merge because the checks passed, not because
