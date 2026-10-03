@@ -1,0 +1,24 @@
+[package]
+name = "github-http"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain" }
+application = { path = "../../application" }
+axum = "0.8"
+tracing = "0.1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt"] }
+# Drives the router without binding a socket.
+tower = { version = "0.5", features = ["util"] }
+# Captures log output, so a test can prove no secret reaches it.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[lints]
+workspace = true
