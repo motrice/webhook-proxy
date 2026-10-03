@@ -1,0 +1,15 @@
+[package]
+name = "system"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain" }
+application = { path = "../../application" }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

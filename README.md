@@ -98,6 +98,33 @@ justfile               every command. `just verify` is the definition of done.
 .beads/                the work ledger (Dolt-backed).
 ```
 
+## Running it
+
+Configuration is entirely environment variables. Secrets have no defaults and no
+fallbacks: a deployment missing one fails to start rather than running in a state
+where it cannot authenticate what it receives.
+
+| Variable | Required | Meaning |
+| -------- | -------- | ------- |
+| `GITHUB_WEBHOOK_SECRET` | yes | the shared secret configured on the GitHub webhook |
+| `ELEMENT_WEBHOOK_URL` | yes | the hookshot webhook URL. A bearer credential — never commit it |
+| `ELEMENT_ROOM` | yes | the Destination identity, used in routing and in logs |
+| `WEBHOOK_PROXY_LISTEN` | no | default `127.0.0.1:8080`; `0.0.0.0:8080` in a container |
+| `WEBHOOK_PROXY_MAX_BODY` | no | default 1 MiB, refused before anything is verified or parsed |
+| `WEBHOOK_PROXY_TIMEOUT_MS` | no | default 5000, bounding each dispatch |
+
+To run it against a real repository: start it with the three required variables
+set, expose the port to the internet however you normally would (`ssh -R`, a
+tunnel, or an Ingress), then add a webhook to the repository pointing at
+`https://<host>/webhook/github` with content type `application/json`, the same
+secret, and just the push event. Push something. The room should say who pushed
+what where; if it does not, `GET /health` tells you the process is alive and the
+logs name any delivery that was dropped and why.
+
+`GET /health` answers `ok` from the process alone, and deliberately does not
+check the destination: a probe that failed when a chat server hiccupped would
+restart a healthy proxy.
+
 ## Working on it
 
 ```bash
