@@ -8,4 +8,16 @@
 #
 # This file is committed so that changing who may approve is a reviewable diff
 # rather than somebody's local git config.
+#
+# The comment on the key below carries no device serial. ssh-keygen puts one in
+# the comment it generates; it was taken out when the key was added here. That
+# was tidiness, not secrecy -- a serial cannot produce a signature, it is printed
+# on the authenticator, and Yubico's attestation certificates contain it.
+#
+# The serial is still in this file's git history. That is a decision, not an
+# oversight: see bead gc-24y. Taking it out means rewriting every commit from
+# f9134d4 onward, which invalidates the hardware signatures this file exists to
+# demand, and GitHub keeps the old blobs on refs/pull/* either way. The audit in
+# that bead also confirms what is *not* in history -- no tokens, no endpoints, no
+# bead prose. Read it before proposing the rewrite.
 sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAILz0bbDs14N8pzU8kxuaWv1BByd9T4RIahCKIbaZbGIsAAAAEXNzaDptb3RyaWNlLXRvdWNo maintainer approval key (hardware, touch required)
