@@ -12,6 +12,7 @@
 
 mod delivery;
 mod event;
+mod label;
 mod origin;
 mod routing;
 mod signature;
@@ -21,6 +22,7 @@ pub use delivery::{Body, Delivery, DeliveryId, VerifiedDelivery};
 pub use event::{
     Blank, BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary,
 };
+pub use label::{LabelName, LabelValue, Labels};
 pub use origin::{Origin, OriginId, SecretId};
 pub use routing::{
     Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,

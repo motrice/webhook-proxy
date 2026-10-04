@@ -32,7 +32,7 @@ that as the defect, ahead of anything about the code.
 | **Signature** | A signature over a Body, as raw bytes, independent of algorithm or encoding. The domain compares signatures; adapters compute them. | The *secret* — a Signature is public, the key that produced it is not. |
 | **DeliveryId** | A Delivery's identity, minted at the inbound boundary. What a log line, and one day a replay, refers to. | A sender's own event id — that is theirs, this is ours. |
 | **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
-| **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` and `DeletedBranch` are the first two. | *Delivery*, and any Origin's own event name. |
+| **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` and `DeletedBranch` are the first two. Every Event offers the Labels it can be routed by. | *Delivery*, and any Origin's own event name. |
 | **PushedCommits** | An Event saying commits were pushed to a branch. The list may be empty, which means a push that changed nothing — a force-push to the commit that was already there. Carries a Permalink when the Origin published one. | **DeletedBranch** — an empty commit list is not a deletion. Only the sender's own flag tells them apart, and an inbound adapter is the only thing that sees it. |
 | **DeletedBranch** | An Event saying a branch no longer exists. Carries no commits, and the type has no field for any: deleting a branch pushes nothing. | **PushedCommits** with an empty list — a reader needs a different sentence for each, which is why these are two variants and not one with a flag. |
 | **Commit** | One commit, reduced to what a Destination needs to show: an identity and a one-line summary. | The full git object — the domain keeps no tree, no diff, no parents. |
@@ -41,7 +41,8 @@ that as the defect, ahead of anything about the code.
 | **Permalink** | Where a reader can go to see what happened, exactly as the Origin published it. Opaque: the domain never builds one, and never parses a scheme or a path out of one. | An *endpoint* — a Permalink is a reference to the subject of a fact, not the address of a system we talk to. A Destination still has no address, and `purity` forbids transport vocabulary in the domain. |
 | **Destination** | An internal system that should be told about Events: an Element room, Forgejo, GitLab. | *Origin* — Origins send to us, Destinations receive from us. |
 | **DestinationKind** | What shape an Event takes for a Destination: prose for people (a Notice) or structure for a machine. Decides which adapter handles it. | The product at the other end — a chat room is a chat room whichever vendor serves it. |
-| **Filter** | The rule inside a Subscription that decides whether a Destination cares about a given Event. | *Subscription* — the Subscription binds, the Filter selects. |
+| **Label** | A name and a value saying what a fact is about, under which an Event can be routed. One value per name. Both halves are attacker-influenced text, and both are checked for presence and nothing else. | A *header* or any other transport metadata — a label describes the fact, never how it arrived. And not a sender's own label conventions: ours carries no reserved spellings and no matcher grammar. |
+| **Filter** | The rule inside a Subscription that decides whether a Destination cares about a given Event: `Everything`, or `Labelled` with the labels a fact must carry. Values are compared for equality only — no negation, no regular expressions. | *Subscription* — the Subscription binds, the Filter selects. A `Labelled` filter requires *containment*, so a fact may carry labels no rule mentions. |
 | **Subscription** | A rule binding a set of Events to one Destination, with the filter that decides whether a given Event matches. | *Destination* — one Destination may have several Subscriptions. |
 | **Timestamp** | A moment, as milliseconds since the Unix epoch. Always an argument, never read from the clock inside the core. | The clock itself — that is a port. |
 | **Dispatch** | One attempt to deliver one Event to one Destination. Succeeds or fails on its own; a sibling's failure never affects it. | *Delivery* — opposite direction. Dispatch goes out, Delivery comes in. |
@@ -55,7 +56,15 @@ Also absent, and enforced rather than merely agreed: *URL*, *endpoint*, *header*
 adapter that reaches it, and `crates/architecture/tests/purity.rs` fails the
 build if one of those words appears in domain code. A fact may still carry a
 Permalink, because a reference to what happened is part of the fact rather than
-part of the mechanism — see bead gc-3pa.13 for why that line falls there.
+part of the mechanism — see bead gc-3pa.13 for why that line falls there. A Label
+is on the same side of that line for the same reason: it says what the fact is
+about, never how it arrived (`gc-ast.1`).
+
+Routing deliberately no longer asks an Event for a typed field. It asks every
+Event for its Labels, because a sender with no repository — an alert has a
+namespace and a severity — could not answer the old question at all. For a push
+the Labels are *projected* from the typed fields rather than stored, so they
+cannot disagree with the fields they came from.
 
 ## Bounded contexts
 
