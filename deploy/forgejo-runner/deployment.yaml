@@ -170,7 +170,24 @@ spec:
           persistentVolumeClaim:
             claimName: forgejo-runner-state
         - name: docker-storage
-          # Build layers and the Rust target directory live here. Deliberately
-          # ephemeral: a cold cache costs minutes, a corrupted one costs an
-          # afternoon.
-          emptyDir: {}
+          # The job image, the base layers it came from, and the build cache.
+          #
+          # This was an emptyDir, chosen so that a corrupted cache could never
+          # outlive a pod. That trade is reversed, because the cost on the other
+          # side turned out to be worse: the job image is built straight into this
+          # storage and no registry serves its tag, so replacing the pod deleted
+          # the image and the fast gate then failed with a pull error against a
+          # tag that resolves nowhere — a trap for whoever is on call when the
+          # pod moves, which is bead gc-guj.
+          #
+          # What made the original trade defensible also made it unnecessary: a
+          # corrupted cache is still cheap to lose. Delete this claim and the pod
+          # rebuilds everything from scratch; the README says how. So the
+          # corruption case costs one command, while the missing-image case cost
+          # an undiagnosable gate.
+          #
+          # Keeping the layers also means a replaced pod needs no network at all,
+          # which a registry would have given up — and a local gate that cannot
+          # run offline is a poor second opinion.
+          persistentVolumeClaim:
+            claimName: forgejo-runner-docker
