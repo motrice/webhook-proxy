@@ -109,6 +109,76 @@ const VENDOR: &[Forbidden] = &[
     },
 ];
 
+/// Transport vocabulary that must not reach the core: the words for *how* we
+/// reach a system, as opposed to *what* happened.
+///
+/// `Destination` deliberately carries no address — where a room lives, and the
+/// credential that opens it, are an adapter's knowledge — and until now only
+/// review enforced that across the crate.
+///
+/// The line this draws is mechanism versus subject. An endpoint, a header, a
+/// bearer credential and a status code are mechanism. A reference to the thing
+/// that happened is part of the fact: the domain never fetches it, parses it, or
+/// decides anything from it, so it is opaque in the way `CommitId` is opaque.
+/// That is why a `Permalink` passes this gate and `Destination { url }` does not
+/// — see bead gc-3pa.13, where the two were settled together.
+///
+/// Every needle below was checked against the existing domain first. `url`,
+/// `header` and `token` each appear exactly once, in a comment explaining what a
+/// `Destination` is not; the rest appear nowhere. Comments and string literals
+/// are blanked before matching, so prose may explain the rule and a test may
+/// still write a real address down.
+///
+/// Matched case-insensitively, so `Url`, `URL` and `url` are one mistake.
+///
+/// Deliberately absent: `port`, which is hexagonal vocabulary this codebase uses
+/// constantly and honestly; `address`, which an English sentence reaches for; and
+/// `status`, which a future domain enum could legitimately want — `statuscode`
+/// and `status_code` catch the transport sense without claiming the word.
+const TRANSPORT: &[Forbidden] = &[
+    Forbidden {
+        needle: "url",
+        why: "where something lives is an adapter's knowledge; if the Event must \
+              carry a reference to what happened, model it as a domain value the \
+              Origin's adapter supplies",
+    },
+    Forbidden {
+        needle: "http",
+        why: "the protocol belongs in an adapter; the domain returns values and \
+              knows nothing of how they travel",
+    },
+    Forbidden {
+        needle: "header",
+        why: "a header is transport metadata; whatever it carried must arrive as \
+              a domain value or not at all",
+    },
+    Forbidden {
+        needle: "bearer",
+        why: "a credential belongs in the adapter that presents it; the domain \
+              holds a SecretId at most, never a secret",
+    },
+    Forbidden {
+        needle: "token",
+        why: "a credential belongs in the adapter that presents it; the domain \
+              holds a SecretId at most, never a secret",
+    },
+    Forbidden {
+        needle: "endpoint",
+        why: "an endpoint is an address, and a Destination is identified by kind \
+              rather than by where it answers",
+    },
+    Forbidden {
+        needle: "statuscode",
+        why: "a transport outcome belongs in the adapter; translate it into a \
+              domain error at the boundary",
+    },
+    Forbidden {
+        needle: "status_code",
+        why: "a transport outcome belongs in the adapter; translate it into a \
+              domain error at the boundary",
+    },
+];
+
 /// Where a forbidden effect was found.
 #[derive(Debug, PartialEq, Eq)]
 struct Violation {
@@ -327,9 +397,14 @@ fn vendor_names_in(src: &str) -> Vec<Violation> {
     scan(src, VENDOR, true)
 }
 
+/// Every transport concept appearing in the code of one file.
+fn transport_in(src: &str) -> Vec<Violation> {
+    scan(src, TRANSPORT, true)
+}
+
 #[cfg(test)]
 mod scanner {
-    use super::{code_only, vendor_names_in, violations_in};
+    use super::{code_only, transport_in, vendor_names_in, violations_in};
 
     #[test]
     fn a_clock_read_is_a_violation() {
@@ -457,6 +532,52 @@ mod scanner {
     }
 
     #[test]
+    fn a_transport_concept_in_code_is_a_violation() {
+        let v = transport_in("pub struct Destination { url: String }");
+
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].needle, "url");
+    }
+
+    #[test]
+    fn transport_is_caught_whatever_its_casing() {
+        assert_eq!(transport_in("fn send(u: Url) {}").len(), 1);
+        assert_eq!(transport_in("fn send(u: URL) {}").len(), 1);
+        assert_eq!(transport_in("struct HttpClient;").len(), 1);
+        assert_eq!(transport_in("let s: StatusCode = x;").len(), 1);
+    }
+
+    #[test]
+    fn a_transport_concept_in_prose_is_not_a_violation() {
+        // The domain's own documentation explains that it knows nothing of URLs,
+        // headers or bearer tokens. A gate that failed on that sentence would be
+        // unusable, and this is the case that matters most.
+        assert!(
+            transport_in(
+                "/// A Destination carries no URL, no header and no bearer token,\n                 /// because where it lives is an adapter's knowledge.\n"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_address_inside_a_string_literal_is_not_a_violation() {
+        // A Permalink's value *is* a web address, and a test for one has to
+        // write a real address down. Literals are blanked, so carrying an
+        // address as data stays possible while naming the mechanism does not.
+        assert!(transport_in(r#"let p = Permalink::new("https://forge.example/c/1");"#).is_empty());
+    }
+
+    #[test]
+    fn a_permalink_is_not_transport_vocabulary() {
+        // The decision in gc-3pa.13: a reference to the thing that happened is
+        // part of the fact, not part of the mechanism for reaching a system. The
+        // concept must therefore pass this gate under its domain name.
+        assert!(transport_in("pub struct Permalink(String);").is_empty());
+        assert!(transport_in("pub fn permalink(&self) -> Option<&Permalink> { None }").is_empty());
+    }
+
+    #[test]
     fn blanking_preserves_line_count_so_numbers_stay_honest() {
         let src = "a\n// comment\n/* b\nc */\nd\n";
 
@@ -548,6 +669,45 @@ fn the_domain_names_no_vendor() {
          Origin's inbound adapter, and translation from an Event into whatever \
          a product accepts belongs in that Destination's adapter. Naming it \
          here makes every future Origin inherit the first one's vocabulary.",
+        reported.len(),
+        reported.join("\n")
+    );
+}
+
+#[test]
+fn the_domain_names_no_transport() {
+    let src = domain_src();
+    let files = rust_files(&src);
+    assert!(
+        !files.is_empty(),
+        "no Rust files found under {}",
+        src.display()
+    );
+
+    let mut reported = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read domain source file");
+        let name = file
+            .strip_prefix(&src)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        for v in transport_in(&text) {
+            reported.push(format!(
+                "  {name}:{} names `{}` — {}",
+                v.line, v.needle, v.why
+            ));
+        }
+    }
+
+    assert!(
+        reported.is_empty(),
+        "the domain must not name a transport concept — {} occurrence(s):\n{}\n\n\
+         How a system is reached — an address, a header, a credential, a status \
+         code — belongs to the adapter that reaches it. A fact about what \
+         happened may still carry a reference to itself, as a domain value the \
+         Origin's adapter supplies: that is the distinction, and bead gc-3pa.13 \
+         records why it falls here.",
         reported.len(),
         reported.join("\n")
     );
