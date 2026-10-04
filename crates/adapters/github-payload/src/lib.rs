@@ -19,7 +19,8 @@
 
 use application::ports::{Translator, Untranslatable};
 use domain::{
-    BranchName, Commit, CommitId, Event, Pusher, RepositoryName, Summary, VerifiedDelivery,
+    BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary,
+    VerifiedDelivery,
 };
 use serde::Deserialize;
 
@@ -54,6 +55,13 @@ struct Push {
     /// sender that omits the field is describing an ordinary push.
     #[serde(default)]
     deleted: bool,
+    /// GitHub's own link comparing what the branch was against what it now is.
+    ///
+    /// Taken as published. Nothing here knows how to build such an address, and
+    /// that is the point: a link can travel inward as a domain value without any
+    /// address scheme existing in the core or in a Destination's adapter.
+    #[serde(default)]
+    compare: Option<String>,
     #[serde(default)]
     commits: Vec<PushedCommit>,
 }
@@ -114,11 +122,20 @@ impl Translator for GithubPayload {
             .map(translate_commit)
             .collect::<Result<Vec<_>, _>>()?;
 
+        // A link we cannot use is dropped rather than carried or complained
+        // about: a blank reference would reach a reader as something to click
+        // that goes nowhere, and refusing the push over it would lose the news.
+        let permalink = push
+            .compare
+            .as_deref()
+            .and_then(|published| Permalink::new(published).ok());
+
         Ok(vec![Event::PushedCommits {
             repository,
             branch,
             pusher,
             commits,
+            permalink,
         }])
     }
 }
@@ -141,7 +158,8 @@ fn translate_commit(raw: &PushedCommit) -> Result<Commit, Untranslatable> {
 mod tests {
     use application::ports::{Translator, Untranslatable};
     use domain::{
-        Body, Delivery, DeliveryId, Event, OriginId, Signature, Timestamp, VerifiedDelivery,
+        Body, Delivery, DeliveryId, Event, OriginId, Permalink, Signature, Timestamp,
+        VerifiedDelivery,
     };
 
     use super::GithubPayload;
@@ -181,6 +199,7 @@ mod tests {
             branch,
             pusher,
             commits,
+            ..
         } = only_event(PUSH)
         else {
             panic!("a push");
@@ -272,6 +291,68 @@ mod tests {
         };
 
         assert_eq!(commits.len(), 1);
+    }
+
+    #[test]
+    fn a_push_carries_the_link_the_sender_published() {
+        // Read, never built. GitHub publishes the comparison link in the payload,
+        // so no address scheme is known here or anywhere else — which is what
+        // made carrying a link possible without leaking a vendor into the core.
+        let Event::PushedCommits { permalink, .. } = only_event(PUSH) else {
+            panic!("a push");
+        };
+
+        assert_eq!(
+            permalink.as_ref().map(Permalink::as_str),
+            Some("https://github.com/motrice/webhook-proxy/compare/9049f1265b7d...6113728f27ae")
+        );
+    }
+
+    #[test]
+    fn a_push_without_a_published_link_still_becomes_an_event() {
+        // A missing link is not a reason to drop a real push, so the field is
+        // absent rather than the Delivery being refused.
+        let unlinked = br#"{"ref": "refs/heads/main",
+                            "repository": {"full_name": "motrice/webhook-proxy"},
+                            "pusher": {"name": "bjornmolin"},
+                            "commits": [{"id": "abc123", "message": "fine"}]}"#;
+
+        let Event::PushedCommits {
+            commits, permalink, ..
+        } = only_event(unlinked)
+        else {
+            panic!("a push");
+        };
+
+        assert_eq!(commits.len(), 1);
+        assert!(permalink.is_none());
+    }
+
+    #[test]
+    fn a_blank_published_link_is_treated_as_no_link() {
+        // Whitespace is not a reference. Dropping it is better than carrying a
+        // link a reader cannot follow, and better than refusing the push.
+        let blank = br#"{"ref": "refs/heads/main",
+                         "compare": "   ",
+                         "repository": {"full_name": "motrice/webhook-proxy"},
+                         "pusher": {"name": "bjornmolin"},
+                         "commits": []}"#;
+
+        let Event::PushedCommits { permalink, .. } = only_event(blank) else {
+            panic!("a push");
+        };
+
+        assert!(permalink.is_none());
+    }
+
+    #[test]
+    fn a_deletion_discards_the_link_the_sender_published() {
+        // The fixture carries a compare link, because a real deletion payload
+        // does. It is dropped: DeletedBranch has no field for one, and comparing
+        // against a ref that no longer exists would tell a reader nothing.
+        let Event::DeletedBranch { .. } = only_event(BRANCH_DELETE) else {
+            panic!("a deletion");
+        };
     }
 
     #[test]

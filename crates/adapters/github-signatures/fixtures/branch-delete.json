@@ -9,5 +9,6 @@
   },
   "pusher": { "name": "bjornmolin", "email": "bjorn.molin@motrice.se" },
   "deleted": true,
+  "compare": "https://github.com/motrice/webhook-proxy/compare/6113728f27ae...000000000000",
   "commits": []
 }

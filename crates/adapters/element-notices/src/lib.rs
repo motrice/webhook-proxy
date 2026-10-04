@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use application::ports::{DispatchFailed, Dispatcher};
-use domain::{Commit, DeliveryId, Destination, Event};
+use domain::{Commit, DeliveryId, Destination, Event, Permalink};
 
 /// How much of a commit identity a reader sees.
 ///
@@ -95,11 +95,13 @@ pub fn notice(event: &Event) -> String {
             branch,
             pusher,
             commits,
+            permalink,
         } => pushed(
             repository.as_str(),
             branch.as_str(),
             pusher.as_str(),
             commits,
+            permalink.as_ref(),
         ),
     }
 }
@@ -110,19 +112,34 @@ pub fn notice(event: &Event) -> String {
 /// that was already there, most often. It is stated plainly and without
 /// mentioning deletion, because a deletion is now its own Event and saying
 /// "possibly a deletion" here would be hedging about something already known.
-fn pushed(repository: &str, branch: &str, pusher: &str, commits: &[Commit]) -> String {
-    if commits.is_empty() {
-        return format!("{pusher} pushed no commits to {branch} in {repository}");
-    }
+fn pushed(
+    repository: &str,
+    branch: &str,
+    pusher: &str,
+    commits: &[Commit],
+    permalink: Option<&Permalink>,
+) -> String {
+    let mut text = if commits.is_empty() {
+        format!("{pusher} pushed no commits to {branch} in {repository}")
+    } else {
+        let count = commits.len();
+        let plural = if count == 1 { "commit" } else { "commits" };
+        let mut listed = format!("{pusher} pushed {count} {plural} to {branch} in {repository}");
+        for commit in commits {
+            let id = commit.id().as_str();
+            let short = id.get(..SHORT_ID).unwrap_or(id);
+            write!(listed, "\n  {short} {}", commit.summary().as_str())
+                .expect("writing to a String cannot fail");
+        }
+        listed
+    };
 
-    let count = commits.len();
-    let plural = if count == 1 { "commit" } else { "commits" };
-    let mut text = format!("{pusher} pushed {count} {plural} to {branch} in {repository}");
-    for commit in commits {
-        let id = commit.id().as_str();
-        let short = id.get(..SHORT_ID).unwrap_or(id);
-        write!(text, "\n  {short} {}", commit.summary().as_str())
-            .expect("writing to a String cannot fail");
+    // Last, on its own line and unindented: a reader sees what happened first
+    // and where to look second, and the line is not mistaken for another commit.
+    // Sent as plain characters like everything else here — there is no markup to
+    // escape because none is produced.
+    if let Some(link) = permalink {
+        write!(text, "\n{}", link.as_str()).expect("writing to a String cannot fail");
     }
 
     text
@@ -200,7 +217,7 @@ mod tests {
     use axum::routing::post;
     use domain::{
         BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId, DestinationKind,
-        Event, Pusher, RepositoryName, Summary,
+        Event, Permalink, Pusher, RepositoryName, Summary,
     };
 
     use super::{ElementNotices, notice};
@@ -209,6 +226,16 @@ mod tests {
     const HOOK_ID: &str = "SUPERSECRETHOOKID";
 
     fn push(repository: &str, branch: &str, pusher: &str, commits: &[(&str, &str)]) -> Event {
+        linked_push(repository, branch, pusher, commits, None)
+    }
+
+    fn linked_push(
+        repository: &str,
+        branch: &str,
+        pusher: &str,
+        commits: &[(&str, &str)],
+        permalink: Option<&str>,
+    ) -> Event {
         Event::PushedCommits {
             repository: RepositoryName::new(repository).expect("a name"),
             branch: BranchName::new(branch).expect("a name"),
@@ -222,6 +249,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            permalink: permalink.map(|p| Permalink::new(p).expect("a reference")),
         }
     }
 
@@ -327,6 +355,67 @@ mod tests {
     // Three situations, three true sentences. These three tests are the reason
     // the Event gained a variant: before it did, one of the three had to be
     // rendered as a guess or as a hedge.
+
+    #[test]
+    fn a_notice_ends_with_the_link_when_one_was_published() {
+        let text = notice(&linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[("aa11bb22cc33dd44", "fix the thing")],
+            Some("https://forge.example/motrice/webhook-proxy/compare/a...b"),
+        ));
+
+        // On its own line and unindented, so it is not read as another commit.
+        assert!(
+            text.ends_with("\nhttps://forge.example/motrice/webhook-proxy/compare/a...b"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_notice_without_a_link_does_not_look_unfinished() {
+        let text = notice(&a_push());
+
+        assert!(!text.ends_with('\n'), "{text}");
+        assert!(!text.contains("://"), "{text}");
+        // The last line is still a commit, so nothing dangles where a link would
+        // have been.
+        assert!(
+            text.lines().last().expect("a line").starts_with("  "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_push_that_changed_nothing_still_carries_its_link() {
+        let text = notice(&linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[],
+            Some("https://forge.example/c/1"),
+        ));
+
+        assert!(text.contains("no commits"), "{text}");
+        assert!(text.ends_with("\nhttps://forge.example/c/1"), "{text}");
+    }
+
+    #[test]
+    fn a_link_appears_literally_and_is_not_made_into_markup() {
+        // Still plain text. A link is sent as the characters it is made of, so
+        // there is no markup to escape and none to get wrong.
+        let text = notice(&linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[],
+            Some("https://forge.example/x?a=1&b=<2>"),
+        ));
+
+        assert!(text.contains("https://forge.example/x?a=1&b=<2>"), "{text}");
+        assert!(!text.contains("]("), "{text}");
+    }
 
     #[test]
     fn a_deleted_branch_reads_as_a_deletion() {

@@ -39,6 +39,24 @@ pub struct CommitId(String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary(String);
 
+/// Where a reader can go to see what happened, exactly as the Origin published
+/// it.
+///
+/// Opaque on purpose. The domain never builds one — an Origin's address scheme
+/// is that Origin's business, and constructing a link here would put one
+/// vendor's knowledge in the core and make every future Origin inherit it. It
+/// never parses one either: there is no scheme check and no path handling,
+/// because a rule that read a reference apart would be claiming to know what
+/// shape references have.
+///
+/// So the only invariant is the one every value type here shares: present and
+/// trimmed. This is a reference to the subject of a fact, not the address of a
+/// system we talk to — a `Destination` still has no address, and
+/// `crates/architecture`'s purity test forbids the vocabulary of transport in
+/// this crate. Bead gc-3pa.13 records why that line falls here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Permalink(String);
+
 /// One commit, reduced to what a Destination needs to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
@@ -73,6 +91,12 @@ pub enum Event {
         /// May be empty, meaning a push that changed nothing. A deletion is
         /// [`Event::DeletedBranch`] and never this with an empty list.
         commits: Vec<Commit>,
+        /// Where a reader can see this push, if the Origin published a link.
+        ///
+        /// `None` means the Origin published none, not that we failed to read
+        /// one: a missing link is no reason to drop a real push, so this is
+        /// optional rather than required.
+        permalink: Option<Permalink>,
     },
     /// A branch was deleted.
     ///
@@ -206,6 +230,23 @@ impl Summary {
     }
 }
 
+impl Permalink {
+    /// Takes a reference as the Origin published it.
+    ///
+    /// # Errors
+    ///
+    /// [`Blank`] if the reference is empty or only whitespace.
+    pub fn new(reference: &str) -> Result<Self, Blank> {
+        present(reference, "a permalink").map(Self)
+    }
+
+    /// The reference as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl Commit {
     /// Records a commit.
     #[must_use]
@@ -228,7 +269,7 @@ impl Commit {
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchName, Commit, CommitId, Event, Pusher, RepositoryName, Summary};
+    use super::{BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary};
 
     fn commit(id: &str, summary: &str) -> Commit {
         Commit::new(
@@ -243,6 +284,7 @@ mod tests {
             branch: BranchName::new("main").expect("a name"),
             pusher: Pusher::new("bjorn").expect("a name"),
             commits,
+            permalink: None,
         }
     }
 
@@ -288,6 +330,76 @@ mod tests {
         // change that gets forgotten.
         assert_eq!(push(vec![]).repository().as_str(), "webhook-proxy");
         assert_eq!(deletion().repository().as_str(), "webhook-proxy");
+    }
+
+    #[test]
+    fn a_permalink_cannot_be_blank() {
+        assert!(Permalink::new("").is_err());
+        assert!(Permalink::new("  \t ").is_err());
+    }
+
+    #[test]
+    fn a_permalink_says_which_concept_was_missing() {
+        let err = Permalink::new("").expect_err("blank is rejected");
+
+        assert_eq!(err.concept(), "a permalink");
+    }
+
+    #[test]
+    fn a_permalink_is_kept_verbatim_and_not_inspected() {
+        // The domain does not know, and must not know, what an Origin's
+        // addresses look like. It carries the reference whole and shows it; it
+        // never parses a scheme or a path out of one.
+        let link = Permalink::new("https://forge.example/motrice/webhook-proxy/compare/a...b")
+            .expect("a reference");
+
+        assert_eq!(
+            link.as_str(),
+            "https://forge.example/motrice/webhook-proxy/compare/a...b"
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_a_permalink() {
+        let link = Permalink::new("  https://forge.example/c/1 \n").expect("a reference");
+
+        assert_eq!(link.as_str(), "https://forge.example/c/1");
+    }
+
+    #[test]
+    fn a_push_may_carry_a_permalink_and_may_not() {
+        // Optional because an Origin may publish no link, not because we failed
+        // to read one. Refusing the Delivery over a missing link would mean a
+        // room hears nothing about a real push.
+        let Event::PushedCommits { permalink, .. } = push(vec![]) else {
+            panic!("a push");
+        };
+        assert!(permalink.is_none());
+
+        let linked = Event::PushedCommits {
+            repository: RepositoryName::new("webhook-proxy").expect("a name"),
+            branch: BranchName::new("main").expect("a name"),
+            pusher: Pusher::new("bjorn").expect("a name"),
+            commits: vec![],
+            permalink: Some(Permalink::new("https://forge.example/c/1").expect("a reference")),
+        };
+        let Event::PushedCommits { permalink, .. } = &linked else {
+            panic!("a push");
+        };
+        assert_eq!(
+            permalink.as_ref().map(Permalink::as_str),
+            Some("https://forge.example/c/1")
+        );
+    }
+
+    #[test]
+    fn a_deletion_cannot_carry_a_permalink() {
+        // DeletedBranch has no such field, so `a deletion, and here is a
+        // comparison link` cannot be built. A link comparing against a ref that
+        // no longer exists would be useless even though a sender may send one.
+        let Event::DeletedBranch { .. } = deletion() else {
+            panic!("a deletion");
+        };
     }
 
     #[test]
