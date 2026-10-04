@@ -326,7 +326,18 @@ _ensure-devtools:
 mirror:
     git push forgejo main
 
-[doc("Sign a reviewed bead tip with the YubiKey (maintainer only)")]
+# ▪ MAINTAINER ONLY. Sign every commit a reviewed bead adds, with the YubiKey.
+#
+# Every commit, not just the tip. The first version amended the tip alone, which
+# was right while every bead branch held exactly one commit and wrong the first
+# time one held two: PR #27 landed 5189569 on main carrying the agent's software
+# key, because nothing had re-signed it. See bead gc-aa4.
+#
+# The rebase is onto the branch's own merge-base, never onto a moved main. Main
+# may have advanced since CI passed, and quietly rebasing onto it would change
+# the content under test at the moment of approval — which is the one moment it
+# must not change.
+[doc("Sign every commit of a reviewed bead with the YubiKey (maintainer only)")]
 [group('ship')]
 approve id:
     #!/usr/bin/env bash
@@ -338,17 +349,51 @@ approve id:
         printf 'set APPROVAL_KEY, or see docs/approval-keys for what land accepts\n' >&2
         exit 1
     fi
+    fingerprint=$(ssh-keygen -lf "$key" | awk '{print $2}')
+
+    # Before the prompt, not after it. Re-signing is a rebase now, and a rebase
+    # refuses a dirty tree — where the amend this replaced would quietly have
+    # ignored one. Failing here costs nothing; failing after the touch wastes it
+    # and leaves a half-approved branch.
+    if [[ -n "$(git status --porcelain)" ]]; then
+        printf 'the working tree is not clean, so the branch cannot be re-signed:\n' >&2
+        git status --short >&2
+        printf 'commit or stash these first\n' >&2
+        exit 1
+    fi
+
+    git fetch --quiet origin
     git switch --quiet "$branch"
-    printf 'touch the YubiKey when it blinks\n'
-    git -c user.signingkey="$key" commit --amend --no-edit --quiet
-    printf 'approved: %s\n' "$(git log --format='%h %G? signed-by=%GK' -1)"
+
+    base=$(git merge-base origin/main "$branch")
+    count=$(git rev-list --count "$base..$branch")
+    if [[ "$count" -eq 0 ]]; then
+        printf '%s adds no commits over main, so there is nothing to approve\n' "$branch" >&2
+        exit 1
+    fi
+
+    printf 'touch the YubiKey when it blinks — once per commit, %s to sign\n' "$count"
+    git -c user.signingkey="$key" rebase --force-rebase --gpg-sign --quiet "$base" "$branch"
+
+    # Asserted, not assumed. A rebase that skipped one would leave an unapproved
+    # commit to be discovered on main later, which is exactly how gc-aa4 was
+    # found — by reading main afterwards rather than by a gate saying so.
+    unapproved=$(git log --format='%h %G? %GK %s' "$base..$branch" \
+        | awk -v k="$fingerprint" '$2 != "G" || $3 != k')
+    if [[ -n "$unapproved" ]]; then
+        printf 'these commits are not signed by %s:\n%s\n' "$fingerprint" "$unapproved" >&2
+        exit 1
+    fi
+
+    printf 'approved %s commit(s), each signed by %s:\n' "$count" "$fingerprint"
+    git log --format='  %h %G? %s' "$base..$branch"
     just _push "$branch"
     printf 'wait for CI to pass, then: just land %s\n' "{{ id }}"
 
 # ▪ MAINTAINER ONLY. Land an approved bead on main, preserving its signature.
 #
-# Refuses unless the tip carries a good signature from a key in
-# docs/approval-keys — all of which are hardware-backed, so landing without a
+# Refuses unless *every* commit it would add carries a good signature from a key
+# in docs/approval-keys — all of which are hardware-backed, so landing without a
 # human present is not merely discouraged but impossible.
 #
 # A fast-forward creates no commit, so the approved object becomes main unchanged.
@@ -364,16 +409,37 @@ land id:
     git fetch --quiet origin
     tip="origin/$branch"
 
-    status=$(git log --format='%G?' -1 "$tip")
-    signer=$(git log --format='%GK' -1 "$tip")
-    if [[ "$status" != "G" ]]; then
-        printf 'the tip of %s carries no good signature (git reports %s)\n' "$branch" "$status" >&2
+    accepted=$(ssh-keygen -lf docs/approval-keys | awk '{print $2}')
+    base=$(git merge-base origin/main "$tip")
+    landing=$(git rev-list "$base..$tip")
+    if [[ -z "$landing" ]]; then
+        printf '%s adds nothing to main\n' "$branch" >&2
         exit 1
     fi
-    if ! ssh-keygen -lf docs/approval-keys | awk '{print $2}' | grep -qxF "$signer"; then
-        printf 'the tip of %s is signed by %s,\n' "$branch" "$signer" >&2
-        printf 'which is not a key listed in docs/approval-keys.\n' >&2
-        printf 'a human has not approved this: just approve %s\n' "{{ id }}" >&2
+
+    # Every commit that is about to become part of main, not only the one the
+    # branch points at. Checking the tip alone is what let a two-commit branch
+    # put an unapproved commit on main (gc-aa4): a fast-forward lands all of
+    # them, so a gate that reads one of them is checking the wrong thing.
+    refused=0
+    while read -r sha; do
+        verdict=$(git log --format='%G?' -1 "$sha")
+        signer=$(git log --format='%GK' -1 "$sha")
+        subject=$(git log --format='%s' -1 "$sha")
+        short=$(git log --format='%h' -1 "$sha")
+        if [[ "$verdict" != "G" ]]; then
+            printf '%s carries no good signature (git reports %s): %s\n' \
+                "$short" "$verdict" "$subject" >&2
+            refused=1
+        elif ! grep -qxF "$signer" <<<"$accepted"; then
+            printf '%s is signed by %s,\n' "$short" "$signer" >&2
+            printf '  which is not a key listed in docs/approval-keys: %s\n' "$subject" >&2
+            refused=1
+        fi
+    done <<<"$landing"
+
+    if [[ "$refused" -ne 0 ]]; then
+        printf 'a human has not approved all of this: just approve %s\n' "{{ id }}" >&2
         exit 1
     fi
 

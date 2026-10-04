@@ -1,6 +1,7 @@
 # Keys permitted to approve a landing.
 #
-# 'just land' refuses a branch tip that is not signed by one of these. Every key
+# 'just land' refuses to land any commit not signed by one of these — every
+# commit it would add, not just the branch tip, which is bead gc-aa4. Every key
 # here must be hardware-backed (sk-ssh-*): a FIDO2 signature cannot be produced
 # without someone physically touching the authenticator, which is the entire
 # point. A software key here would silently reduce "a human approved this" to

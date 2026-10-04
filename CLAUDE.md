@@ -98,11 +98,12 @@ no more than this:
   force-push a branch anyone else may have, or edit CI workflow files without a
   `decision` bead. Approving and landing are the maintainer's; a branch that is
   not a fast-forward is rebased by you and landed by them.
-- **You cannot approve, even in principle.** `just approve` re-signs the branch
-  tip with a hardware key, and that signature cannot be produced without someone
-  physically touching the authenticator. `just land` refuses a tip not signed by
-  a key in `docs/approval-keys`. This is the one guarantee in the repository that
-  does not rest on an agent following instructions.
+- **You cannot approve, even in principle.** `just approve` re-signs every commit
+  the branch adds with a hardware key, and that signature cannot be produced
+  without someone physically touching the authenticator. `just land` refuses if
+  any commit it would add is not signed by a key in `docs/approval-keys`. This is
+  the one guarantee in the repository that does not rest on an agent following
+  instructions.
 - **You must not** weaken a rule in `crates/architecture/` — widening
   `allowed_external`, or adding an exemption to the forbidden-effects list — in
   the same commit as a feature. Separate commit, referencing a `decision` bead,
@@ -236,9 +237,17 @@ to fetch the mise-pinned hygiene tools.
   to carry twenty-one unsigned commits while every branch was signed. A
   fast-forward creates no commit, so the approved object becomes `main` unchanged
   and history stays linear.
-- **So `main`'s tip per bead is hardware-signed**, and that is the audit trail:
-  each landing carries cryptographic evidence that a human approved it. Reading
-  it back is `git log --format='%h %G? %GK'`.
+- **So every commit landed on `main` is hardware-signed**, and that is the audit
+  trail: each one carries cryptographic evidence that a human approved it.
+  Reading it back is `git log --format='%h %G? %GK'`. One commit predates the
+  rule and is signed by the agent key — `5189569`, the intermediate commit of the
+  two-commit branch that exposed `gc-aa4`. Removing it means rewriting `main`,
+  which is the maintainer's call; the bead says what that costs.
+- **Keep a bead branch to one commit unless two genuinely explain each other.**
+  Approving costs one touch per commit, so a branch of six costs six. The rule
+  exists because signing only the tip once let an unapproved commit onto `main`
+  (`gc-aa4`); the cost is the honest price of the guarantee, not a reason to
+  weaken it.
 - **Clippy pedantic is denied, not warned.** Fix the lint rather than
   `#[allow]`-ing it; if an allow is genuinely right, the comment above it says
   why in terms of this code, not in terms of the lint.
