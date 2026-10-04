@@ -48,11 +48,16 @@ pub struct Commit {
 
 /// Something that happened, independent of any Origin's payload format.
 ///
-/// `commits` may be empty, and that is meaningful rather than degenerate: a
-/// branch deletion and a force-push that changes nothing both arrive carrying no
-/// commits. The domain cannot tell those apart from the count alone — only an
-/// inbound adapter sees the flag that distinguishes them — so this type reports
-/// what it knows and refuses to guess.
+/// Two different facts reach us carrying no commits: a branch was deleted, and a
+/// push that changed nothing. A reader needs different words for them, so they
+/// are separate variants rather than one variant with a flag. A flag would also
+/// permit `deleted, and here are two commits`, which no sender means and no
+/// renderer could sensibly show.
+///
+/// Which of the two it is, is visible only to an inbound adapter: the sender says
+/// so in a field alongside the commit list. That is why the distinction is drawn
+/// at the boundary and carried inward as a variant, rather than guessed here from
+/// a count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// Commits were pushed to a branch.
@@ -63,9 +68,41 @@ pub enum Event {
         branch: BranchName,
         /// Who pushed.
         pusher: Pusher,
-        /// What was pushed, oldest first. May be empty.
+        /// What was pushed, oldest first.
+        ///
+        /// May be empty, meaning a push that changed nothing. A deletion is
+        /// [`Event::DeletedBranch`] and never this with an empty list.
         commits: Vec<Commit>,
     },
+    /// A branch was deleted.
+    ///
+    /// Carries no commits, and cannot: deleting a branch pushes nothing. The
+    /// absence of the field is what keeps a deletion from being confused with a
+    /// push.
+    DeletedBranch {
+        /// Which repository.
+        repository: RepositoryName,
+        /// Which branch no longer exists.
+        branch: BranchName,
+        /// Who deleted it.
+        pusher: Pusher,
+    },
+}
+
+impl Event {
+    /// Which repository this is about. Every Event concerns exactly one.
+    ///
+    /// Routing asks this of any Event, so a new variant is bound by the compiler
+    /// to answer it, rather than by somebody remembering to extend a match
+    /// inside a Filter.
+    #[must_use]
+    pub fn repository(&self) -> &RepositoryName {
+        match self {
+            Self::PushedCommits { repository, .. } | Self::DeletedBranch { repository, .. } => {
+                repository
+            }
+        }
+    }
 }
 
 /// Trim and reject blank, so every one of these types means the same thing by
@@ -209,6 +246,50 @@ mod tests {
         }
     }
 
+    fn deletion() -> Event {
+        Event::DeletedBranch {
+            repository: RepositoryName::new("webhook-proxy").expect("a name"),
+            branch: BranchName::new("main").expect("a name"),
+            pusher: Pusher::new("bjorn").expect("a name"),
+        }
+    }
+
+    #[test]
+    fn a_deletion_is_not_a_push_that_carried_no_commits() {
+        // The point of the whole variant. Both arrive from the same sender with
+        // an empty commit list; only the Event can keep them apart, and a
+        // renderer that cannot tell them apart says something false about one.
+        assert_ne!(deletion(), push(vec![]));
+    }
+
+    #[test]
+    fn a_deletion_cannot_carry_commits() {
+        // Expressed as a type, not a test: DeletedBranch has no commits field,
+        // so `deleted but here are two commits` cannot be constructed. This
+        // test exists to state the intent that keeps it that way.
+        let Event::DeletedBranch {
+            repository,
+            branch,
+            pusher,
+        } = deletion()
+        else {
+            panic!("a deletion");
+        };
+
+        assert_eq!(repository.as_str(), "webhook-proxy");
+        assert_eq!(branch.as_str(), "main");
+        assert_eq!(pusher.as_str(), "bjorn");
+    }
+
+    #[test]
+    fn every_event_says_which_repository_it_is_about() {
+        // Routing asks this of any Event. Without it, each new variant would
+        // have to be added to a match inside the Filter, which is the kind of
+        // change that gets forgotten.
+        assert_eq!(push(vec![]).repository().as_str(), "webhook-proxy");
+        assert_eq!(deletion().repository().as_str(), "webhook-proxy");
+    }
+
     #[test]
     fn a_repository_name_cannot_be_blank() {
         assert!(RepositoryName::new("").is_err());
@@ -256,7 +337,9 @@ mod tests {
     fn a_push_of_zero_commits_is_representable() {
         // This is how a branch deletion arrives. Refusing to represent it would
         // mean dropping a real event on the floor.
-        let Event::PushedCommits { commits, .. } = push(vec![]);
+        let Event::PushedCommits { commits, .. } = push(vec![]) else {
+            panic!("a push");
+        };
 
         assert!(commits.is_empty());
     }
@@ -268,7 +351,9 @@ mod tests {
 
         assert_ne!(empty, one);
 
-        let Event::PushedCommits { commits, .. } = &one;
+        let Event::PushedCommits { commits, .. } = &one else {
+            panic!("a push");
+        };
         assert_eq!(commits.len(), 1);
     }
 
@@ -277,7 +362,9 @@ mod tests {
         let one = commit("aaa", "first");
         let two = commit("bbb", "second");
 
-        let Event::PushedCommits { commits, .. } = push(vec![one.clone(), two.clone()]);
+        let Event::PushedCommits { commits, .. } = push(vec![one.clone(), two.clone()]) else {
+            panic!("a push");
+        };
 
         assert_eq!(commits, vec![one, two]);
     }

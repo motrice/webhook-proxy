@@ -95,10 +95,7 @@ impl Filter {
     pub fn admits(&self, event: &Event) -> bool {
         match self {
             Self::Everything => true,
-            Self::Repository(wanted) => {
-                let Event::PushedCommits { repository, .. } = event;
-                repository == wanted
-            }
+            Self::Repository(wanted) => event.repository() == wanted,
         }
     }
 }
@@ -177,6 +174,14 @@ mod tests {
         }
     }
 
+    fn deletion_in(repository: &str) -> Event {
+        Event::DeletedBranch {
+            repository: RepositoryName::new(repository).expect("a name"),
+            branch: BranchName::new("bead/gc-old").expect("a name"),
+            pusher: Pusher::new("bjorn").expect("a name"),
+        }
+    }
+
     #[test]
     fn a_destination_identity_cannot_be_blank() {
         assert!(DestinationId::new("  ").is_err());
@@ -192,6 +197,22 @@ mod tests {
         assert!(printed.contains("devsecops-room"), "{printed}");
         assert!(printed.contains("ChatRoom"), "{printed}");
         assert!(!printed.contains("://"), "{printed}");
+    }
+
+    #[test]
+    fn a_repository_filter_admits_a_deletion_in_that_repository() {
+        // The Filter reads the repository off the Event rather than off one
+        // variant, so a room subscribed to a repository hears about a deleted
+        // branch in it without the Filter having to learn the new variant.
+        let filter = Filter::Repository(RepositoryName::new("webhook-proxy").expect("a name"));
+
+        assert!(filter.admits(&deletion_in("webhook-proxy")));
+        assert!(!filter.admits(&deletion_in("something-else")));
+    }
+
+    #[test]
+    fn everything_admits_a_deletion_too() {
+        assert!(Filter::Everything.admits(&deletion_in("webhook-proxy")));
     }
 
     #[test]

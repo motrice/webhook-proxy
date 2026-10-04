@@ -27,6 +27,12 @@ const PAYLOAD: &[u8] = include_bytes!("../../adapters/github-signatures/fixtures
 const SIGNATURE: &str = include_str!("../../adapters/github-signatures/fixtures/push.signature");
 const SECRET: &str = include_str!("../../adapters/github-signatures/fixtures/push.secret");
 
+/// A real branch deletion, signed with the same test secret.
+const DELETION: &[u8] =
+    include_bytes!("../../adapters/github-signatures/fixtures/branch-delete.json");
+const DELETION_SIGNATURE: &str =
+    include_str!("../../adapters/github-signatures/fixtures/branch-delete.signature");
+
 const ROOM: &str = "devsecops-room";
 
 /// Kills the child when the test ends, however it ends.
@@ -163,6 +169,34 @@ async fn a_signed_push_reaches_the_room() {
     assert!(text.contains("motrice/webhook-proxy"), "{text}");
     assert!(text.contains("main"), "{text}");
     assert!(text.contains("bjornmolin"), "{text}");
+}
+
+#[tokio::test]
+async fn a_signed_branch_deletion_reaches_the_room_as_a_deletion() {
+    // The whole path for the second Event: a signed payload whose `deleted` flag
+    // the inbound adapter reads, a domain Event with no commits to be empty, and
+    // a Notice that says what happened rather than describing it as a push of
+    // nothing. Tested here because no single layer can prove the sentence that
+    // comes out the far end.
+    let (url, seen) = hookshot().await;
+    let proxy = start(configured(&url)).await.expect("the proxy starts");
+
+    let status = post_webhook(&proxy.address, Some(DELETION_SIGNATURE), DELETION).await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let received = delivered(&seen).await;
+    assert_eq!(received.len(), 1, "the room should have been told once");
+
+    let sent: serde_json::Value = serde_json::from_str(&received[0]).expect("valid JSON");
+    let text = sent["text"].as_str().expect("a text field");
+    assert!(text.contains("deleted"), "{text}");
+    assert!(text.contains("bead/gc-old"), "{text}");
+    assert!(text.contains("bjornmolin"), "{text}");
+    assert!(
+        !text.contains("no commits"),
+        "a deletion must not be reported as a push that carried nothing: {text}"
+    );
 }
 
 #[tokio::test]

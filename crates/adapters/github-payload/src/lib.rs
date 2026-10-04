@@ -11,6 +11,11 @@
 //! header into the domain to carry a hint would be transport vocabulary in the
 //! core. Inferring also degrades better: a payload that is not a push simply is
 //! not a push, rather than depending on a header that may be missing.
+//!
+//! Within a push, what the push *did* is read from the body's `deleted` flag. A
+//! deletion and a push that changed nothing both carry an empty commit list, so
+//! the count cannot tell them apart; this is the only place that can, which is
+//! why the two leave here as different Events.
 
 use application::ports::{Translator, Untranslatable};
 use domain::{
@@ -44,6 +49,11 @@ struct Push {
     reference: String,
     repository: Repository,
     pusher: Account,
+    /// GitHub says so explicitly when the push deleted the ref. Absent means a
+    /// push, so this defaults to false rather than refusing the payload: a
+    /// sender that omits the field is describing an ordinary push.
+    #[serde(default)]
+    deleted: bool,
     #[serde(default)]
     commits: Vec<PushedCommit>,
 }
@@ -85,6 +95,19 @@ impl Translator for GithubPayload {
             RepositoryName::new(&push.repository.full_name).map_err(|_| Untranslatable)?;
         let branch = BranchName::new(branch).map_err(|_| Untranslatable)?;
         let pusher = Pusher::new(&push.pusher.name).map_err(|_| Untranslatable)?;
+
+        // A deletion carries no commits, so there is nothing to translate and
+        // the list is ignored rather than trusted: were a sender ever to send
+        // both, the flag is the claim about what happened and the commits would
+        // be the stale half.
+        if push.deleted {
+            return Ok(vec![Event::DeletedBranch {
+                repository,
+                branch,
+                pusher,
+            }]);
+        }
+
         let commits = push
             .commits
             .iter()
@@ -145,7 +168,7 @@ mod tests {
         GithubPayload.events(&verified(body))
     }
 
-    fn only_push(body: &[u8]) -> Event {
+    fn only_event(body: &[u8]) -> Event {
         let mut events = translate(body).expect("translatable");
         assert_eq!(events.len(), 1, "{events:?}");
         events.remove(0)
@@ -158,7 +181,10 @@ mod tests {
             branch,
             pusher,
             commits,
-        } = only_push(PUSH);
+        } = only_event(PUSH)
+        else {
+            panic!("a push");
+        };
 
         assert_eq!(repository.as_str(), "motrice/webhook-proxy");
         assert_eq!(branch.as_str(), "main");
@@ -174,7 +200,9 @@ mod tests {
     fn a_commit_body_does_not_reach_the_event() {
         // The fixture's first commit has a body that must not travel: a
         // Destination shows one line, and the domain's Summary enforces that.
-        let Event::PushedCommits { commits, .. } = only_push(PUSH);
+        let Event::PushedCommits { commits, .. } = only_event(PUSH) else {
+            panic!("a push");
+        };
 
         assert_eq!(
             commits[0].summary().as_str(),
@@ -184,22 +212,66 @@ mod tests {
 
     #[test]
     fn the_branch_is_the_ref_without_its_prefix() {
-        let Event::PushedCommits { branch, .. } = only_push(PUSH);
+        let Event::PushedCommits { branch, .. } = only_event(PUSH) else {
+            panic!("a push");
+        };
 
         assert_eq!(branch.as_str(), "main");
     }
 
     #[test]
-    fn a_branch_delete_is_a_push_carrying_no_commits() {
-        // This is how a deletion arrives. The `deleted` flag in the payload is
-        // currently discarded, so a renderer cannot yet tell this apart from a
-        // push that happened to change nothing — that is gc-3pa.10.
-        let Event::PushedCommits {
-            branch, commits, ..
-        } = only_push(BRANCH_DELETE);
+    fn a_branch_delete_becomes_a_deletion_not_an_empty_push() {
+        // Captured from a real payload: `deleted: true` with an empty commit
+        // list and an all-zero `after`. The flag is the only thing that
+        // distinguishes this from a push that changed nothing, and reading it
+        // here is the whole reason the distinction can exist in the domain.
+        let Event::DeletedBranch {
+            repository,
+            branch,
+            pusher,
+        } = only_event(BRANCH_DELETE)
+        else {
+            panic!("a deletion");
+        };
 
+        assert_eq!(repository.as_str(), "motrice/webhook-proxy");
         assert_eq!(branch.as_str(), "bead/gc-old");
+        assert_eq!(pusher.as_str(), "bjornmolin");
+    }
+
+    #[test]
+    fn a_push_that_changed_nothing_stays_a_push() {
+        // The other half of the distinction, and the reason an empty commit list
+        // is not enough to infer a deletion: `deleted` is false, so this is a
+        // push that happened to carry nothing — a force-push to the same commit,
+        // for instance.
+        let quiet = br#"{"ref": "refs/heads/main",
+                         "deleted": false,
+                         "repository": {"full_name": "motrice/webhook-proxy"},
+                         "pusher": {"name": "bjornmolin"},
+                         "commits": []}"#;
+
+        let Event::PushedCommits { commits, .. } = only_event(quiet) else {
+            panic!("a push");
+        };
+
         assert!(commits.is_empty());
+    }
+
+    #[test]
+    fn a_payload_with_no_deleted_field_is_read_as_a_push() {
+        // Absence is not deletion. A sender that omits the flag is describing a
+        // push, so the default must be false rather than an error.
+        let terse = br#"{"ref": "refs/heads/main",
+                         "repository": {"full_name": "motrice/webhook-proxy"},
+                         "pusher": {"name": "bjornmolin"},
+                         "commits": [{"id": "abc123", "message": "fine"}]}"#;
+
+        let Event::PushedCommits { commits, .. } = only_event(terse) else {
+            panic!("a push");
+        };
+
+        assert_eq!(commits.len(), 1);
     }
 
     #[test]
@@ -235,7 +307,9 @@ mod tests {
                        "pusher": {"name": "bjornmolin"},
                        "commits": [{"id": "abc123", "message": "   \n  "}]}"#;
 
-        let Event::PushedCommits { commits, .. } = only_push(odd);
+        let Event::PushedCommits { commits, .. } = only_event(odd) else {
+            panic!("a push");
+        };
 
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].summary().as_str(), "(no commit message)");

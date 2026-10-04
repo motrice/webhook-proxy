@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use application::ports::{DispatchFailed, Dispatcher};
-use domain::{DeliveryId, Destination, Event};
+use domain::{Commit, DeliveryId, Destination, Event};
 
 /// How much of a commit identity a reader sees.
 ///
@@ -79,33 +79,45 @@ impl fmt::Debug for ElementNotices {
 /// needs escaping and no escaping can be forgotten.
 #[must_use]
 pub fn notice(event: &Event) -> String {
-    let Event::PushedCommits {
-        repository,
-        branch,
-        pusher,
-        commits,
-    } = event;
-
-    if commits.is_empty() {
-        // The Event cannot distinguish a deletion from a push that changed
-        // nothing — only an inbound adapter sees that flag (gc-3pa.10). Saying
-        // so is better than picking one and being wrong half the time.
-        return format!(
-            "{} pushed no commits to {} in {} — a deleted branch appears this way",
+    match event {
+        Event::DeletedBranch {
+            repository,
+            branch,
+            pusher,
+        } => format!(
+            "{} deleted branch {} in {}",
             pusher.as_str(),
             branch.as_str(),
             repository.as_str()
-        );
+        ),
+        Event::PushedCommits {
+            repository,
+            branch,
+            pusher,
+            commits,
+        } => pushed(
+            repository.as_str(),
+            branch.as_str(),
+            pusher.as_str(),
+            commits,
+        ),
+    }
+}
+
+/// A push, with however many commits it carried.
+///
+/// An empty list is a push that changed nothing — a force-push to the commit
+/// that was already there, most often. It is stated plainly and without
+/// mentioning deletion, because a deletion is now its own Event and saying
+/// "possibly a deletion" here would be hedging about something already known.
+fn pushed(repository: &str, branch: &str, pusher: &str, commits: &[Commit]) -> String {
+    if commits.is_empty() {
+        return format!("{pusher} pushed no commits to {branch} in {repository}");
     }
 
     let count = commits.len();
     let plural = if count == 1 { "commit" } else { "commits" };
-    let mut text = format!(
-        "{} pushed {count} {plural} to {} in {}",
-        pusher.as_str(),
-        branch.as_str(),
-        repository.as_str()
-    );
+    let mut text = format!("{pusher} pushed {count} {plural} to {branch} in {repository}");
     for commit in commits {
         let id = commit.id().as_str();
         let short = id.get(..SHORT_ID).unwrap_or(id);
@@ -213,6 +225,14 @@ mod tests {
         }
     }
 
+    fn deletion(repository: &str, branch: &str, pusher: &str) -> Event {
+        Event::DeletedBranch {
+            repository: RepositoryName::new(repository).expect("a name"),
+            branch: BranchName::new(branch).expect("a name"),
+            pusher: Pusher::new(pusher).expect("a name"),
+        }
+    }
+
     fn a_push() -> Event {
         push(
             "motrice/webhook-proxy",
@@ -304,20 +324,59 @@ mod tests {
         assert!(text.contains("<i>nobody</i>"), "{text}");
     }
 
+    // Three situations, three true sentences. These three tests are the reason
+    // the Event gained a variant: before it did, one of the three had to be
+    // rendered as a guess or as a hedge.
+
     #[test]
-    fn a_push_with_no_commits_says_how_a_deleted_branch_appears() {
-        // The Event cannot tell a deletion from a push that changed nothing —
-        // only the inbound adapter sees that flag, and gc-3pa.10 is about fixing
-        // it. Until then the Notice states the ambiguity rather than guessing.
-        let text = notice(&push(
+    fn a_deleted_branch_reads_as_a_deletion() {
+        let text = notice(&deletion(
             "motrice/webhook-proxy",
             "bead/gc-old",
             "bjornmolin",
-            &[],
         ));
 
+        assert!(text.contains("bjornmolin"), "{text}");
+        assert!(text.contains("bead/gc-old"), "{text}");
+        assert!(text.contains("motrice/webhook-proxy"), "{text}");
+        assert!(text.to_lowercase().contains("deleted"), "{text}");
+        // It must not describe a deletion as a push of nothing, which is the
+        // sentence this bead existed to remove.
+        assert!(!text.contains("no commits"), "{text}");
+    }
+
+    #[test]
+    fn a_push_that_changed_nothing_says_so_and_does_not_mention_deletion() {
+        let text = notice(&push("motrice/webhook-proxy", "main", "bjornmolin", &[]));
+
         assert!(text.contains("no commits"), "{text}");
-        assert!(text.to_lowercase().contains("delet"), "{text}");
+        // The hedge is gone: this is no longer possibly-a-deletion.
+        assert!(!text.to_lowercase().contains("delet"), "{text}");
+    }
+
+    #[test]
+    fn a_push_of_commits_lists_them() {
+        let text = notice(&a_push());
+
+        assert!(text.contains("2 commits"), "{text}");
+        assert!(text.contains("docs: tidy the glossary"), "{text}");
+        assert!(!text.to_lowercase().contains("delet"), "{text}");
+    }
+
+    #[test]
+    fn a_deletion_containing_markup_appears_literally_too() {
+        // The deletion path interpolates the same attacker-controlled fields as
+        // the push path — whoever can delete a branch chose its name — so it
+        // needs the same guarantee, not an inherited assumption. See gc-o61.
+        let text = notice(&deletion(
+            "motrice/<img src=x>",
+            "feature/<script>alert(1)</script>",
+            "<i>nobody</i>",
+        ));
+
+        assert!(text.contains("motrice/<img src=x>"), "{text}");
+        assert!(text.contains("feature/<script>alert(1)</script>"), "{text}");
+        assert!(text.contains("<i>nobody</i>"), "{text}");
     }
 
     // ---- delivery: against a stub hookshot --------------------------------

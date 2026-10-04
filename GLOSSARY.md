@@ -32,7 +32,9 @@ that as the defect, ahead of anything about the code.
 | **Signature** | A signature over a Body, as raw bytes, independent of algorithm or encoding. The domain compares signatures; adapters compute them. | The *secret* — a Signature is public, the key that produced it is not. |
 | **DeliveryId** | A Delivery's identity, minted at the inbound boundary. What a log line, and one day a replay, refers to. | A sender's own event id — that is theirs, this is ours. |
 | **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
-| **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` is the first. | *Delivery*, and any Origin's own event name. |
+| **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` and `DeletedBranch` are the first two. | *Delivery*, and any Origin's own event name. |
+| **PushedCommits** | An Event saying commits were pushed to a branch. The list may be empty, which means a push that changed nothing — a force-push to the commit that was already there. | **DeletedBranch** — an empty commit list is not a deletion. Only the sender's own flag tells them apart, and an inbound adapter is the only thing that sees it. |
+| **DeletedBranch** | An Event saying a branch no longer exists. Carries no commits, and the type has no field for any: deleting a branch pushes nothing. | **PushedCommits** with an empty list — a reader needs a different sentence for each, which is why these are two variants and not one with a flag. |
 | **Commit** | One commit, reduced to what a Destination needs to show: an identity and a one-line summary. | The full git object — the domain keeps no tree, no diff, no parents. |
 | **Pusher** | Whoever pushed, as a name to show a reader. | *Origin* — an Origin is the system that told us, a Pusher is the person who acted. |
 | **Summary** | A commit's first non-blank line. | The commit message — the body is deliberately discarded at the boundary. |
