@@ -29,10 +29,14 @@ jobs:
   check:
     runs-on: docker
     container:
-      # Built from deploy/ci-image/Containerfile and present in the runner's own
-      # Docker storage — there is no registry behind this tag. See that
-      # directory's README: the image must be rebuilt if the runner pod is
-      # replaced, because its storage is ephemeral.
+      # Built from deploy/ci-image/Containerfile into the runner's own Docker
+      # storage — there is no registry behind this tag, and `force_pull` is off
+      # in the runner config so nothing tries to find one.
+      #
+      # That storage is a PersistentVolumeClaim, so the image outlives the pod
+      # (gc-guj). Rebuilding is manual: when the Containerfile changes, bump this
+      # tag and rebuild, or the existing layer is used unchanged. See that
+      # directory's README.
       #
       # It carries rust, node, just and cargo-machete, so this job installs
       # nothing. Installing a toolchain per run would make the fast gate slower

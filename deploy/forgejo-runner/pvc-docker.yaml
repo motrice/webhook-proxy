@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forgejo-runner-docker
+  namespace: forgejo-runner
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Holds Docker's whole storage: the job image, the base layers it was
+      # built from, and the build cache. The job image alone is 1.6GB, so this
+      # is sized for it plus room for a second tag during a rebuild and a Rust
+      # target directory that grows with the workspace.
+      #
+      # local-path hands out a directory on the node rather than a block device,
+      # so this is a ceiling rather than an allocation.
+      storage: 20Gi
+  # No storageClassName: take the cluster default, which on k3s is local-path.
+  # The data is a cache and is meant to be cheap to lose — see the README on
+  # wiping it — so node-local storage is the right trade.

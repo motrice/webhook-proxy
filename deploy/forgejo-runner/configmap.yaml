@@ -18,5 +18,6 @@ data:
     container:
       # Already the default; stated because the job image is built straight into
       # this runner's Docker storage and no registry serves that tag. A forced
-      # pull would fail every run.
+      # pull would fail every run. The storage is a PersistentVolumeClaim, so the
+      # image is still there after the pod is replaced (gc-guj).
       force_pull: false
