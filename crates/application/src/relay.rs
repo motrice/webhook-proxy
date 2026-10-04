@@ -162,8 +162,8 @@ mod tests {
     use async_trait::async_trait;
     use domain::{
         Blank, Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Event,
-        Filter, Origin, OriginId, Pusher, RepositoryName, SecretId, Signature, Subscription,
-        Timestamp, VerifiedDelivery,
+        Filter, LabelName, LabelValue, Labels, Origin, OriginId, Pusher, RepositoryName, SecretId,
+        Signature, Subscription, Timestamp, VerifiedDelivery,
     };
 
     use super::{Refused, Relay};
@@ -437,7 +437,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = vec![Subscription::new(
             room("elsewhere"),
-            Filter::Repository(name("another-repository").expect("a name")),
+            // A label requirement no push can satisfy. It used to be a
+            // Filter::Repository; the Filter now asks for labels so that one
+            // mechanism serves senders that have no repository at all (gc-ast.1).
+            Filter::Labelled(Labels::none().with(
+                LabelName::new("repository").expect("a non-blank name"),
+                LabelValue::new("another-repository").expect("a non-blank value"),
+            )),
         )];
         let relay = Relay::new(
             &secret,

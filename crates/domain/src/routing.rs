@@ -1,7 +1,7 @@
 //! Who should hear about an Event.
 
 use crate::event::present;
-use crate::{Blank, Event, RepositoryName};
+use crate::{Blank, Event, Labels};
 
 /// Identifies a [`Destination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,12 +37,27 @@ pub struct Destination {
 }
 
 /// Decides whether a Destination cares about a given Event.
+///
+/// There is one mechanism, because routing serves senders with nothing
+/// structural in common. A rule names the labels a fact must carry, and every
+/// Event can answer that whether it is a push or an alert. This replaced a
+/// variant naming a `RepositoryName`, which only a sender that has a repository
+/// could be asked about; bead gc-ast.1 records the choice and what it costs.
+///
+/// Values are compared for equality and nothing else — no negation, no regular
+/// expressions. A regex engine would be a dependency in a crate that has none,
+/// and it would run attacker-influenced text through a backtracking matcher,
+/// which hands a denial of service to whoever can write a workload annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Filter {
     /// Everything that arrives.
     Everything,
-    /// Only Events about one repository.
-    Repository(RepositoryName),
+    /// Only Events carrying all of these labels.
+    ///
+    /// Containment, not equality: a fact may carry labels no rule mentions.
+    /// Requiring an exact set would force a Subscription to enumerate every label
+    /// a sender might ever add.
+    Labelled(Labels),
 }
 
 /// A rule binding Events to one Destination.
@@ -95,7 +110,7 @@ impl Filter {
     pub fn admits(&self, event: &Event) -> bool {
         match self {
             Self::Everything => true,
-            Self::Repository(wanted) => event.repository() == wanted,
+            Self::Labelled(required) => event.labels().contain_all(required),
         }
     }
 }
@@ -156,7 +171,7 @@ mod tests {
     use super::{
         Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,
     };
-    use crate::{BranchName, Event, Pusher, RepositoryName};
+    use crate::{BranchName, Event, LabelName, LabelValue, Labels, Pusher, RepositoryName};
 
     fn destination(id: &str) -> Destination {
         Destination::new(
@@ -183,6 +198,25 @@ mod tests {
         }
     }
 
+    /// The Filter that the removed `Repository` variant used to be, expressed the
+    /// new way.
+    ///
+    /// Its presence is the point: the tests below are the ones that guarded that
+    /// variant, unchanged apart from this constructor, so nothing it could express
+    /// has been lost.
+    fn only_repository(name: &str) -> Filter {
+        requiring(&[("repository", name)])
+    }
+
+    fn requiring(pairs: &[(&str, &str)]) -> Filter {
+        Filter::Labelled(pairs.iter().fold(Labels::none(), |set, (name, value)| {
+            set.with(
+                LabelName::new(name).expect("a non-blank name"),
+                LabelValue::new(value).expect("a non-blank value"),
+            )
+        }))
+    }
+
     #[test]
     fn a_destination_identity_cannot_be_blank() {
         assert!(DestinationId::new("  ").is_err());
@@ -205,7 +239,7 @@ mod tests {
         // The Filter reads the repository off the Event rather than off one
         // variant, so a room subscribed to a repository hears about a deleted
         // branch in it without the Filter having to learn the new variant.
-        let filter = Filter::Repository(RepositoryName::new("webhook-proxy").expect("a name"));
+        let filter = only_repository("webhook-proxy");
 
         assert!(filter.admits(&deletion_in("webhook-proxy")));
         assert!(!filter.admits(&deletion_in("something-else")));
@@ -223,17 +257,61 @@ mod tests {
 
     #[test]
     fn a_repository_filter_admits_only_that_repository() {
-        let filter = Filter::Repository(RepositoryName::new("webhook-proxy").expect("a name"));
+        let filter = only_repository("webhook-proxy");
 
         assert!(filter.admits(&push_to("webhook-proxy")));
         assert!(!filter.admits(&push_to("something-else")));
     }
 
     #[test]
+    fn a_filter_of_two_labels_admits_an_event_only_when_both_hold() {
+        // One rule, not two. A room that wants main of one repository says so in a
+        // single Filter, and a push matching only half of it is not admitted.
+        let filter = requiring(&[("repository", "webhook-proxy"), ("branch", "main")]);
+
+        assert!(filter.admits(&push_to("webhook-proxy")));
+        assert!(!filter.admits(&push_to("something-else")));
+        // deletion_in is on bead/gc-old, so its repository matches and its branch
+        // does not.
+        assert!(!filter.admits(&deletion_in("webhook-proxy")));
+    }
+
+    #[test]
+    fn a_filter_naming_a_label_the_event_does_not_carry_admits_nothing() {
+        // A push has no severity. A rule asking for one must fail to match rather
+        // than fail to run — and a mistyped label name lands here too, which is
+        // why a typo makes a room go quiet instead of hearing the wrong thing.
+        assert!(!requiring(&[("severity", "critical")]).admits(&push_to("webhook-proxy")));
+        assert!(!requiring(&[("repositry", "webhook-proxy")]).admits(&push_to("webhook-proxy")));
+    }
+
+    #[test]
+    fn a_filter_requiring_nothing_admits_everything() {
+        // The degenerate case, stated because configuration can reach it: an empty
+        // requirement is Everything by another name, not a rule that quietly
+        // matches nothing.
+        let filter = Filter::Labelled(Labels::none());
+
+        assert!(filter.admits(&push_to("webhook-proxy")));
+        assert!(filter.admits(&deletion_in("anything")));
+    }
+
+    #[test]
+    fn filtering_by_branch_needs_no_new_filter_kind() {
+        // This is bead gc-3pa.11, which asked for a Filter admitting only named
+        // branches. It is a label requirement now, so the feature exists without
+        // code of its own — which is why that bead is closed as superseded.
+        let main_only = requiring(&[("branch", "main")]);
+
+        assert!(main_only.admits(&push_to("webhook-proxy")));
+        assert!(!main_only.admits(&deletion_in("webhook-proxy")));
+    }
+
+    #[test]
     fn an_event_matching_nothing_yields_no_destinations_and_is_not_an_error() {
         let subscriptions = vec![Subscription::new(
             destination("room"),
-            Filter::Repository(RepositoryName::new("other").expect("a name")),
+            only_repository("other"),
         )];
 
         assert!(destinations_for(&push_to("webhook-proxy"), &subscriptions).is_empty());
@@ -244,10 +322,7 @@ mod tests {
         let room = destination("room");
         let subscriptions = vec![
             Subscription::new(room.clone(), Filter::Everything),
-            Subscription::new(
-                room.clone(),
-                Filter::Repository(RepositoryName::new("webhook-proxy").expect("a name")),
-            ),
+            Subscription::new(room.clone(), only_repository("webhook-proxy")),
         ];
 
         let reached = destinations_for(&push_to("webhook-proxy"), &subscriptions);

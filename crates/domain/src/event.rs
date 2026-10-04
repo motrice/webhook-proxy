@@ -1,5 +1,7 @@
 //! What happened, stated without reference to whoever told us about it.
 
+use crate::label::{LabelName, LabelValue, Labels};
+
 /// A value that carries meaning may not be blank. Carries the concept that was
 /// blank, so a caller can say which field the sender left out.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,18 +115,45 @@ pub enum Event {
     },
 }
 
+/// The label a forge Event is routed by when a rule names a repository.
+const REPOSITORY: &str = "repository";
+
+/// The label a forge Event is routed by when a rule names a branch.
+const BRANCH: &str = "branch";
+
 impl Event {
-    /// Which repository this is about. Every Event concerns exactly one.
+    /// The labels this can be routed by.
     ///
-    /// Routing asks this of any Event, so a new variant is bound by the compiler
-    /// to answer it, rather than by somebody remembering to extend a match
-    /// inside a Filter.
+    /// Every Event answers this, so a new variant is bound by the compiler to
+    /// say how it is routed rather than by somebody remembering to extend a
+    /// match inside a Filter. It replaced an accessor that returned a
+    /// `RepositoryName`, which only a sender that has a repository could answer —
+    /// an alert has a namespace and a severity and no repository at all. Bead
+    /// gc-ast.1 records why routing stopped asking for a typed field.
+    ///
+    /// For these variants the labels are *projected* from the typed fields, never
+    /// stored. That is what keeps the mechanism safe: there is nowhere to put a
+    /// label, so a label cannot disagree with the field it came from, and no
+    /// adapter can misspell one into an Event. A sender whose labels are its own
+    /// data — an alert — stores them instead, and the same question is asked of
+    /// both.
     #[must_use]
-    pub fn repository(&self) -> &RepositoryName {
+    pub fn labels(&self) -> Labels {
         match self {
-            Self::PushedCommits { repository, .. } | Self::DeletedBranch { repository, .. } => {
-                repository
+            Self::PushedCommits {
+                repository, branch, ..
             }
+            | Self::DeletedBranch {
+                repository, branch, ..
+            } => Labels::none()
+                .with(
+                    LabelName::known(REPOSITORY),
+                    LabelValue::present(repository.as_str()),
+                )
+                .with(
+                    LabelName::known(BRANCH),
+                    LabelValue::present(branch.as_str()),
+                ),
         }
     }
 }
@@ -270,6 +299,7 @@ impl Commit {
 #[cfg(test)]
 mod tests {
     use super::{BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary};
+    use crate::LabelName;
 
     fn commit(id: &str, summary: &str) -> Commit {
         Commit::new(
@@ -323,13 +353,56 @@ mod tests {
         assert_eq!(pusher.as_str(), "bjorn");
     }
 
+    fn label_of(event: &Event, name: &str) -> Option<String> {
+        let name = LabelName::new(name).expect("a non-blank name");
+        event
+            .labels()
+            .get(&name)
+            .map(|value| value.as_str().to_owned())
+    }
+
     #[test]
-    fn every_event_says_which_repository_it_is_about() {
-        // Routing asks this of any Event. Without it, each new variant would
-        // have to be added to a match inside the Filter, which is the kind of
-        // change that gets forgotten.
-        assert_eq!(push(vec![]).repository().as_str(), "webhook-proxy");
-        assert_eq!(deletion().repository().as_str(), "webhook-proxy");
+    fn every_event_offers_the_labels_it_can_be_routed_by() {
+        // Routing asks this of any Event, so a new variant is bound by the
+        // compiler to answer it rather than by somebody remembering to extend a
+        // match inside a Filter. This replaced Event::repository(), which only a
+        // sender that has a repository could answer — see bead gc-ast.1.
+        for event in [push(vec![]), deletion()] {
+            assert_eq!(
+                label_of(&event, "repository").as_deref(),
+                Some("webhook-proxy")
+            );
+            assert_eq!(label_of(&event, "branch").as_deref(), Some("main"));
+            assert_eq!(event.labels().len(), 2);
+        }
+    }
+
+    #[test]
+    fn labels_are_projected_from_the_typed_fields_rather_than_stored() {
+        // The property that makes label routing safe: there is nowhere to put a
+        // label, so a label cannot disagree with the field it came from and no
+        // adapter can misspell one into an Event. Changing the branch changes the
+        // label, necessarily.
+        let elsewhere = Event::PushedCommits {
+            repository: RepositoryName::new("other/repo").expect("a name"),
+            branch: BranchName::new("feature/x").expect("a name"),
+            pusher: Pusher::new("bjorn").expect("a name"),
+            commits: vec![],
+            permalink: None,
+        };
+
+        assert_eq!(
+            label_of(&elsewhere, "repository").as_deref(),
+            Some("other/repo")
+        );
+        assert_eq!(label_of(&elsewhere, "branch").as_deref(), Some("feature/x"));
+    }
+
+    #[test]
+    fn a_label_an_event_does_not_carry_is_simply_absent() {
+        // Not an error and not a blank: a push has no severity, and a rule asking
+        // for one must fail to match rather than fail to run.
+        assert!(label_of(&push(vec![]), "severity").is_none());
     }
 
     #[test]
