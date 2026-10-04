@@ -258,6 +258,7 @@ mod tests {
             branch: BranchName::new("main").expect("a name"),
             pusher: Pusher::new("bjorn").expect("a name"),
             commits: vec![],
+            permalink: None,
         }
     }
 

@@ -33,11 +33,12 @@ that as the defect, ahead of anything about the code.
 | **DeliveryId** | A Delivery's identity, minted at the inbound boundary. What a log line, and one day a replay, refers to. | A sender's own event id — that is theirs, this is ours. |
 | **VerifiedDelivery** | A Delivery whose signature has been checked and matched. Only constructible by a successful verification, never by a caller. | *Delivery* — the type distinction is the security boundary. |
 | **Event** | What happened, stated independently of any Origin's payload format. `PushedCommits` and `DeletedBranch` are the first two. | *Delivery*, and any Origin's own event name. |
-| **PushedCommits** | An Event saying commits were pushed to a branch. The list may be empty, which means a push that changed nothing — a force-push to the commit that was already there. | **DeletedBranch** — an empty commit list is not a deletion. Only the sender's own flag tells them apart, and an inbound adapter is the only thing that sees it. |
+| **PushedCommits** | An Event saying commits were pushed to a branch. The list may be empty, which means a push that changed nothing — a force-push to the commit that was already there. Carries a Permalink when the Origin published one. | **DeletedBranch** — an empty commit list is not a deletion. Only the sender's own flag tells them apart, and an inbound adapter is the only thing that sees it. |
 | **DeletedBranch** | An Event saying a branch no longer exists. Carries no commits, and the type has no field for any: deleting a branch pushes nothing. | **PushedCommits** with an empty list — a reader needs a different sentence for each, which is why these are two variants and not one with a flag. |
 | **Commit** | One commit, reduced to what a Destination needs to show: an identity and a one-line summary. | The full git object — the domain keeps no tree, no diff, no parents. |
 | **Pusher** | Whoever pushed, as a name to show a reader. | *Origin* — an Origin is the system that told us, a Pusher is the person who acted. |
 | **Summary** | A commit's first non-blank line. | The commit message — the body is deliberately discarded at the boundary. |
+| **Permalink** | Where a reader can go to see what happened, exactly as the Origin published it. Opaque: the domain never builds one, and never parses a scheme or a path out of one. | An *endpoint* — a Permalink is a reference to the subject of a fact, not the address of a system we talk to. A Destination still has no address, and `purity` forbids transport vocabulary in the domain. |
 | **Destination** | An internal system that should be told about Events: an Element room, Forgejo, GitLab. | *Origin* — Origins send to us, Destinations receive from us. |
 | **DestinationKind** | What shape an Event takes for a Destination: prose for people (a Notice) or structure for a machine. Decides which adapter handles it. | The product at the other end — a chat room is a chat room whichever vendor serves it. |
 | **Filter** | The rule inside a Subscription that decides whether a Destination cares about a given Event. | *Subscription* — the Subscription binds, the Filter selects. |
@@ -48,6 +49,13 @@ that as the defect, ahead of anything about the code.
 
 Deliberately absent: *Message*, *Payload*, *Hook*, *Handler*, *Processor*. The
 first three are ambiguous about direction, and the last two name mechanisms.
+
+Also absent, and enforced rather than merely agreed: *URL*, *endpoint*, *header*,
+*bearer*, *token* and *status code*. How a system is reached belongs to the
+adapter that reaches it, and `crates/architecture/tests/purity.rs` fails the
+build if one of those words appears in domain code. A fact may still carry a
+Permalink, because a reference to what happened is part of the fact rather than
+part of the mechanism — see bead gc-3pa.13 for why that line falls there.
 
 ## Bounded contexts
 

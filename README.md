@@ -189,6 +189,5 @@ file paths, so pipe into them rather than passing a filename.
 
 - **`main` is not yet protected**, so the human-merges rule is currently only a
   sentence in `CLAUDE.md` (`gc-rdz`).
-- **The boundary test cannot see inside source files.** A domain file calling
-  `SystemTime::now()` still compiles, because `std` needs no manifest entry
-  (`gc-3ew`).
+- **The hookshot endpoint has no authentication**, so possession of the URL is
+  the only credential it has (`gc-fks`).

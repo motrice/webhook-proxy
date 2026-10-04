@@ -5,6 +5,7 @@
   "created": false,
   "deleted": true,
   "forced": false,
+  "compare": "https://github.com/motrice/webhook-proxy/compare/6113728f27ae...000000000000",
   "repository": {
     "id": 1035219,
     "name": "webhook-proxy",

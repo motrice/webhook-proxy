@@ -169,6 +169,15 @@ async fn a_signed_push_reaches_the_room() {
     assert!(text.contains("motrice/webhook-proxy"), "{text}");
     assert!(text.contains("main"), "{text}");
     assert!(text.contains("bjornmolin"), "{text}");
+    // The link the sender published, carried through the domain as a Permalink
+    // and rendered last. Nothing along the way knows how to build such an
+    // address, which is what made carrying it possible at all — see gc-3pa.13.
+    assert!(
+        text.ends_with(
+            "\nhttps://github.com/motrice/webhook-proxy/compare/9049f1265b7d...6113728f27ae"
+        ),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -197,6 +206,10 @@ async fn a_signed_branch_deletion_reaches_the_room_as_a_deletion() {
         !text.contains("no commits"),
         "a deletion must not be reported as a push that carried nothing: {text}"
     );
+    // The deletion payload publishes a compare link; it is deliberately dropped,
+    // because comparing against a ref that no longer exists tells a reader
+    // nothing. DeletedBranch has no field for one.
+    assert!(!text.contains("://"), "{text}");
 }
 
 #[tokio::test]
