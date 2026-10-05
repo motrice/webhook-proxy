@@ -24,6 +24,24 @@ use std::collections::BTreeMap;
 use crate::Blank;
 use crate::event::present;
 
+/// The label naming which Origin told us, set from the verified Delivery.
+///
+/// Reserved: see [`RESERVED`].
+pub const ORIGIN: &str = "origin";
+
+/// Label names only this crate may set.
+///
+/// A sender that could set one of these could lie about something the system
+/// relies on. `origin` is the first and the reason the set exists: a workload
+/// able to write its own annotations — a wider set of people than the sender
+/// forwarding them — could otherwise claim to be any Origin and so reach every
+/// room subscribed to one. Bead gc-srw.
+///
+/// Requiring a reserved label in a rule is fine and is the point; only *setting*
+/// one is denied. A Subscription saying `origin=alertmanager` is exactly what
+/// this makes trustworthy.
+const RESERVED: &[&str] = &[ORIGIN];
+
 /// The name a label is known by.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LabelName(String);
@@ -123,6 +141,18 @@ impl Labels {
         self.0.is_empty()
     }
 
+    /// The same labels with everything reserved removed.
+    ///
+    /// Called on whatever a fact offers, before matching and before the domain
+    /// sets the reserved labels itself. Dropping rather than rejecting is
+    /// deliberate: a sender including a reserved label must not be able to deny
+    /// itself delivery by doing so, so it loses that label and nothing else.
+    #[must_use]
+    pub fn without_reserved(mut self) -> Self {
+        self.0.retain(|name, _| !RESERVED.contains(&name.as_str()));
+        self
+    }
+
     /// Whether every label in `required` is here with the same value.
     ///
     /// Containment, not equality: a fact may carry labels no rule mentions, and
@@ -153,6 +183,49 @@ mod tests {
             let (name, value) = label(name, value);
             set.with(name, value)
         })
+    }
+
+    #[test]
+    fn a_reserved_label_is_dropped_rather_than_honoured() {
+        // The security property. A sender that could set `origin` could claim to
+        // be another Origin and reach every room subscribed to it. Dropping is
+        // the whole defence, and it happens before any matching.
+        let forged = labels(&[("origin", "alertmanager"), ("severity", "critical")]);
+
+        let safe = forged.without_reserved();
+
+        assert_eq!(safe.len(), 1);
+        assert!(
+            safe.get(&LabelName::new("origin").expect("a name"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dropping_a_reserved_label_keeps_everything_else() {
+        // Dropped, not rejected: a sender including a reserved label must not be
+        // able to deny itself delivery by doing so. It loses the label it was
+        // never allowed to set, and nothing more.
+        let forged = labels(&[
+            ("origin", "lies"),
+            ("namespace", "prod"),
+            ("service", "api"),
+        ]);
+
+        let safe = forged.without_reserved();
+
+        assert_eq!(safe.len(), 2);
+        for (name, value) in [("namespace", "prod"), ("service", "api")] {
+            let name = LabelName::new(name).expect("a name");
+            assert_eq!(safe.get(&name).map(LabelValue::as_str), Some(value));
+        }
+    }
+
+    #[test]
+    fn labels_with_nothing_reserved_are_unchanged() {
+        let honest = labels(&[("namespace", "prod")]);
+
+        assert_eq!(honest.clone().without_reserved(), honest);
     }
 
     #[test]

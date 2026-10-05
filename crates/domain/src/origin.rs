@@ -24,6 +24,12 @@ impl OriginId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    /// The name as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl SecretId {
