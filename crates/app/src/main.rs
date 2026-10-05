@@ -163,10 +163,20 @@ async fn run() -> Result<(), Unstartable> {
         Filter::Everything,
     )];
 
-    let origins = HashMap::from([(
-        ORIGIN.to_owned(),
-        Origin::new(OriginId::new(ORIGIN), SecretId::new(SECRET)),
-    )]);
+    // Both names are consts in this file rather than configuration, so neither
+    // can be blank today. Reported rather than unwrapped all the same: the
+    // composition root is where a bad name becomes a refusal to start, and the
+    // moment either comes from a file (gc-ast.11) this is already the right
+    // shape. Same idiom as ELEMENT_ROOM above.
+    let origin_id = OriginId::new(ORIGIN).map_err(|blank| Unstartable::Unusable {
+        name: "the Origin identity",
+        why: blank.to_string(),
+    })?;
+    let secret_id = SecretId::new(SECRET).map_err(|blank| Unstartable::Unusable {
+        name: "the secret name",
+        why: blank.to_string(),
+    })?;
+    let origins = HashMap::from([(ORIGIN.to_owned(), Origin::new(origin_id, secret_id))]);
 
     let inbound = Inbound::new(
         signatures,

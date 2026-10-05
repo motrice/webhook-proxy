@@ -174,7 +174,7 @@ mod tests {
         let signature = Signature::from_bytes([1, 2, 3]);
         Delivery::new(
             DeliveryId::new("d-1").expect("a non-blank identity"),
-            OriginId::new("a-forge"),
+            OriginId::new("a-forge").expect("a non-blank origin identity"),
             Body::from_bytes(body.to_vec()),
             Timestamp::from_millis_since_epoch(1_759_000_000_000),
         )

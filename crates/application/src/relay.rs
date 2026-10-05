@@ -249,7 +249,10 @@ mod tests {
     }
 
     fn an_origin() -> Origin {
-        Origin::new(OriginId::new("a-forge"), SecretId::new("a-secret"))
+        Origin::new(
+            OriginId::new("a-forge").expect("a non-blank origin identity"),
+            SecretId::new("a-secret").expect("a non-blank secret name"),
+        )
     }
 
     fn name(text: &str) -> Result<RepositoryName, Blank> {
