@@ -133,7 +133,11 @@ impl<'a> Relay<'a> {
         let mut reached = Vec::new();
         let mut lost = Vec::new();
         for event in &events {
-            for destination in destinations_for(event, self.subscriptions) {
+            // The Origin from the *verified* Delivery, not the one the caller
+            // named: routing must turn on who actually signed this. The two are
+            // the same value today, and asking the VerifiedDelivery means they
+            // cannot drift apart later. See bead gc-srw.
+            for destination in destinations_for(verified.origin(), event, self.subscriptions) {
                 match self
                     .dispatcher
                     .dispatch(verified.id(), event, destination)
