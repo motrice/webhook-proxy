@@ -157,17 +157,16 @@ impl Subscription {
 /// chose — an Alert, whose labels come from workload annotations, and so from
 /// whoever can deploy. Bead gc-srw.
 fn routing_labels(origin: &OriginId, offered: Labels) -> Labels {
-    let labels = offered.without_reserved();
-
-    // Unlike every other name in this crate, OriginId does not reject a blank —
-    // see bead gc-qz6 — so this can fail, and the validating constructor is used
-    // rather than the unchecked one. When it fails the label is simply absent, so
-    // every rule naming an origin stops matching: the room goes quiet, which is
-    // the safe direction for a value that decides who may reach it.
-    match LabelValue::new(origin.as_str()) {
-        Ok(value) => labels.with(LabelName::known(label::ORIGIN), value),
-        Err(_) => labels,
-    }
+    // The drop stays even though `with` would overwrite a forged `origin`
+    // anyway. The invariant wanted here is "a sender cannot set a reserved
+    // label", and resting that on "every reserved label happens to be projected"
+    // would make it depend on a property of a different function — true today,
+    // silently false the first time a reserved name is added that is not always
+    // set. Dropping makes it locally true instead.
+    offered.without_reserved().with(
+        LabelName::known(label::ORIGIN),
+        LabelValue::present(origin.as_str()),
+    )
 }
 
 /// Every Destination that should hear about this Event, each once.
@@ -262,7 +261,7 @@ mod tests {
     }
 
     fn origin(id: &str) -> OriginId {
-        OriginId::new(id)
+        OriginId::new(id).expect("a non-blank origin identity")
     }
 
     fn offering(pairs: &[(&str, &str)]) -> Labels {
@@ -350,24 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_origin_yields_no_origin_label_and_so_matches_no_origin_rule() {
-        // OriginId does not reject a blank name (gc-qz6). The label is omitted
-        // rather than invented, so a rule naming an origin stops matching and the
-        // room goes quiet — never the opposite, where a blank would match
-        // something.
-        let matched = routing_labels(&OriginId::new("  "), offering(&[("severity", "critical")]));
-
-        assert!(
-            matched
-                .get(&LabelName::new("origin").expect("a name"))
-                .is_none()
-        );
-        // A rule requiring a blank origin is not constructible in the first
-        // place, so the only case to pin is that a real one does not match.
-        assert!(!requiring(&[("origin", "anything")]).admits(&matched));
-    }
-
-    #[test]
     fn a_senders_origin_label_is_overwritten_by_the_one_that_sent_it() {
         // An Alert stores the labels it was sent, and those come from workload
         // annotations — from whoever can deploy, a wider set than the sender
@@ -409,47 +390,6 @@ mod tests {
             destinations_for(&origin("alertmanager"), &forged, &its_own),
             vec![&room]
         );
-    }
-
-    #[test]
-    fn a_senders_origin_label_is_dropped_even_when_nothing_overwrites_it() {
-        // This is where `without_reserved` is load-bearing, and the only place it
-        // currently is. OriginId accepts a blank name (gc-qz6), so the projection
-        // can fail — and when it does there is nothing to overwrite a forged
-        // label with. Without the drop, a blank origin in configuration would let
-        // a sender's own `origin` label stand and reach rooms with it.
-        //
-        // Proven by mutation: commenting out the retain in `without_reserved`
-        // makes this test fail and leaves every other test passing.
-        let forged = Event::Alert {
-            id: AlertId::new("7b1a177c").expect("an identity"),
-            severity: Severity::Critical,
-            status: AlertStatus::Firing,
-            summary: Summary::new("something is wrong").expect("a summary"),
-            labels: Labels::none().with(
-                LabelName::new("origin").expect("a name"),
-                LabelValue::new("a-forge").expect("a value"),
-            ),
-            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
-            permalink: None,
-        };
-
-        // A blank configured origin: the projection cannot produce a label.
-        let matched = routing_labels(&OriginId::new("   "), forged.labels());
-
-        assert!(
-            matched
-                .get(&LabelName::new("origin").expect("a name"))
-                .is_none(),
-            "a sender's forged origin survived into the labels a rule is matched against"
-        );
-
-        let room = destination("devsecops-room");
-        let subscriptions = vec![Subscription::new(
-            room.clone(),
-            requiring(&[("origin", "a-forge")]),
-        )];
-        assert!(destinations_for(&OriginId::new("   "), &forged, &subscriptions).is_empty());
     }
 
     #[test]

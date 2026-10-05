@@ -106,7 +106,10 @@ mod tests {
     }
 
     fn origin() -> Origin {
-        Origin::new(OriginId::new("a-forge"), SecretId::new(SECRET_NAME))
+        Origin::new(
+            OriginId::new("a-forge").expect("a non-blank origin identity"),
+            SecretId::new(SECRET_NAME).expect("a non-blank secret name"),
+        )
     }
 
     #[test]
@@ -153,7 +156,10 @@ mod tests {
 
     #[test]
     fn an_unknown_secret_name_is_unavailable_rather_than_a_mismatch() {
-        let unknown = Origin::new(OriginId::new("a-forge"), SecretId::new("not-configured"));
+        let unknown = Origin::new(
+            OriginId::new("a-forge").expect("a non-blank origin identity"),
+            SecretId::new("not-configured").expect("a non-blank secret name"),
+        );
 
         let outcome = verifier().expected(&unknown, &Body::from_bytes(BODY.to_vec()));
 
@@ -212,7 +218,10 @@ mod tests {
 
     #[test]
     fn no_secret_value_appears_in_an_error_or_in_debug_output() {
-        let unknown = Origin::new(OriginId::new("a-forge"), SecretId::new("not-configured"));
+        let unknown = Origin::new(
+            OriginId::new("a-forge").expect("a non-blank origin identity"),
+            SecretId::new("not-configured").expect("a non-blank secret name"),
+        );
         let error = verifier()
             .expected(&unknown, &Body::from_bytes(BODY.to_vec()))
             .expect_err("unknown secret");

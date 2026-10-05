@@ -363,7 +363,10 @@ mod tests {
     fn an_origin() -> (String, Origin) {
         (
             "github".to_owned(),
-            Origin::new(OriginId::new("github"), SecretId::new("a-secret")),
+            Origin::new(
+                OriginId::new("github").expect("a non-blank origin identity"),
+                SecretId::new("a-secret").expect("a non-blank secret name"),
+            ),
         )
     }
 
