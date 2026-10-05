@@ -213,7 +213,8 @@ mod tests {
         routing_labels,
     };
     use crate::{
-        BranchName, Event, LabelName, LabelValue, Labels, OriginId, Pusher, RepositoryName,
+        AlertId, AlertStatus, BranchName, Event, LabelName, LabelValue, Labels, OriginId, Pusher,
+        RepositoryName, Severity, Summary, Timestamp,
     };
 
     fn destination(id: &str) -> Destination {
@@ -364,6 +365,91 @@ mod tests {
         // A rule requiring a blank origin is not constructible in the first
         // place, so the only case to pin is that a real one does not match.
         assert!(!requiring(&[("origin", "anything")]).admits(&matched));
+    }
+
+    #[test]
+    fn a_senders_origin_label_is_overwritten_by_the_one_that_sent_it() {
+        // An Alert stores the labels it was sent, and those come from workload
+        // annotations — from whoever can deploy, a wider set than the sender
+        // forwarding them. Here the projection overwrites the claim, because
+        // `Labels::with` replaces. The *drop* is what covers the case where the
+        // projection does not happen at all: see the test below.
+        let forged = Event::Alert {
+            id: AlertId::new("7b1a177c").expect("an identity"),
+            severity: Severity::Critical,
+            status: AlertStatus::Firing,
+            summary: Summary::new("something is wrong").expect("a summary"),
+            labels: Labels::none().with(
+                LabelName::new("origin").expect("a name"),
+                LabelValue::new("a-forge").expect("a value"),
+            ),
+            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
+            permalink: None,
+        };
+
+        let room = destination("devsecops-room");
+        let only_the_forge = vec![Subscription::new(
+            room.clone(),
+            requiring(&[("origin", "a-forge")]),
+        )];
+
+        // The alert says it came from a-forge. It did not.
+        let reached = destinations_for(&origin("alertmanager"), &forged, &only_the_forge);
+        assert!(
+            reached.is_empty(),
+            "a sender set its own origin label and reached a room with it"
+        );
+
+        // And it still routes as what it actually is.
+        let its_own = vec![Subscription::new(
+            room.clone(),
+            requiring(&[("origin", "alertmanager"), ("severity", "critical")]),
+        )];
+        assert_eq!(
+            destinations_for(&origin("alertmanager"), &forged, &its_own),
+            vec![&room]
+        );
+    }
+
+    #[test]
+    fn a_senders_origin_label_is_dropped_even_when_nothing_overwrites_it() {
+        // This is where `without_reserved` is load-bearing, and the only place it
+        // currently is. OriginId accepts a blank name (gc-qz6), so the projection
+        // can fail — and when it does there is nothing to overwrite a forged
+        // label with. Without the drop, a blank origin in configuration would let
+        // a sender's own `origin` label stand and reach rooms with it.
+        //
+        // Proven by mutation: commenting out the retain in `without_reserved`
+        // makes this test fail and leaves every other test passing.
+        let forged = Event::Alert {
+            id: AlertId::new("7b1a177c").expect("an identity"),
+            severity: Severity::Critical,
+            status: AlertStatus::Firing,
+            summary: Summary::new("something is wrong").expect("a summary"),
+            labels: Labels::none().with(
+                LabelName::new("origin").expect("a name"),
+                LabelValue::new("a-forge").expect("a value"),
+            ),
+            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
+            permalink: None,
+        };
+
+        // A blank configured origin: the projection cannot produce a label.
+        let matched = routing_labels(&OriginId::new("   "), forged.labels());
+
+        assert!(
+            matched
+                .get(&LabelName::new("origin").expect("a name"))
+                .is_none(),
+            "a sender's forged origin survived into the labels a rule is matched against"
+        );
+
+        let room = destination("devsecops-room");
+        let subscriptions = vec![Subscription::new(
+            room.clone(),
+            requiring(&[("origin", "a-forge")]),
+        )];
+        assert!(destinations_for(&OriginId::new("   "), &forged, &subscriptions).is_empty());
     }
 
     #[test]
