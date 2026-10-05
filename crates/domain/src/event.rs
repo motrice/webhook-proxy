@@ -1,6 +1,8 @@
 //! What happened, stated without reference to whoever told us about it.
 
+use crate::alert::{AlertId, AlertStatus, Severity};
 use crate::label::{LabelName, LabelValue, Labels};
+use crate::time::Timestamp;
 
 /// A value that carries meaning may not be blank. Carries the concept that was
 /// blank, so a caller can say which field the sender left out.
@@ -113,7 +115,39 @@ pub enum Event {
         /// Who deleted it.
         pusher: Pusher,
     },
+    /// A monitoring system reported something.
+    ///
+    /// The first variant whose labels are the sender's own data rather than a
+    /// projection of typed fields, which is why reserved names exist: see
+    /// [`routing_labels`](crate::destinations_for) and bead gc-srw.
+    Alert {
+        /// The sender's identity for this alert, not ours. Never a `DeliveryId`.
+        id: AlertId,
+        /// How urgent the sender says it is.
+        severity: Severity,
+        /// Firing or resolved. A resolution is reported, never inferred.
+        status: AlertStatus,
+        /// One line for a reader.
+        summary: Summary,
+        /// The labels the sender attached, as sent.
+        ///
+        /// Stored rather than projected, because they *are* the content of the
+        /// fact. Severity and status are projected over the top when routing, so
+        /// a sender cannot make those two disagree with the typed fields.
+        labels: Labels,
+        /// When the sender says it began. Always data; the domain never reads a
+        /// clock.
+        started: Timestamp,
+        /// Where a reader can see it, if the sender published a link.
+        permalink: Option<Permalink>,
+    },
 }
+
+/// The label a rule names to select alerts by urgency.
+const SEVERITY: &str = "severity";
+
+/// The label a rule names to select firing or resolved alerts.
+const STATUS: &str = "status";
 
 /// The label a forge Event is routed by when a rule names a repository.
 const REPOSITORY: &str = "repository";
@@ -154,6 +188,29 @@ impl Event {
                     LabelName::known(BRANCH),
                     LabelValue::present(branch.as_str()),
                 ),
+            // What the sender sent, then the typed fields over the top. The order
+            // matters: a sender's own `severity` label must not be able to
+            // disagree with the severity a renderer shows, so the projection
+            // wins. Reserved names are dropped later, in one place, by
+            // `routing_labels`.
+            Self::Alert {
+                severity,
+                status,
+                labels,
+                ..
+            } => {
+                let offered = labels.clone().with(
+                    LabelName::known(STATUS),
+                    LabelValue::present(status.as_label()),
+                );
+                match severity.as_label() {
+                    Some(stated) => {
+                        offered.with(LabelName::known(SEVERITY), LabelValue::present(stated))
+                    }
+                    // Nothing to match on, so no label rather than a blank one.
+                    None => offered,
+                }
+            }
         }
     }
 }
@@ -299,7 +356,7 @@ impl Commit {
 #[cfg(test)]
 mod tests {
     use super::{BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary};
-    use crate::LabelName;
+    use crate::{AlertId, AlertStatus, LabelName, LabelValue, Labels, Severity, Timestamp};
 
     fn commit(id: &str, summary: &str) -> Commit {
         Commit::new(
@@ -473,6 +530,139 @@ mod tests {
         let Event::DeletedBranch { .. } = deletion() else {
             panic!("a deletion");
         };
+    }
+
+    fn alert_labels() -> Labels {
+        Labels::none()
+            .with(
+                LabelName::new("namespace").expect("a name"),
+                LabelValue::new("prod").expect("a value"),
+            )
+            .with(
+                LabelName::new("service").expect("a name"),
+                LabelValue::new("api").expect("a value"),
+            )
+    }
+
+    fn alert(status: AlertStatus, severity: Severity) -> Event {
+        Event::Alert {
+            id: AlertId::new("7b1a177c").expect("an identity"),
+            severity,
+            status,
+            summary: Summary::new("api latency above target").expect("a summary"),
+            labels: alert_labels(),
+            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
+            permalink: None,
+        }
+    }
+
+    #[test]
+    fn an_alert_carries_what_a_reader_and_a_rule_both_need() {
+        let Event::Alert {
+            id,
+            severity,
+            status,
+            summary,
+            labels,
+            started,
+            permalink,
+        } = alert(AlertStatus::Firing, Severity::Critical)
+        else {
+            panic!("an alert");
+        };
+
+        assert_eq!(id.as_str(), "7b1a177c");
+        assert_eq!(severity, Severity::Critical);
+        assert_eq!(status, AlertStatus::Firing);
+        assert_eq!(summary.as_str(), "api latency above target");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(started.millis_since_epoch(), 1_759_000_000_000);
+        assert!(permalink.is_none());
+    }
+
+    #[test]
+    fn a_resolved_alert_and_a_firing_one_with_the_same_identity_are_distinct() {
+        // Two facts, not one fact in two states. The sender says which, and there
+        // is deliberately no method here that turns one into the other: a
+        // resolution is something that was reported, never something the domain
+        // can infer.
+        let firing = alert(AlertStatus::Firing, Severity::Critical);
+        let resolved = alert(AlertStatus::Resolved, Severity::Critical);
+
+        assert_ne!(firing, resolved);
+    }
+
+    #[test]
+    fn an_alert_offers_its_own_labels_plus_its_severity_and_status() {
+        // The reason a filter written against severity needs no new filter kind.
+        let event = alert(AlertStatus::Firing, Severity::Critical);
+
+        assert_eq!(label_of(&event, "namespace").as_deref(), Some("prod"));
+        assert_eq!(label_of(&event, "service").as_deref(), Some("api"));
+        assert_eq!(label_of(&event, "severity").as_deref(), Some("critical"));
+        assert_eq!(label_of(&event, "status").as_deref(), Some("firing"));
+    }
+
+    #[test]
+    fn an_alert_offers_no_repository_or_branch() {
+        // The whole reason routing stopped asking for a typed repository.
+        let event = alert(AlertStatus::Firing, Severity::Warning);
+
+        assert!(label_of(&event, "repository").is_none());
+        assert!(label_of(&event, "branch").is_none());
+    }
+
+    #[test]
+    fn a_senders_own_severity_label_cannot_disagree_with_the_typed_one() {
+        // A sender's labels are its own data, so they may contain a severity that
+        // does not match the one we parsed. The typed value wins, because it is
+        // what a renderer shows and what an order is taken from — two answers to
+        // one question is the bug this prevents.
+        let mut sent = alert_labels();
+        sent = sent.with(
+            LabelName::new("severity").expect("a name"),
+            LabelValue::new("info").expect("a value"),
+        );
+
+        let event = Event::Alert {
+            id: AlertId::new("7b1a177c").expect("an identity"),
+            severity: Severity::Critical,
+            status: AlertStatus::Firing,
+            summary: Summary::new("api latency above target").expect("a summary"),
+            labels: sent,
+            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
+            permalink: None,
+        };
+
+        assert_eq!(label_of(&event, "severity").as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn an_unstated_severity_offers_no_severity_label_to_match_on() {
+        // Named rather than defaulted, per the decision in gc-ast.1: a rule
+        // asking for a severity does not select this alert, and the alert is
+        // still delivered to any rule that does not ask.
+        let event = alert(AlertStatus::Firing, Severity::Unstated);
+
+        assert!(label_of(&event, "severity").is_none());
+        assert_eq!(label_of(&event, "status").as_deref(), Some("firing"));
+    }
+
+    #[test]
+    fn an_unrecognised_severity_is_offered_as_the_sender_wrote_it() {
+        let event = alert(
+            AlertStatus::Resolved,
+            Severity::Unrecognised("sev1".to_owned()),
+        );
+
+        assert_eq!(label_of(&event, "severity").as_deref(), Some("sev1"));
+        assert_eq!(label_of(&event, "status").as_deref(), Some("resolved"));
+    }
+
+    #[test]
+    fn a_blank_alert_summary_or_identity_is_rejected_at_construction() {
+        assert!(Summary::new("   ").is_err());
+        assert!(AlertId::new("  ").is_err());
     }
 
     #[test]

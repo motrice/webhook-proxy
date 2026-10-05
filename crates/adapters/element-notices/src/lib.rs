@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use application::ports::{DispatchFailed, Dispatcher};
-use domain::{Commit, DeliveryId, Destination, Event, Permalink};
+use domain::{AlertStatus, Commit, DeliveryId, Destination, Event, Permalink, Severity};
 
 /// How much of a commit identity a reader sees.
 ///
@@ -90,6 +90,13 @@ pub fn notice(event: &Event) -> String {
             branch.as_str(),
             repository.as_str()
         ),
+        Event::Alert {
+            severity,
+            status,
+            summary,
+            permalink,
+            ..
+        } => alerted(severity, *status, summary.as_str(), permalink.as_ref()),
         Event::PushedCommits {
             repository,
             branch,
@@ -104,6 +111,33 @@ pub fn notice(event: &Event) -> String {
             permalink.as_ref(),
         ),
     }
+}
+
+/// An alert, said plainly.
+///
+/// Deliberately minimal. Designing what a reader actually wants from an alert —
+/// which labels to show, how to group a storm, whether a resolution repeats the
+/// summary — is bead gc-ast.10. This exists because the compiler is right to
+/// demand an arm, and because a stub that panicked would turn a real alert into
+/// a lost one. It says what happened and nothing it cannot stand behind.
+fn alerted(
+    severity: &Severity,
+    status: AlertStatus,
+    summary: &str,
+    permalink: Option<&Permalink>,
+) -> String {
+    // A severity the sender did not state has nothing to print, so the line
+    // simply does not claim one.
+    let mut text = match severity.as_label() {
+        Some(stated) => format!("{stated}: {summary} ({})", status.as_label()),
+        None => format!("{summary} ({})", status.as_label()),
+    };
+
+    if let Some(link) = permalink {
+        write!(text, "\n{}", link.as_str()).expect("writing to a String cannot fail");
+    }
+
+    text
 }
 
 /// A push, with however many commits it carried.
@@ -216,8 +250,9 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
     use domain::{
-        BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId, DestinationKind,
-        Event, Permalink, Pusher, RepositoryName, Summary,
+        AlertId, AlertStatus, BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId,
+        DestinationKind, Event, Labels, Permalink, Pusher, RepositoryName, Severity, Summary,
+        Timestamp,
     };
 
     use super::{ElementNotices, notice};
@@ -415,6 +450,76 @@ mod tests {
 
         assert!(text.contains("https://forge.example/x?a=1&b=<2>"), "{text}");
         assert!(!text.contains("]("), "{text}");
+    }
+
+    fn an_alert(severity: Severity, status: AlertStatus, summary: &str) -> Event {
+        Event::Alert {
+            id: AlertId::new("7b1a177c").expect("an identity"),
+            severity,
+            status,
+            summary: Summary::new(summary).expect("a summary"),
+            labels: Labels::none(),
+            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
+            permalink: None,
+        }
+    }
+
+    // Minimal on purpose: what a reader actually wants from an alert is bead
+    // gc-ast.10. These pin only that the arm says something true for each case,
+    // and that it is still plain text.
+
+    #[test]
+    fn an_alert_notice_says_the_severity_the_summary_and_whether_it_is_over() {
+        let text = notice(&an_alert(
+            Severity::Critical,
+            AlertStatus::Firing,
+            "api latency above target",
+        ));
+
+        assert!(text.contains("critical"), "{text}");
+        assert!(text.contains("api latency above target"), "{text}");
+        assert!(text.contains("firing"), "{text}");
+    }
+
+    #[test]
+    fn a_resolved_alert_says_resolved_and_not_firing() {
+        let text = notice(&an_alert(
+            Severity::Warning,
+            AlertStatus::Resolved,
+            "disk filling",
+        ));
+
+        assert!(text.contains("resolved"), "{text}");
+        assert!(!text.contains("firing"), "{text}");
+    }
+
+    #[test]
+    fn an_alert_with_no_stated_severity_does_not_invent_one() {
+        let text = notice(&an_alert(
+            Severity::Unstated,
+            AlertStatus::Firing,
+            "something",
+        ));
+
+        assert!(text.contains("something"), "{text}");
+        assert!(text.contains("firing"), "{text}");
+        for invented in ["critical", "warning", "info", "unknown", "unstated"] {
+            assert!(!text.contains(invented), "invented {invented}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_alert_summary_containing_markup_appears_literally() {
+        // An alert summary comes from a workload annotation, so from whoever can
+        // deploy. Same guarantee as the push path, tested rather than inherited.
+        let text = notice(&an_alert(
+            Severity::Unrecognised("<b>sev1</b>".to_owned()),
+            AlertStatus::Firing,
+            "<script>alert(1)</script> see [here](http://evil)",
+        ));
+
+        assert!(text.contains("<script>alert(1)</script>"), "{text}");
+        assert!(text.contains("<b>sev1</b>"), "{text}");
     }
 
     #[test]

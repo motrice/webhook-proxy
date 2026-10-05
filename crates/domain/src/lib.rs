@@ -10,6 +10,7 @@
 //! Tests for this crate are unit tests in-module; they need no fixtures,
 //! no I/O and no async, which is what makes the TDD loop fast.
 
+mod alert;
 mod delivery;
 mod event;
 mod label;
@@ -18,6 +19,7 @@ mod routing;
 mod signature;
 mod time;
 
+pub use alert::{AlertId, AlertStatus, Severity};
 pub use delivery::{Body, Delivery, DeliveryId, VerifiedDelivery};
 pub use event::{
     Blank, BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary,
