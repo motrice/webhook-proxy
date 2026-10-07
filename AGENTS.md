@@ -13,6 +13,20 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 > source of truth; don't `bd import` during normal operation; don't
 > reach for third-party Dolt hosting before trying the default).
 
+## The ledger is not published from this repository
+
+`bd dolt push` had put the whole bead database on the git remote as
+`refs/dolt/data`, which `git ls-remote` lists to anyone — so publishing this
+repository would have published every bead note, including ones describing
+third-party infrastructure. Those refs were deleted and `sync.remote` is
+deliberately unset in `.beads/config.yaml`, so `bd dolt push` refuses rather
+than adopting a remote by accident. See bead `gc-60e`.
+
+**Do not configure a remote for the ledger here.** The advice elsewhere in this
+file about `refs/dolt/data` describes how beads works, not how this repository
+uses it. Cross-machine sync, if it is ever wanted, belongs on a private remote
+and is a decision to take deliberately rather than by running a command.
+
 ## Quick Reference
 
 ```bash
@@ -20,7 +34,7 @@ bd ready              # Find available work
 bd show <id>          # View issue details
 bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+# bd dolt push        # DISABLED here -- see below
 ```
 
 ## Non-Interactive Shell Commands

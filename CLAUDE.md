@@ -171,6 +171,13 @@ in full. Three rules bind the code, and none of them is a preference:
 - **Never add a way to skip verification.** No flag, no environment variable, no
   test mode, no "just for local development". If a test needs to bypass it, the
   test is wrong — inject a fake `Proofs` port instead.
+
+  There are now two mechanisms, and neither is a bypass: an Origin declares one
+  and only one, the declaration is read from configuration before the request is
+  looked at, and a request bearing the other mechanism's credential is refused
+  rather than retried under it. Adding a *third* would be the same kind of work
+  and is permitted. Making any of them optional, or letting a request choose
+  which applies, is the thing this rule forbids.
 - **Fail closed.** An unknown Origin, an unreadable payload or an oversized body
   is refused. There is no path where uncertainty results in forwarding.
 - **Treat every field of an Event as attacker-influenced text.** Commit messages
