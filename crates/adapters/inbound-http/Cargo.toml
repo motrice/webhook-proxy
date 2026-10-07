@@ -1,5 +1,5 @@
 [package]
-name = "github-http"
+name = "inbound-http"
 version = "0.0.0"
 publish = false
 edition.workspace = true

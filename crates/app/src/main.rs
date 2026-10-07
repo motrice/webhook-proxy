@@ -17,9 +17,9 @@ use domain::{
     Verification,
 };
 use element_notices::ElementNotices;
-use github_http::{Inbound, router};
 use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
+use inbound_http::{Inbound, router};
 use std::sync::Arc;
 use system::{RandomIds, SystemClock};
 

@@ -30,9 +30,9 @@ dependencies = [
  "axum",
  "domain",
  "element-notices",
- "github-http",
  "github-payload",
  "github-signatures",
+ "inbound-http",
  "reqwest",
  "serde_json",
  "system",
@@ -379,20 +379,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "github-http"
-version = "0.0.0"
-dependencies = [
- "application",
- "async-trait",
- "axum",
- "domain",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "github-payload"
 version = "0.0.0"
 dependencies = [
@@ -643,6 +629,20 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "inbound-http"
+version = "0.0.0"
+dependencies = [
+ "application",
+ "async-trait",
+ "axum",
+ "domain",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
