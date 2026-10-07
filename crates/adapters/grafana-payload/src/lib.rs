@@ -17,6 +17,12 @@
 //! which is where the Alertmanager adapter reaches for them too. Adapters may not
 //! depend on each other, so anything genuinely shared belongs below them rather
 //! than beside them.
+//!
+//! **`truncatedAlerts` is one of the things the two senders do share** — same
+//! name, same meaning — so the loss it reports is logged here too, by the
+//! decision in bead gc-rl5. The Alertmanager adapter's header states the
+//! reasoning; the eight lines that do it are duplicated rather than shared, for
+//! the reason above.
 
 use application::ports::{Translator, Untranslatable};
 use domain::{
@@ -57,6 +63,15 @@ struct Notification {
     /// less so as a one-line summary — its first line is a bold "Firing".
     #[serde(default)]
     message: String,
+    /// How many alerts Grafana dropped from this notification because the group
+    /// was larger than it will send. The same field name and meaning
+    /// Alertmanager gives it.
+    ///
+    /// Defaulted rather than required: a sender that omits it is not truncating,
+    /// and refusing a notification over a missing count would turn a loss we
+    /// were told about into a delivery we refused.
+    #[serde(rename = "truncatedAlerts", default)]
+    truncated_alerts: u32,
 }
 
 /// One alert within a notification.
@@ -92,12 +107,44 @@ impl Translator for GrafanaPayload {
 
         // All or nothing: a half-mapped group means a room hears about two of
         // three alerts and nobody knows the third existed.
-        notification
+        let events: Vec<Event> = notification
             .alerts
             .iter()
             .map(|raw| translate_alert(raw, &notification))
-            .collect()
+            .collect::<Result<_, _>>()?;
+
+        // Reported only once the notification is known to be translatable: a
+        // refused one is answered with a 400 and retried, so reporting it here
+        // would name a delivery that has not happened.
+        report_truncation(delivery, notification.truncated_alerts);
+
+        Ok(events)
     }
+}
+
+/// Say what the sender told us it dropped.
+///
+/// A log line and nothing else, by the decision in bead gc-rl5: this is a loss,
+/// and losses in this system are reported rather than turned into Events a room
+/// receives.
+///
+/// Duplicated from the Alertmanager adapter, for the reason the date parsing is:
+/// adapters may not depend on each other, and the alternative — a shared crate
+/// for eight lines, or the count riding out through the `Translator` port — buys
+/// less than it costs. If a third sender arrives, that calculation changes.
+///
+/// Carries the Delivery's identity and a count. Never any part of the payload: a
+/// truncated notification is still attacker-influenced text.
+fn report_truncation(delivery: &VerifiedDelivery, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+
+    tracing::warn!(
+        delivery = delivery.id().as_str(),
+        truncated = dropped,
+        "notification truncated by sender"
+    );
 }
 
 /// One alert, or nothing.
@@ -181,11 +228,15 @@ fn permalink_of(raw: &Firing) -> Option<Permalink> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex, OnceLock};
+
     use application::ports::{Translator, Untranslatable};
     use domain::{
         AlertStatus, Body, Delivery, DeliveryId, Event, LabelName, OriginId, Permalink, Proof,
         Severity, Timestamp, VerifiedDelivery,
     };
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::GrafanaPayload;
 
@@ -194,9 +245,15 @@ mod tests {
     const ALERTMANAGER: &[u8] = include_bytes!("../../alertmanager-payload/fixtures/firing.json");
 
     fn verified(body: &[u8]) -> VerifiedDelivery {
+        verified_as("d-1", body)
+    }
+
+    /// A Delivery under a named identity, so a test asserting that *nothing* was
+    /// reported can look for its own name in a log buffer every test shares.
+    fn verified_as(id: &str, body: &[u8]) -> VerifiedDelivery {
         let proof = Proof::from_bytes([1, 2, 3]);
         Delivery::new(
-            DeliveryId::new("d-1").expect("a non-blank identity"),
+            DeliveryId::new(id).expect("a non-blank identity"),
             OriginId::new("a-monitor").expect("a non-blank origin identity"),
             Body::from_bytes(body.to_vec()),
             Timestamp::from_millis_since_epoch(1_759_000_000_000),
@@ -490,5 +547,92 @@ mod tests {
         };
 
         assert_eq!(summary.as_str(), "HighLatency");
+    }
+
+    #[test]
+    fn a_truncated_notification_is_reported_with_the_count_the_sender_stated() {
+        let logs = captured_logs();
+        // Grafana spells it exactly as Alertmanager does, which is why this is
+        // reported for both senders rather than for the first one found.
+        let payload = br#"{"version":"1","truncatedAlerts":12,"alerts":[{
+            "status":"firing","labels":{"alertname":"X"},
+            "annotations":{"summary":"fine"},
+            "startsAt":"2026-10-07T09:15:00Z","fingerprint":"abc123"}]}"#;
+
+        assert_eq!(alerts(payload).len(), 1);
+
+        let written = logged(&logs);
+        assert!(
+            written.contains("truncated=12"),
+            "the sender said 12 alerts were dropped and nothing reported it; \
+             captured log output was {written:?}"
+        );
+        assert!(
+            written.contains("d-1"),
+            "the report does not name the Delivery it belongs to; \
+             captured log output was {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_notification_that_dropped_nothing_reports_nothing() {
+        let logs = captured_logs();
+        // The fixture carries truncatedAlerts: 0.
+        let delivery = verified_as("d-dropped-nothing", FIRING);
+
+        let events = GrafanaPayload.events(&delivery).expect("translatable");
+        assert_eq!(events.len(), 3);
+
+        let written = logged(&logs);
+        assert!(
+            !written.contains("d-dropped-nothing"),
+            "a notification that truncated nothing was reported anyway; \
+             captured log output was {written:?}"
+        );
+    }
+
+    /// Collects log output in memory so a test can assert on what was written.
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+
+    /// The buffer every log line in this binary is written to. One *global*
+    /// subscriber installed once, for the reason the inbound adapter's copy of
+    /// this records: tracing caches a callsite's interest globally, so a `warn!`
+    /// reached while no subscriber is installed is cached as "nobody cares".
+    fn captured_logs() -> Arc<Mutex<Vec<u8>>> {
+        LOGS.get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            tracing_subscriber::fmt()
+                .with_writer(Captured(Arc::clone(&buffer)))
+                .with_ansi(false)
+                .init();
+            buffer
+        })
+        .clone()
+    }
+
+    fn logged(logs: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(logs.lock().expect("not poisoned").clone()).expect("utf-8 log output")
+    }
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("not poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }

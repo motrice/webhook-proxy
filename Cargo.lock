@@ -20,6 +20,8 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -415,6 +417,8 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
