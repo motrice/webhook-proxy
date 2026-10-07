@@ -16,6 +16,7 @@ members = [
     "crates/adapters/github-payload",
     "crates/adapters/github-signatures",
     "crates/adapters/system",
+    "crates/adapters/yaml-config",
     "crates/app",
     "crates/architecture",
 ]
