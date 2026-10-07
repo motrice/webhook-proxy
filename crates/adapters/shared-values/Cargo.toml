@@ -1,0 +1,17 @@
+[package]
+name = "shared-values"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Nothing an HMAC adapter would not need. No HTTP client, no framework, no
+# digest: a shared value is compared, not computed, so there is nothing to
+# compute it with.
+[dependencies]
+domain = { path = "../../domain" }
+application = { path = "../../application" }
+
+[lints]
+workspace = true
