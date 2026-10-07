@@ -272,3 +272,4 @@ Load the skill before doing the thing, not after:
 | adding a domain concept, type or invariant | `domain-modelling` |
 | anything touching I/O, time, or randomness | `port-and-adapter` |
 | turning a request into beads; splitting an epic | `bead-grooming` |
+| designing or changing an HTTP interface for a Swedish public-sector consumer | `rest-api-profil` |
