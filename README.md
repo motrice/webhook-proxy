@@ -1,10 +1,18 @@
 # webhook-proxy
 
-A Rust product, built by agents, under a workflow where the evidence is
-mechanical rather than social: you merge because the checks passed, not because
-the diff looked plausible.
+A relay that lets external senders reach an internal chat room, and the
+authentication boundary in front of them.
 
-The product itself is not here yet. What is here is the way of working.
+It takes webhooks from several kinds of sender — a monitoring system's alerts, a
+forge's pushes — verifies each against the mechanism that sender declared,
+translates the payload into a fact of its own, routes that fact to whichever
+rooms asked for it, and renders it as something a person can act on. Who may
+send, and who hears what, is a file reviewed as a diff rather than a list of
+environment variables.
+
+Built by agents, under a workflow where the evidence is mechanical rather than
+social: you merge because the checks passed, not because the diff looked
+plausible.
 
 ## The idea in one paragraph
 
@@ -70,14 +78,18 @@ Three obligations follow, and they are not negotiable:
   than the configured limit is rejected before any work is done on it.
 - **Content reaching a room is attacker-influenced even when the request is
   genuine.** Commit messages, branch names and repository names are written by
-  whoever can push, not by the sender we authenticated. A Notice therefore
-  renders them as text, never as markup, or the room becomes an injection
-  target for anyone with commit access.
+  whoever can push; an alert's summary and labels come from a workload
+  annotation, so from whoever can deploy — a wider set of people still. A Notice
+  therefore renders everything as text, never as markup, and neutralises line
+  breaks in a label so a value cannot forge a line that looks like a separate
+  message. Without that, the room is an injection target for anyone with commit
+  or deploy access.
 
-The hookshot URL is still handled as a secret — injected from the environment or
-a k3s Secret, never defaulted in code, never logged, never in a test fixture —
-because the network perimeter is one line of defence and leaking the URL would
-let anything already inside it post freely.
+A room's URL is still handled as a secret — named in the routing file, its value
+read from a mounted directory, never defaulted in code, never logged, never in a
+test fixture — because the network perimeter is one line of defence and leaking
+the URL would let anything already inside it post freely. The routing file is
+reviewable precisely because it holds names and no values.
 
 Rotation and expiry live on the hookshot instance and are not ours to set.
 Accepted deliberately: the rooms in scope carry notifications, so the worst case
@@ -89,7 +101,16 @@ fix if it ever becomes a problem.
 ```text
 crates/domain          pure rules. zero dependencies, enforced.
 crates/application     use cases and ports (traits).
-crates/adapters/*      implementations of ports. none yet.
+crates/adapters/*      implementations of ports:
+  inbound-http           the front door. every sender arrives here.
+  github-signatures      verifies a sender that signs its body.
+  shared-values          verifies a sender that presents a shared value.
+  github-payload         a forge push becomes Events.
+  alertmanager-payload   a monitoring notification becomes Alerts.
+  grafana-payload        a different monitoring notification. not the same.
+  element-notices        an Event becomes prose in a chat room.
+  yaml-config            the routing file becomes Origins and Subscriptions.
+  system                 the clock and identity generation.
 crates/app             composition root. wiring only.
 crates/architecture    the dependency-direction test.
 
