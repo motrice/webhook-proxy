@@ -1,0 +1,109 @@
+# webhook-proxy routing, as a file.
+#
+# This is a published interface with a schema, not a parsing detail: it is
+# reviewed as a diff in the GitOps repository, and what it says decides who may
+# send to this proxy and who hears what. Bead gc-ast.3 records the decisions
+# below and why each one falls the way it does.
+#
+# Two rules govern what belongs here:
+#
+#   * This file holds POLICY — who may send, and who hears what.
+#   * The environment holds what the process needs to RUN — where to listen, how
+#     long to wait, how large a body to accept.
+#
+# Secrets are in neither. This file names one; the value is read from a file in
+# the secrets directory, mounted from a Kubernetes Secret. No secret value ever
+# appears here, not even as a placeholder.
+#
+# Nothing is reloaded while running. A change to the ConfigMap rolls the
+# Deployment, so the start-up log always says what was actually loaded — which is
+# the record you want when asking why a room went quiet.
+
+# Bumped only when the shape changes incompatibly, so an old binary meeting a new
+# file fails with something better than a parse error.
+version: 1
+
+# Every system permitted to send to this proxy, and how each proves it is
+# genuine. An Origin with no verify block is a startup error: there is no third
+# state and nothing to default to.
+#
+# The mechanism is read from here, never from the request. A request arriving at
+# an hmac_sha256 Origin bearing a token is refused, not retried as a token —
+# otherwise configuration could be talked into a downgrade. See bead gc-ast.2.
+origins:
+  # Signs the body, so the proof is bound to what was sent.
+  - id: github
+    verify:
+      hmac_sha256:
+        secret: github-webhook-secret
+
+  # Cannot sign a body, so the proof is possession of a shared value and says
+  # nothing about the payload. Weaker, deliberately accepted, and the cost is
+  # written down in gc-ast.2.
+  - id: alertmanager
+    verify:
+      bearer:
+        secret: alertmanager-token
+
+# Everywhere an Event can be sent. The address is named, never written: for a
+# chat room served by a generic webhook, possession of the URL is the only
+# credential it has, so putting it here would publish it to everyone who can read
+# this repository.
+destinations:
+  - id: devsecops-room
+    kind: chat_room
+    webhook:
+      secret: devsecops-room-url
+
+  - id: platform-room
+    kind: chat_room
+    webhook:
+      secret: platform-room-url
+
+  - id: audit-room
+    kind: chat_room
+    webhook:
+      secret: audit-room-url
+
+# Which Destination hears which Events.
+#
+# A rule names labels a fact must carry; values are compared for equality and
+# nothing else. No negation and no regular expressions: a regex engine would be a
+# dependency in a crate that has none, and it would run attacker-influenced
+# annotation text through a backtracking matcher.
+#
+# `origin` is a reserved label. The proxy sets it from the verified delivery and a
+# sender cannot, so a rule naming it is trustworthy even though every other label
+# an alert carries comes from whoever can deploy a workload.
+#
+# Exactly one of `match` (non-empty) or `everything: true` per rule. An empty
+# `match` is an error on purpose: a templating accident rendering an empty mapping
+# would turn a narrow rule into a firehose while looking like a formatting change
+# in review, so the most dangerous thing in this file is the hardest to write by
+# accident.
+#
+# Two rules may name the same Destination — that is how a room says it wants two
+# unrelated things — and it is still told once per Event.
+subscriptions:
+  # Pushes to one branch of one repository.
+  - destination: devsecops-room
+    match:
+      origin: github
+      repository: motrice/webhook-proxy
+      branch: main
+
+  # And critical alerts, wherever in the cluster they come from.
+  - destination: devsecops-room
+    match:
+      origin: alertmanager
+      severity: critical
+
+  # One team's namespace, at any severity.
+  - destination: platform-room
+    match:
+      origin: alertmanager
+      namespace: platform
+
+  # Everything, said out loud so a reviewer sees it.
+  - destination: audit-room
+    everything: true

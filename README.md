@@ -113,6 +113,14 @@ where it cannot authenticate what it receives.
 | `WEBHOOK_PROXY_MAX_BODY` | no | default 1 MiB, refused before anything is verified or parsed |
 | `WEBHOOK_PROXY_TIMEOUT_MS` | no | default 5000, bounding each dispatch |
 
+Three of those are on their way out. Many senders, many rooms and overlapping
+routing rules do not fit in environment variables, and the point of a file is
+that a human reviews the routing as a diff. `deploy/config.example.yaml` is the
+shape that replaces them — `GITHUB_WEBHOOK_SECRET`, `ELEMENT_WEBHOOK_URL` and
+`ELEMENT_ROOM` become entries in it, with secret *names* in the file and values
+read from a mounted directory. The variables above still describe what runs
+today; bead `gc-ast.11` is what makes the file real.
+
 To run it against a real repository: start it with the three required variables
 set, expose the port to the internet however you normally would (`ssh -R`, a
 tunnel, or an Ingress), then add a webhook to the repository pointing at
