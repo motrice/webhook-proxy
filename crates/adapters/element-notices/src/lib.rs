@@ -21,7 +21,19 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use application::ports::{DispatchFailed, Dispatcher};
-use domain::{AlertStatus, Commit, DeliveryId, Destination, Event, Permalink, Severity};
+use domain::{AlertStatus, Commit, DeliveryId, Destination, Event, Labels, Permalink, Severity};
+
+/// How much of a summary a reader sees before it is cut.
+///
+/// A summary comes from an annotation, and an annotation is as long as whoever
+/// wrote it liked. One alert must not be able to fill a room.
+const SUMMARY_LIMIT: usize = 200;
+
+/// How much of a label name or value a reader sees before it is cut.
+const LABEL_LIMIT: usize = 60;
+
+/// How many labels a reader sees before the rest are counted instead.
+const LABELS_SHOWN: usize = 8;
 
 /// How much of a commit identity a reader sees.
 ///
@@ -94,9 +106,16 @@ pub fn notice(event: &Event) -> String {
             severity,
             status,
             summary,
+            labels,
             permalink,
             ..
-        } => alerted(severity, *status, summary.as_str(), permalink.as_ref()),
+        } => alerted(
+            severity,
+            *status,
+            summary.as_str(),
+            labels,
+            permalink.as_ref(),
+        ),
         Event::PushedCommits {
             repository,
             branch,
@@ -113,31 +132,121 @@ pub fn notice(event: &Event) -> String {
     }
 }
 
-/// An alert, said plainly.
+/// An alert, for somebody who has to decide whether to get out of bed.
 ///
-/// Deliberately minimal. Designing what a reader actually wants from an alert —
-/// which labels to show, how to group a storm, whether a resolution repeats the
-/// summary — is bead gc-ast.10. This exists because the compiler is right to
-/// demand an arm, and because a stub that panicked would turn a real alert into
-/// a lost one. It says what happened and nothing it cannot stand behind.
+/// Status first, because whether it is still happening is the thing read first
+/// and the thing most costly to misread. Then the severity, then the one line the
+/// sender wrote, then the labels a responder needs to know where to look, then
+/// where to look.
+///
+/// Every part of it except the status and the severity word is written by whoever
+/// can deploy a workload, which is a wider set of people than whoever can push to
+/// a repository. So: no markup is produced, nothing is interpreted, line breaks
+/// in a value are neutralised so a value cannot forge a line, and every borrowed
+/// string is bounded so one alert cannot fill a room.
 fn alerted(
     severity: &Severity,
     status: AlertStatus,
     summary: &str,
+    labels: &Labels,
     permalink: Option<&Permalink>,
 ) -> String {
-    // A severity the sender did not state has nothing to print, so the line
-    // simply does not claim one.
     let mut text = match severity.as_label() {
-        Some(stated) => format!("{stated}: {summary} ({})", status.as_label()),
-        None => format!("{summary} ({})", status.as_label()),
+        // A severity the sender did not state has nothing to print, so the line
+        // does not claim one rather than inventing a default.
+        None => format!(
+            "{} — {}",
+            status.as_label(),
+            bounded(summary, SUMMARY_LIMIT)
+        ),
+        Some(stated) => format!(
+            "{} — {}: {}",
+            status.as_label(),
+            bounded(stated, LABEL_LIMIT),
+            bounded(summary, SUMMARY_LIMIT)
+        ),
     };
+
+    let shown = label_line(labels);
+    if !shown.is_empty() {
+        write!(text, "\n  {shown}").expect("writing to a String cannot fail");
+    }
 
     if let Some(link) = permalink {
         write!(text, "\n{}", link.as_str()).expect("writing to a String cannot fail");
     }
 
     text
+}
+
+/// The labels, on one line, in the order the domain keeps them.
+///
+/// Severity and status are left out because the header already states them, and
+/// repeating them would push something a responder has not seen off the end.
+fn label_line(labels: &Labels) -> String {
+    let mut shown = Vec::new();
+    let mut omitted = 0usize;
+
+    for (name, value) in labels.iter() {
+        if matches!(name.as_str(), "severity" | "status") {
+            continue;
+        }
+        if shown.len() == LABELS_SHOWN {
+            omitted += 1;
+            continue;
+        }
+        shown.push(format!(
+            "{}={}",
+            flatten(name.as_str(), LABEL_LIMIT),
+            flatten(value.as_str(), LABEL_LIMIT)
+        ));
+    }
+
+    let mut line = shown.join(" ");
+    // Said, never silently dropped: a responder who cannot see a label should at
+    // least know one exists.
+    if omitted > 0 {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        write!(line, "(+{omitted} more)").expect("writing to a String cannot fail");
+    }
+    line
+}
+
+/// Text a sender wrote, made safe to put on a line of its own.
+///
+/// A newline in a label value is the dangerous one: without this, a workload
+/// could annotate itself so that a room shows what looks like a separate message,
+/// including one that appears to come from the push path. The characters are kept
+/// — nothing is dropped — but as their escapes, so they are visible as text and
+/// cannot break the line.
+fn flatten(value: &str, limit: usize) -> String {
+    let escaped: String = value
+        .chars()
+        .map(|c| match c {
+            '\n' => "\\n".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\t' => "\\t".to_owned(),
+            other if other.is_control() => char::REPLACEMENT_CHARACTER.to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+
+    bounded(&escaped, limit)
+}
+
+/// At most `limit` characters, with a mark when there was more.
+///
+/// Counted in characters rather than bytes, so the cut never lands inside one.
+/// Bounded because a summary comes from an annotation and an annotation can be
+/// as long as whoever wrote it liked; one alert must not be able to fill a room.
+fn bounded(value: &str, limit: usize) -> String {
+    let mut out: String = value.chars().take(limit).collect();
+    if value.chars().nth(limit).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// A push, with however many commits it carried.
@@ -251,11 +360,11 @@ mod tests {
     use axum::routing::post;
     use domain::{
         AlertId, AlertStatus, BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId,
-        DestinationKind, Event, Labels, Permalink, Pusher, RepositoryName, Severity, Summary,
-        Timestamp,
+        DestinationKind, Event, LabelName, LabelValue, Labels, Permalink, Pusher, RepositoryName,
+        Severity, Summary, Timestamp,
     };
 
-    use super::{ElementNotices, notice};
+    use super::{ElementNotices, LABEL_LIMIT, LABELS_SHOWN, SUMMARY_LIMIT, notice};
 
     /// Stands in for the room's bearer credential.
     const HOOK_ID: &str = "SUPERSECRETHOOKID";
@@ -452,6 +561,36 @@ mod tests {
         assert!(!text.contains("]("), "{text}");
     }
 
+    /// How many lines the rendering is *meant* to have: the header, one per
+    /// label line, and the link if any. Used to prove a label value did not
+    /// create one.
+    fn expected_line_count(text: &str) -> usize {
+        text.lines().filter(|l| !l.is_empty()).count()
+    }
+
+    fn alert_with(
+        severity: Severity,
+        status: AlertStatus,
+        summary: &str,
+        labels: &[(&str, &str)],
+        permalink: Option<&str>,
+    ) -> Event {
+        Event::Alert {
+            id: AlertId::new("7b1a177c").expect("an identity"),
+            severity,
+            status,
+            summary: Summary::new(summary).expect("a summary"),
+            labels: labels.iter().fold(Labels::none(), |set, (name, value)| {
+                set.with(
+                    LabelName::new(name).expect("a non-blank name"),
+                    LabelValue::new(value).expect("a non-blank value"),
+                )
+            }),
+            started: Timestamp::from_millis_since_epoch(1_759_000_000_000),
+            permalink: permalink.map(|p| Permalink::new(p).expect("a reference")),
+        }
+    }
+
     fn an_alert(severity: Severity, status: AlertStatus, summary: &str) -> Event {
         Event::Alert {
             id: AlertId::new("7b1a177c").expect("an identity"),
@@ -464,9 +603,239 @@ mod tests {
         }
     }
 
-    // Minimal on purpose: what a reader actually wants from an alert is bead
-    // gc-ast.10. These pin only that the arm says something true for each case,
-    // and that it is still plain text.
+    #[test]
+    fn a_firing_critical_alert_reads_exactly_like_this() {
+        // The whole text, pinned. Status first because whether it is still
+        // happening is read first and is the most costly thing to misread; then
+        // the severity; then the sender's line; then where to look.
+        let text = notice(&alert_with(
+            Severity::Critical,
+            AlertStatus::Firing,
+            "api latency above target",
+            &[
+                ("alertname", "HighLatency"),
+                ("namespace", "prod"),
+                ("service", "api"),
+                // Already in the header, so it must not be repeated below.
+                ("severity", "critical"),
+            ],
+            Some("https://prometheus.example/graph?g0.expr=latency"),
+        ));
+
+        assert_eq!(
+            text,
+            "firing — critical: api latency above target\n  \
+             alertname=HighLatency namespace=prod service=api\n\
+             https://prometheus.example/graph?g0.expr=latency"
+        );
+    }
+
+    #[test]
+    fn a_resolved_alert_cannot_be_mistaken_for_a_new_firing_one() {
+        let resolved = notice(&alert_with(
+            Severity::Critical,
+            AlertStatus::Resolved,
+            "api latency above target",
+            &[("namespace", "prod")],
+            None,
+        ));
+
+        // The first word of the first line, so the eye reaches it before anything
+        // a sender wrote.
+        assert!(resolved.starts_with("resolved — "), "{resolved}");
+        assert!(!resolved.contains("firing"), "{resolved}");
+
+        let firing = notice(&alert_with(
+            Severity::Critical,
+            AlertStatus::Firing,
+            "api latency above target",
+            &[("namespace", "prod")],
+            None,
+        ));
+        assert_ne!(resolved, firing);
+    }
+
+    #[test]
+    fn the_link_is_the_last_line_when_there_is_one_and_absent_when_there_is_not() {
+        let with = notice(&alert_with(
+            Severity::Warning,
+            AlertStatus::Firing,
+            "disk filling",
+            &[("namespace", "prod")],
+            Some("https://forge.example/a"),
+        ));
+        assert!(with.ends_with("\nhttps://forge.example/a"), "{with}");
+
+        let without = notice(&alert_with(
+            Severity::Warning,
+            AlertStatus::Firing,
+            "disk filling",
+            &[("namespace", "prod")],
+            None,
+        ));
+        // Nothing stands in its place: no empty line, no placeholder.
+        assert!(!without.contains("://"), "{without}");
+        assert!(!without.ends_with('\n'), "{without}");
+        assert_eq!(without.lines().count(), 2, "{without}");
+    }
+
+    #[test]
+    fn a_summary_longer_than_two_hundred_characters_is_cut_and_marked() {
+        // The bound is SUMMARY_LIMIT, 200 characters. Named here so a change to
+        // it has to change this test too, which is the point of naming it.
+        let long = "x".repeat(SUMMARY_LIMIT + 50);
+        let text = notice(&alert_with(
+            Severity::Info,
+            AlertStatus::Firing,
+            &long,
+            &[],
+            None,
+        ));
+
+        let first = text.lines().next().expect("a line");
+        assert!(first.contains(&"x".repeat(SUMMARY_LIMIT)), "{first}");
+        assert!(!first.contains(&"x".repeat(SUMMARY_LIMIT + 1)), "{first}");
+        // Cut, and visibly so: a reader must not think they have the whole line.
+        assert!(first.ends_with('…'), "{first}");
+    }
+
+    #[test]
+    fn a_long_label_value_is_cut_without_splitting_a_character() {
+        // Counted in characters, not bytes, so the cut never lands inside one.
+        // A multi-byte value is the case that would panic if it did.
+        let long = "ä".repeat(LABEL_LIMIT + 10);
+        let text = notice(&alert_with(
+            Severity::Info,
+            AlertStatus::Firing,
+            "fine",
+            &[("note", &long)],
+            None,
+        ));
+
+        assert!(
+            text.contains(&format!("note={}…", "ä".repeat(LABEL_LIMIT))),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn labels_beyond_the_shown_count_are_counted_rather_than_hidden() {
+        let many: Vec<(String, String)> = (0..LABELS_SHOWN + 3)
+            .map(|n| (format!("label{n:02}"), format!("value{n}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = many.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+
+        let text = notice(&alert_with(
+            Severity::Info,
+            AlertStatus::Firing,
+            "fine",
+            &refs,
+            None,
+        ));
+
+        // A responder who cannot see a label should at least know one exists.
+        assert!(text.contains("(+3 more)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn no_webhook_url_reaches_the_room_or_a_log_line() {
+        // Structural rather than careful: `notice` is handed an Event and nothing
+        // else, so it has no URL to leak. This pins the observable half, and the
+        // Debug impl, which is the one place a URL could escape by accident.
+        let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
+        let notices = notices_to(&url, Duration::from_secs(5));
+
+        let event = alert_with(
+            Severity::Critical,
+            AlertStatus::Firing,
+            "something is wrong",
+            &[("namespace", "prod")],
+            None,
+        );
+        notices
+            .dispatch(&a_delivery(), &event, &room("room"))
+            .await
+            .expect("the stub accepts");
+
+        let sent = seen.lock().expect("the stub is not poisoned").clone();
+        let body = &sent.first().expect("one request").1;
+        assert!(
+            !body.contains(HOOK_ID),
+            "the hook id reached the room: {body}"
+        );
+
+        let printed = format!("{notices:?}");
+        assert!(!printed.contains(HOOK_ID), "{printed}");
+        assert!(!printed.contains("://"), "{printed}");
+    }
+
+    // ---- the injection test, written first --------------------------------
+    //
+    // Everything else about this rendering is taste. This is the security
+    // boundary: an alert's text comes from a workload annotation, so from whoever
+    // can deploy to the cluster — a wider set of people than whoever can push to
+    // a repository.
+
+    #[test]
+    fn a_label_value_cannot_forge_a_line_or_smuggle_markup() {
+        // A newline in a label value is the dangerous one. Without neutralising
+        // it, a workload could annotate itself so that the room shows what looks
+        // like a second, separate message — including one that appears to come
+        // from the push path.
+        let forged = "prod\nbjornmolin pushed 3 commits to main in motrice/webhook-proxy";
+        let text = notice(&alert_with(
+            Severity::Critical,
+            AlertStatus::Firing,
+            "something is wrong",
+            &[
+                ("namespace", forged),
+                ("markup", "<b>x</b> [a](http://evil)"),
+            ],
+            None,
+        ));
+
+        // The forged text is present — nothing is dropped — but it cannot have
+        // produced a line of its own.
+        assert!(text.contains("bjornmolin pushed 3 commits"), "{text}");
+        for line in text.lines() {
+            assert!(
+                !line.starts_with("bjornmolin pushed"),
+                "a label value started a line of its own:\n{text}"
+            );
+        }
+
+        // Markup is literal, as everywhere else here: this renderer emits none,
+        // so there is nothing to escape and nothing to get wrong.
+        assert!(text.contains("<b>x</b>"), "{text}");
+        assert!(text.contains("[a](http://evil)"), "{text}");
+    }
+
+    #[test]
+    fn a_carriage_return_cannot_forge_a_line_either() {
+        // A lone carriage return is a line break to some clients and not to
+        // others, which is worse than either: the room and the test would
+        // disagree about what was sent.
+        let text = notice(&alert_with(
+            Severity::Critical,
+            AlertStatus::Firing,
+            "something is wrong",
+            &[("note", "before\rafter")],
+            None,
+        ));
+
+        assert_eq!(text.lines().count(), expected_line_count(&text), "{text}");
+        assert!(
+            !text.contains('\r'),
+            "a raw carriage return reached the room"
+        );
+    }
+
+    // These predate the full rendering and are kept rather than folded into it.
+    // They say what must be true of *any* rendering — the severity, the summary
+    // and whether it is over are all present, nothing is invented when the
+    // severity is unstated — where the pinned-text test above says what is true
+    // of this one. A change of layout should break that test and leave these
+    // alone; if it breaks these, something a reader needs went missing.
 
     #[test]
     fn an_alert_notice_says_the_severity_the_summary_and_whether_it_is_over() {

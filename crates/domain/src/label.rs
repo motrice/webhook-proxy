@@ -153,6 +153,15 @@ impl Labels {
         self
     }
 
+    /// Every label, by name, in a stable order.
+    ///
+    /// Ordered because a Destination renders them for a person: a room where the
+    /// same alert reads differently each time is a room nobody trusts, and a test
+    /// that cannot predict the order cannot pin the text.
+    pub fn iter(&self) -> impl Iterator<Item = (&LabelName, &LabelValue)> {
+        self.0.iter()
+    }
+
     /// Whether every label in `required` is here with the same value.
     ///
     /// Containment, not equality: a fact may carry labels no rule mentions, and
@@ -183,6 +192,22 @@ mod tests {
             let (name, value) = label(name, value);
             set.with(name, value)
         })
+    }
+
+    #[test]
+    fn labels_are_offered_in_a_stable_order() {
+        // A Destination renders these for a person. A room where the same alert
+        // reads differently each time is a room nobody trusts, so the order is
+        // part of the contract rather than an accident of the map.
+        let set = labels(&[
+            ("service", "api"),
+            ("alertname", "X"),
+            ("namespace", "prod"),
+        ]);
+
+        let names: Vec<&str> = set.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(names, vec!["alertname", "namespace", "service"]);
     }
 
     #[test]
