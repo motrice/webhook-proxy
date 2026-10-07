@@ -33,6 +33,7 @@ dependencies = [
  "element-notices",
  "github-payload",
  "github-signatures",
+ "grafana-payload",
  "inbound-http",
  "reqwest",
  "serde_json",
@@ -402,6 +403,18 @@ dependencies = [
  "hmac",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "grafana-payload"
+version = "0.0.0"
+dependencies = [
+ "alertmanager-payload",
+ "application",
+ "domain",
+ "serde",
+ "serde_json",
+ "time",
 ]
 
 [[package]]

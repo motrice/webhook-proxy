@@ -53,6 +53,8 @@ pub enum Speaks {
     Github,
     /// A monitoring notification.
     Alertmanager,
+    /// A unified-alerting notification. Resembles the above and is not it.
+    Grafana,
 }
 
 /// An Origin as the file declares it, with the vocabulary it speaks.
@@ -167,6 +169,7 @@ struct OriginEntry {
 enum SpeaksEntry {
     Github,
     Alertmanager,
+    Grafana,
 }
 
 /// The one field every mechanism has.
@@ -311,6 +314,7 @@ impl Configuration {
             let speaks = match entry.speaks {
                 SpeaksEntry::Github => Speaks::Github,
                 SpeaksEntry::Alertmanager => Speaks::Alertmanager,
+                SpeaksEntry::Grafana => Speaks::Grafana,
             };
             self.origins.insert(
                 entry.id.trim().to_owned(),
@@ -527,6 +531,7 @@ impl Configuration {
             let speaks = match declared.speaks {
                 Speaks::Github => "github",
                 Speaks::Alertmanager => "alertmanager",
+                Speaks::Grafana => "grafana",
             };
             let _ = writeln!(out, "  /webhook/{path}  {how}, speaks {speaks}");
         }
@@ -927,6 +932,23 @@ subscriptions:
         assert!(!table.contains("://"), "{table}");
         // The count is fine; the values are not.
         assert!(table.contains("2 secret(s) present"), "{table}");
+    }
+
+    #[test]
+    fn a_third_vocabulary_is_readable_and_shown_in_the_table() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        let yaml = sound().replace("speaks: github", "speaks: grafana");
+        let file = written(dir.path(), &yaml);
+
+        let config = Configuration::read(&file, dir.path()).expect("it parses");
+
+        assert_eq!(config.origins()["a-forge"].speaks, super::Speaks::Grafana);
+        assert!(
+            config.routing_table().contains("speaks grafana"),
+            "{}",
+            config.routing_table()
+        );
     }
 
     // ---- what a human will get wrong -------------------------------------

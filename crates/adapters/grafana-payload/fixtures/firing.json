@@ -1,0 +1,63 @@
+{
+  "receiver": "webhook-proxy",
+  "status": "firing",
+  "orgId": 1,
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighLatency",
+        "grafana_folder": "Platform",
+        "severity": "critical",
+        "namespace": "prod"
+      },
+      "annotations": {
+        "summary": "api latency above target",
+        "description": "p99 over 500ms for 10 minutes"
+      },
+      "startsAt": "2026-10-07T09:15:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "values": { "A": 0.73 },
+      "valueString": "[ var='A' labels={} value=0.73 ]",
+      "generatorURL": "https://grafana.example/alerting/grafana/abc/view",
+      "silenceURL": "https://grafana.example/alerting/silence/new?alertmanager=grafana",
+      "dashboardURL": "https://grafana.example/d/latency",
+      "panelURL": "https://grafana.example/d/latency?viewPanel=3",
+      "fingerprint": "5a1f2b3c4d5e6f70"
+    },
+    {
+      "status": "firing",
+      "labels": { "alertname": "DiskFilling", "namespace": "prod" },
+      "annotations": {},
+      "startsAt": "2026-10-07T09:16:30.500Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "",
+      "silenceURL": "https://grafana.example/alerting/silence/new?x=1",
+      "dashboardURL": "https://grafana.example/d/disk",
+      "panelURL": "",
+      "fingerprint": "70f6e5d4c3b2f1a5"
+    },
+    {
+      "status": "resolved",
+      "labels": { "alertname": "CertExpiring", "severity": "warning" },
+      "annotations": { "summary": "<b>cert</b> expires — see [here](https://evil.example)" },
+      "startsAt": "2026-10-06T22:00:00+02:00",
+      "endsAt": "2026-10-07T08:00:00+02:00",
+      "generatorURL": "https://grafana.example/alerting/grafana/def/view",
+      "silenceURL": "https://grafana.example/alerting/silence/new?x=2",
+      "dashboardURL": "",
+      "panelURL": "",
+      "fingerprint": "0e1d2c3b4a596877"
+    }
+  ],
+  "groupLabels": { "alertname": "HighLatency" },
+  "commonLabels": { "namespace": "prod" },
+  "commonAnnotations": {},
+  "externalURL": "https://grafana.example/",
+  "version": "1",
+  "groupKey": "{}:{alertname=\"HighLatency\"}",
+  "truncatedAlerts": 0,
+  "title": "[FIRING:2, RESOLVED:1] HighLatency",
+  "state": "alerting",
+  "message": "**Firing**\n\nValue: A=0.73\nLabels:\n - alertname = HighLatency"
+}

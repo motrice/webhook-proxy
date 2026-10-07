@@ -152,6 +152,24 @@ impl Labels {
         Self(BTreeMap::new())
     }
 
+    /// Every usable label from loose pairs, in one step.
+    ///
+    /// A pair the domain will not accept is dropped rather than refusing the
+    /// lot: one odd label is no reason for a room to hear nothing about what
+    /// happened. Every inbound adapter that receives a map of labels wants
+    /// exactly this, and they may not depend on each other, so it lives here.
+    #[must_use]
+    pub fn from_pairs<'p>(pairs: impl IntoIterator<Item = (&'p str, &'p str)>) -> Self {
+        pairs
+            .into_iter()
+            .fold(Self::none(), |labels, (name, value)| {
+                match (LabelName::new(name), LabelValue::new(value)) {
+                    (Ok(name), Ok(value)) => labels.with(name, value),
+                    _ => labels,
+                }
+            })
+    }
+
     /// The same labels with one more. A name already present takes the new value.
     #[must_use]
     pub fn with(mut self, name: LabelName, value: LabelValue) -> Self {
@@ -301,6 +319,23 @@ mod tests {
                 "{invented}"
             );
         }
+    }
+
+    #[test]
+    fn loose_pairs_become_labels_and_the_unusable_ones_are_dropped() {
+        let set = Labels::from_pairs([
+            ("namespace", "prod"),
+            ("", "a blank name"),
+            ("a blank value", "   "),
+            ("service", "api"),
+        ]);
+
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.get(&LabelName::new("namespace").expect("a name"))
+                .map(LabelValue::as_str),
+            Some("prod")
+        );
     }
 
     #[test]
