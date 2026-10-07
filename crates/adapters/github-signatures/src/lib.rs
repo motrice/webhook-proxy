@@ -1,7 +1,7 @@
 //! GitHub's signature scheme, in one place: computing the signature we expect
 //! over a body, and reading the one a request claims.
 //!
-//! This adapter does not decide anything. It hands a computed [`Signature`] to
+//! This adapter does not decide anything. It hands a computed [`Proof`] to
 //! the application, and `Delivery::verify` in the domain compares it against the
 //! claimed one — so the security judgement stays in the crate with no
 //! dependencies, and the constant-time comparison is tested there, once, for
@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 
-use application::ports::{MalformedSignature, SecretUnavailable, Signatures};
-use domain::{Body, Origin, Signature};
+use application::ports::{MalformedProof, Proofs, SecretUnavailable};
+use domain::{Body, Origin, Proof};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -37,8 +37,8 @@ impl GithubSignatures {
     }
 }
 
-impl Signatures for GithubSignatures {
-    fn expected(&self, origin: &Origin, body: &Body) -> Result<Signature, SecretUnavailable> {
+impl Proofs for GithubSignatures {
+    fn expected(&self, origin: &Origin, body: &Body) -> Result<Proof, SecretUnavailable> {
         let secret = self
             .secrets
             .get(origin.secret().as_str())
@@ -50,7 +50,7 @@ impl Signatures for GithubSignatures {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| SecretUnavailable)?;
         mac.update(body.as_bytes());
 
-        Ok(Signature::from_bytes(
+        Ok(Proof::from_bytes(
             mac.finalize().into_bytes().as_slice().to_vec(),
         ))
     }
@@ -59,21 +59,21 @@ impl Signatures for GithubSignatures {
     ///
     /// A malformed value is never treated as a match and never panics: these
     /// arrive from the open internet.
-    fn claimed(&self, presented: &str) -> Result<Signature, MalformedSignature> {
+    fn claimed(&self, presented: &str) -> Result<Proof, MalformedProof> {
         let digest = presented
             .strip_prefix(SCHEME)
-            .ok_or(MalformedSignature::UnknownScheme)?;
+            .ok_or(MalformedProof::UnknownScheme)?;
 
         // Check the length before decoding, so a short-but-valid hex string
         // cannot produce a shorter signature that happens to compare equal to a
         // truncated one. The domain rejects differing lengths too; both is cheap.
         if digest.len() != HEX_DIGEST {
-            return Err(MalformedSignature::Unreadable);
+            return Err(MalformedProof::Unreadable);
         }
 
         hex::decode(digest)
-            .map(Signature::from_bytes)
-            .map_err(|_| MalformedSignature::Unreadable)
+            .map(Proof::from_bytes)
+            .map_err(|_| MalformedProof::Unreadable)
     }
 }
 
@@ -81,10 +81,10 @@ impl Signatures for GithubSignatures {
 mod tests {
     use std::collections::HashMap;
 
-    use application::ports::Signatures;
+    use application::ports::Proofs;
     use domain::{Body, Origin, OriginId, SecretId};
 
-    use application::ports::MalformedSignature;
+    use application::ports::MalformedProof;
 
     use super::GithubSignatures;
 
@@ -172,15 +172,12 @@ mod tests {
 
         assert_eq!(
             verifier().claimed(digest),
-            Err(MalformedSignature::UnknownScheme)
+            Err(MalformedProof::UnknownScheme)
         );
-        assert_eq!(
-            verifier().claimed(""),
-            Err(MalformedSignature::UnknownScheme)
-        );
+        assert_eq!(verifier().claimed(""), Err(MalformedProof::UnknownScheme));
         assert_eq!(
             verifier().claimed(&format!("sha1={digest}")),
-            Err(MalformedSignature::UnknownScheme)
+            Err(MalformedProof::UnknownScheme)
         );
     }
 
@@ -188,15 +185,15 @@ mod tests {
     fn a_header_that_is_not_a_sha256_digest_is_malformed() {
         assert_eq!(
             verifier().claimed("sha256="),
-            Err(MalformedSignature::Unreadable)
+            Err(MalformedProof::Unreadable)
         );
         assert_eq!(
             verifier().claimed("sha256=abcd"),
-            Err(MalformedSignature::Unreadable)
+            Err(MalformedProof::Unreadable)
         );
         assert_eq!(
             verifier().claimed(&format!("sha256={}", "z".repeat(64))),
-            Err(MalformedSignature::Unreadable)
+            Err(MalformedProof::Unreadable)
         );
     }
 

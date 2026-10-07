@@ -158,8 +158,7 @@ fn translate_commit(raw: &PushedCommit) -> Result<Commit, Untranslatable> {
 mod tests {
     use application::ports::{Translator, Untranslatable};
     use domain::{
-        Body, Delivery, DeliveryId, Event, OriginId, Permalink, Signature, Timestamp,
-        VerifiedDelivery,
+        Body, Delivery, DeliveryId, Event, OriginId, Permalink, Proof, Timestamp, VerifiedDelivery,
     };
 
     use super::GithubPayload;
@@ -171,7 +170,7 @@ mod tests {
     /// the port accepts — by design, so nothing is parsed before its signature
     /// matched.
     fn verified(body: &[u8]) -> VerifiedDelivery {
-        let signature = Signature::from_bytes([1, 2, 3]);
+        let signature = Proof::from_bytes([1, 2, 3]);
         Delivery::new(
             DeliveryId::new("d-1").expect("a non-blank identity"),
             OriginId::new("a-forge").expect("a non-blank origin identity"),
