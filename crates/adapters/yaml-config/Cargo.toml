@@ -1,0 +1,24 @@
+[package]
+name = "yaml-config"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain" }
+serde = { version = "1", features = ["derive"] }
+# serde_yaml was archived in 2024. serde_yaml_ng is its maintained continuation
+# with the same API, which matters here because the alternative is hand-rolled
+# YAML parsing — and a parser that disagrees with every other YAML reader about
+# an edge case would turn this file's whole purpose, being reviewable, into a
+# trap.
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+# Each test needs a secrets directory of its own. Dev-only.
+tempfile = "3"
+
+[lints]
+workspace = true
