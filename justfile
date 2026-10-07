@@ -83,9 +83,95 @@ lint-all: _ensure-devtools clippy
     # that someone else's repository is clean.
     @{{ mise }} "{{ devtools_dir }}/scripts/verify.sh"
 
+# Lint the commit messages this branch adds — from a worktree too.
+#
+# gommitlint cannot open a git worktree, in 0.9.10 and still in 0.9.12: a
+# worktree's `.git` is a file holding a gitdir pointer, and gommitlint reads that
+# as a submodule reference and refuses before looking at a single commit. Its own
+# error was hidden by the `2>/dev/null` in devbase's commits.sh, so the Commits
+# row reported a verdict it had never computed — and since every bead is worked
+# in a worktree, the check could neither pass nor fail for a real reason. A check
+# that cannot fail is the `crypto_signature.required` mistake again. See gc-4l5.
+#
+# The way round it is to name the repository gommitlint *can* open — the one
+# holding the real `.git`, which is the main checkout — and then to name the
+# commits as an explicit range, because that repository's HEAD is not ours. Refs
+# and objects are shared between worktrees, so our SHA resolves there. In an
+# ordinary checkout those same two values come out as the repository itself and
+# its own HEAD, so this is one code path rather than a worktree special case.
+#
+# The branch's own `.gommitlint.yaml` is passed explicitly, so a branch that
+# tightens the rules is checked by the rules it ships rather than by main's.
 [group('lint')]
 lint-commits:
-    @{{ mise }} {{ lint }}/commits.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # devbase's verify.sh reads these to build the summary table; it sets
+    # DEVBASE_CHECK_MARKERS=1, and a bare `just lint-commits` prints nothing.
+    marker() {
+        [[ "${DEVBASE_CHECK_MARKERS:-0}" == "1" ]] || return 0
+        printf 'DEVBASE_CHECK_STATUS=%s\n' "$1"
+        [[ -n "${2:-}" ]] && printf 'DEVBASE_CHECK_DETAILS=%s\n' "$2"
+    }
+
+    printf '\033[0;33m************ COMMIT HEALTH (GOMMITLINT) ***********\033[0m\n'
+
+    # The directory that owns the real .git: this checkout, or the main one when
+    # this is a worktree.
+    repo=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+
+    # `|| true` because symbolic-ref exits 128 when origin/HEAD is not set, which
+    # is the ordinary state of a CI checkout — and under `pipefail` that killed
+    # the recipe before it linted anything, which is how this first reached CI.
+    default=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)
+    default=${default:-main}
+
+    # Prefer the local default branch, and fall back to the remote one when it is
+    # missing or has drifted out of our ancestry — the same preference devbase's
+    # script applies, for the same reason: a diverged local main invents commits.
+    base=""
+    if git rev-parse --verify --quiet "refs/heads/${default}" >/dev/null &&
+        git merge-base --is-ancestor "$default" HEAD >/dev/null 2>&1; then
+        base="$default"
+    elif git rev-parse --verify --quiet "refs/remotes/origin/${default}" >/dev/null; then
+        base="origin/${default}"
+    fi
+
+    # Refused rather than reported as n/a. This repository always has a default
+    # branch, so not finding one means the check cannot see what it is meant to
+    # judge — and a row that passes while checking nothing is the thing this
+    # recipe exists to remove.
+    if [[ -z "$base" ]]; then
+        printf '\033[0;31m✗ Neither %s nor origin/%s exists, so there is nothing to compare\033[0m\n' "$default" "$default"
+        printf '  fetch the default branch, or say which one to compare against\n'
+        marker "fail" "no base branch"
+        exit 1
+    fi
+
+    head=$(git rev-parse HEAD)
+    if [[ "$(git rev-parse "$base")" == "$head" ]]; then
+        printf '\033[0;36mⓘ No commits to check (HEAD is %s)\033[0m\n' "$base"
+        marker "na" "n/a"
+        exit 0
+    fi
+
+    # An if rather than `[[ ... ]] && ...`, which under `set -e` would exit the
+    # recipe when the file is simply absent.
+    config=()
+    if [[ -f .gommitlint.yaml ]]; then
+        config=(--gommitconfig "${PWD}/.gommitlint.yaml")
+    fi
+
+    if {{ mise }} gommitlint --repo-path "$repo" "${config[@]}" \
+        validate --range "${base}..${head}"; then
+        printf '\033[0;32m✓ Commit health check passed\033[0m\n'
+        marker "pass" "ok"
+    else
+        printf '\033[0;31m✗ Commit health check failed - check your commit messages\033[0m\n'
+        marker "fail" "failed"
+        exit 1
+    fi
 
 # Refuses to pass while the working tree is dirty, so a green `verify` always
 # describes committed state rather than whatever happens to be on disk.
