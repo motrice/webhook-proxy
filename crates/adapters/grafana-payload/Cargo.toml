@@ -16,8 +16,15 @@ serde_json = "1"
 # library's job. Six lines of it are duplicated between the two adapters because
 # adapters may not depend on each other — see the commit message.
 time = { version = "0.3", features = ["parsing"] }
+# Grafana carries truncatedAlerts with the same name and meaning Alertmanager
+# gives it, so the loss is reported here too rather than only for one sender.
+# The reporting is duplicated between the two adapters for the same reason the
+# date parsing above is — see bead gc-rl5 and the commit message.
+tracing = "0.1"
 
 [dev-dependencies]
+# Captures log output, so a test can prove the count reaches it.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # Only to assert that the two senders are not interchangeable: this crate refuses
 # Alertmanager's payload and that one refuses Grafana's. A dev-dependency, so the
 # architecture test still sees no adapter depending on an adapter.

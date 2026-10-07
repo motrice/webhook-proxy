@@ -32,6 +32,27 @@
 //! * **A status we do not understand is refused**, never guessed. Saying
 //!   "resolved" about something still firing is the one mistake here with real
 //!   consequences.
+//!
+//! And in bead gc-rl5:
+//!
+//! * **A truncation the sender reports is logged, and nothing more.** When
+//!   `truncatedAlerts` is above zero, Alertmanager is telling us how many alerts
+//!   it dropped from the group, and a loss this system is told about must not be
+//!   dropped on the floor. It is reported as a log line against the Delivery's
+//!   identity, because that is how every other loss here is reported.
+//!
+//!   Not an extra `Event`: that would reach a room through normal routing, which
+//!   is attractive — a human would see it — but it is an Event about our own
+//!   processing rather than about the world, and the enum is for facts a sender
+//!   reported. Not carried on each Alert either: the count describes the
+//!   notification, not any alert in it, and repeating it on three Alerts would
+//!   invite a reader to add them up.
+//!
+//!   What this mechanism does *not* do, and the port-level alternative would
+//!   have: increment the dispatch-loss counter. That counter lives in the
+//!   inbound adapter and adapters may not depend on each other, so a truncation
+//!   is logged but not counted. The delivery promise says losses are logged
+//!   *and* counted; this is half of it, and the bead records why.
 
 use application::ports::{Translator, Untranslatable};
 use domain::{
@@ -60,6 +81,14 @@ pub struct AlertmanagerPayload;
 struct Notification {
     version: String,
     alerts: Vec<Firing>,
+    /// How many alerts Alertmanager dropped from this notification because the
+    /// group was larger than it will send.
+    ///
+    /// Defaulted rather than required: a sender that omits it is not truncating,
+    /// and refusing a notification over a missing count would turn a loss we
+    /// were told about into a delivery we refused.
+    #[serde(rename = "truncatedAlerts", default)]
+    truncated_alerts: u32,
 }
 
 /// One alert within a notification.
@@ -93,8 +122,42 @@ impl Translator for AlertmanagerPayload {
         // All or nothing. A half-mapped notification would mean a room hears
         // about two of three alerts and nobody knows the third existed, which is
         // worse than a visible refusal the sender will retry.
-        notification.alerts.iter().map(translate_alert).collect()
+        let events: Vec<Event> = notification
+            .alerts
+            .iter()
+            .map(translate_alert)
+            .collect::<Result<_, _>>()?;
+
+        // Reported only once the notification is known to be translatable. A
+        // refused one is answered with a 400 and retried by the sender, so
+        // reporting its truncation here would be a loss report for a delivery
+        // that has not happened yet.
+        report_truncation(delivery, notification.truncated_alerts);
+
+        Ok(events)
     }
+}
+
+/// Say what the sender told us it dropped.
+///
+/// A log line and nothing else, by the decision in bead gc-rl5: this is a loss,
+/// and losses in this system are reported rather than turned into Events a room
+/// receives. The count is logged where it is known — the counter alongside
+/// dispatch losses lives in the inbound adapter, and adapters may not depend on
+/// each other.
+///
+/// Carries the Delivery's identity and a count. Never any part of the payload: a
+/// truncated notification is still attacker-influenced text.
+fn report_truncation(delivery: &VerifiedDelivery, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+
+    tracing::warn!(
+        delivery = delivery.id().as_str(),
+        truncated = dropped,
+        "notification truncated by sender"
+    );
 }
 
 /// One alert, or nothing.
@@ -181,20 +244,30 @@ fn labels_of(raw: &Firing) -> Labels {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex, OnceLock};
+
     use application::ports::{Translator, Untranslatable};
     use domain::{
         AlertStatus, Body, Delivery, DeliveryId, Event, LabelName, OriginId, Permalink, Proof,
         Severity, Timestamp, VerifiedDelivery,
     };
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::AlertmanagerPayload;
 
     const FIRING: &[u8] = include_bytes!("../fixtures/firing.json");
 
     fn verified(body: &[u8]) -> VerifiedDelivery {
+        verified_as("d-1", body)
+    }
+
+    /// A Delivery under a named identity, so a test asserting that *nothing* was
+    /// reported can look for its own name in a log buffer every test shares.
+    fn verified_as(id: &str, body: &[u8]) -> VerifiedDelivery {
         let proof = Proof::from_bytes([1, 2, 3]);
         Delivery::new(
-            DeliveryId::new("d-1").expect("a non-blank identity"),
+            DeliveryId::new(id).expect("a non-blank identity"),
             OriginId::new("a-monitor").expect("a non-blank origin identity"),
             Body::from_bytes(body.to_vec()),
             Timestamp::from_millis_since_epoch(1_759_000_000_000),
@@ -512,5 +585,103 @@ mod tests {
         };
 
         assert_eq!(summary.as_str(), "HighLatency");
+    }
+
+    #[test]
+    fn a_truncated_notification_is_reported_with_the_count_the_sender_stated() {
+        let logs = captured_logs();
+        // 47 rather than 1: a count that could not be produced by reading the
+        // field as a boolean, or by counting the alerts that did arrive.
+        let payload = br#"{"version":"4","status":"firing","truncatedAlerts":47,
+            "alerts":[{
+            "status":"firing","labels":{"alertname":"X"},
+            "annotations":{"summary":"fine"},
+            "startsAt":"2026-10-07T09:15:00Z","fingerprint":"abc123"}]}"#;
+
+        // The alert that did arrive is still translated. Truncation is the
+        // sender telling us what we are not seeing, not a reason to refuse what
+        // we are.
+        assert_eq!(alerts(payload).len(), 1);
+
+        let written = logged(&logs);
+        assert!(
+            written.contains("truncated=47"),
+            "the sender said 47 alerts were dropped and nothing reported it; \
+             captured log output was {written:?}"
+        );
+        // Named against the Delivery, so a loss report can say which one.
+        assert!(
+            written.contains("d-1"),
+            "the report does not name the Delivery it belongs to; \
+             captured log output was {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_notification_that_dropped_nothing_reports_nothing() {
+        let logs = captured_logs();
+        // The fixture carries truncatedAlerts: 0 — the ordinary case, and the
+        // one that must stay silent. A report on every notification would make
+        // the real ones unfindable.
+        let delivery = verified_as("d-dropped-nothing", FIRING);
+
+        let events = AlertmanagerPayload.events(&delivery).expect("translatable");
+        assert_eq!(events.len(), 3);
+
+        let written = logged(&logs);
+        assert!(
+            !written.contains("d-dropped-nothing"),
+            "a notification that truncated nothing was reported anyway; \
+             captured log output was {written:?}"
+        );
+    }
+
+    /// Collects log output in memory so a test can assert on what was written.
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+
+    /// The buffer every log line in this binary is written to.
+    ///
+    /// One *global* subscriber installed once, for the reason the inbound
+    /// adapter's copy of this records: tracing caches each callsite's interest
+    /// globally, so a `warn!` reached while no subscriber is installed is cached
+    /// as "nobody cares" and a thread-local subscriber set later is never
+    /// consulted. The cost is a shared buffer, so each assertion looks for its
+    /// own count.
+    fn captured_logs() -> Arc<Mutex<Vec<u8>>> {
+        LOGS.get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            tracing_subscriber::fmt()
+                .with_writer(Captured(Arc::clone(&buffer)))
+                .with_ansi(false)
+                .init();
+            buffer
+        })
+        .clone()
+    }
+
+    fn logged(logs: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(logs.lock().expect("not poisoned").clone()).expect("utf-8 log output")
+    }
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("not poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }

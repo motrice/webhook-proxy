@@ -16,6 +16,16 @@ serde_json = "1"
 # arrival time is not a substitute. Date arithmetic with offsets and leap years
 # is exactly what a library should do rather than this crate.
 time = { version = "0.3", features = ["parsing"] }
+# Alertmanager reports its own truncation in truncatedAlerts, and a loss this
+# system is told about must be reported rather than dropped. The count is logged
+# here, at the only place that knows it: the counter lives in the inbound
+# adapter and adapters may not depend on each other — see bead gc-rl5.
+tracing = "0.1"
+
+[dev-dependencies]
+# Captures log output, so a test can prove the count reaches it. The same
+# mechanism the inbound adapter's tests use.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]
 workspace = true
