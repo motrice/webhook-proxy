@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use application::ports::{MalformedProof, Proofs, SecretUnavailable};
-use domain::{Body, Origin, Proof};
+use domain::{Body, Origin, Proof, Verification};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -39,6 +39,16 @@ impl GithubSignatures {
 
 impl Proofs for GithubSignatures {
     fn expected(&self, origin: &Origin, body: &Body) -> Result<Proof, SecretUnavailable> {
+        // First, before the secret is looked at. An Origin that declares it
+        // presents a shared value must never be verified by a digest instead: a
+        // mechanism is not a fallback in either direction, and a mis-wiring has to
+        // fail closed rather than quietly change what an Origin proved. Bead
+        // gc-ast.7 added the other half of this.
+        match origin.verify() {
+            Verification::Signed { .. } => {}
+            Verification::Shared { .. } => return Err(SecretUnavailable),
+        }
+
         let secret = self
             .secrets
             .get(origin.secret().as_str())
@@ -81,7 +91,7 @@ impl Proofs for GithubSignatures {
 mod tests {
     use std::collections::HashMap;
 
-    use application::ports::Proofs;
+    use application::ports::{Proofs, SecretUnavailable};
     use domain::{Body, Origin, OriginId, SecretId, Verification};
 
     use application::ports::MalformedProof;
@@ -112,6 +122,26 @@ mod tests {
                 secret: SecretId::new(SECRET_NAME).expect("a non-blank secret name"),
             },
         )
+    }
+
+    #[test]
+    fn an_origin_that_presents_a_shared_value_is_not_verified_by_a_digest() {
+        // The other direction of the same rule. An Origin declaring the weaker
+        // mechanism must not be verifiable here, or a mis-wiring would change
+        // what it is required to prove without anything failing.
+        let sharing = Origin::new(
+            OriginId::new("a-monitor").expect("a non-blank origin identity"),
+            Verification::Shared {
+                secret: SecretId::new(SECRET_NAME).expect("a non-blank secret name"),
+            },
+        );
+
+        assert_eq!(
+            verifier()
+                .expected(&sharing, &Body::from_bytes(BODY.to_vec()))
+                .err(),
+            Some(SecretUnavailable)
+        );
     }
 
     #[test]

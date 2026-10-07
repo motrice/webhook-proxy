@@ -15,6 +15,7 @@ members = [
     "crates/adapters/github-http",
     "crates/adapters/github-payload",
     "crates/adapters/github-signatures",
+    "crates/adapters/shared-values",
     "crates/adapters/system",
     "crates/adapters/yaml-config",
     "crates/app",
