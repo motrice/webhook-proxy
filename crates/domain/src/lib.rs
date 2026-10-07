@@ -15,8 +15,8 @@ mod delivery;
 mod event;
 mod label;
 mod origin;
+mod proof;
 mod routing;
-mod signature;
 mod time;
 
 pub use alert::{AlertId, AlertStatus, Severity};
@@ -26,8 +26,8 @@ pub use event::{
 };
 pub use label::{LabelName, LabelValue, Labels};
 pub use origin::{Origin, OriginId, SecretId};
+pub use proof::{Proof, ProofMismatch};
 pub use routing::{
     Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,
 };
-pub use signature::{Signature, SignatureMismatch};
 pub use time::Timestamp;

@@ -1,10 +1,10 @@
 //! The use case: one inbound Delivery reaches everyone who should hear about it.
 
 use domain::{
-    Body, Delivery, DeliveryId, DestinationId, Origin, Signature, Subscription, destinations_for,
+    Body, Delivery, DeliveryId, DestinationId, Origin, Proof, Subscription, destinations_for,
 };
 
-use crate::ports::{Clock, DispatchFailed, Dispatcher, Ids, Signatures, Translator};
+use crate::ports::{Clock, DispatchFailed, Dispatcher, Ids, Proofs, Translator};
 
 /// Why a Delivery was not accepted at all.
 ///
@@ -13,7 +13,7 @@ use crate::ports::{Clock, DispatchFailed, Dispatcher, Ids, Signatures, Translato
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
     /// The claimed signature did not match the computed one.
-    SignatureMismatch,
+    ProofMismatch,
     /// The Origin's secret could not be obtained, so no judgement was possible.
     SecretUnavailable,
     /// The payload could not be read.
@@ -59,7 +59,7 @@ impl Relayed {
 /// routing decision to `destinations_for`. What lives here is the order those
 /// happen in, and the refusal to let one Destination's failure affect another's.
 pub struct Relay<'a> {
-    signatures: &'a dyn Signatures,
+    signatures: &'a dyn Proofs,
     translator: &'a dyn Translator,
     dispatcher: &'a dyn Dispatcher,
     clock: &'a dyn Clock,
@@ -71,7 +71,7 @@ impl<'a> Relay<'a> {
     /// Wires the use case to the outside world.
     #[must_use]
     pub fn new(
-        signatures: &'a dyn Signatures,
+        signatures: &'a dyn Proofs,
         translator: &'a dyn Translator,
         dispatcher: &'a dyn Dispatcher,
         clock: &'a dyn Clock,
@@ -103,7 +103,7 @@ impl<'a> Relay<'a> {
         &self,
         origin: &Origin,
         body: Body,
-        claimed: &Signature,
+        claimed: &Proof,
     ) -> Result<Relayed, Refused> {
         let delivery = Delivery::new(
             self.ids.next_delivery_id(),
@@ -121,7 +121,7 @@ impl<'a> Relay<'a> {
         // unverified one cannot be used further down by accident.
         let verified = delivery
             .verify(claimed, &expected)
-            .map_err(|_| Refused::SignatureMismatch)?;
+            .map_err(|_| Refused::ProofMismatch)?;
 
         // Only now is the payload read. Translation after verification is the
         // reason this is a port rather than something the adapter does first.
@@ -166,27 +166,27 @@ mod tests {
     use async_trait::async_trait;
     use domain::{
         Blank, Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Event,
-        Filter, LabelName, LabelValue, Labels, Origin, OriginId, Pusher, RepositoryName, SecretId,
-        Signature, Subscription, Timestamp, VerifiedDelivery,
+        Filter, LabelName, LabelValue, Labels, Origin, OriginId, Proof, Pusher, RepositoryName,
+        SecretId, Subscription, Timestamp, VerifiedDelivery,
     };
 
     use super::{Refused, Relay};
     use crate::ports::{
-        Clock, DispatchFailed, Dispatcher, Ids, MalformedSignature, SecretUnavailable, Signatures,
+        Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Proofs, SecretUnavailable,
         Translator, Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
 
-    struct Secret(Result<Signature, SecretUnavailable>);
-    impl Signatures for Secret {
-        fn expected(&self, _origin: &Origin, _body: &Body) -> Result<Signature, SecretUnavailable> {
+    struct Secret(Result<Proof, SecretUnavailable>);
+    impl Proofs for Secret {
+        fn expected(&self, _origin: &Origin, _body: &Body) -> Result<Proof, SecretUnavailable> {
             self.0.clone()
         }
 
         /// The use case never calls this — an inbound adapter does, before it has
         /// anything to relay — so the fake is honest about not being exercised.
-        fn claimed(&self, _presented: &str) -> Result<Signature, MalformedSignature> {
+        fn claimed(&self, _presented: &str) -> Result<Proof, MalformedProof> {
             unreachable!("the relay is given a claimed signature, it does not read one")
         }
     }
@@ -282,8 +282,8 @@ mod tests {
             .collect()
     }
 
-    fn signature() -> Signature {
-        Signature::from_bytes(SIGNATURE)
+    fn signature() -> Proof {
+        Proof::from_bytes(SIGNATURE)
     }
 
     #[tokio::test]
@@ -352,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mismatched_signature_dispatches_nothing() {
-        let secret = Secret(Ok(Signature::from_bytes([9, 9, 9])));
+        let secret = Secret(Ok(Proof::from_bytes([9, 9, 9])));
         let says = Says(Ok(vec![a_push()]));
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first"]);
@@ -374,7 +374,7 @@ mod tests {
             .await
             .expect_err("a mismatch is refused");
 
-        assert_eq!(refused, Refused::SignatureMismatch);
+        assert_eq!(refused, Refused::ProofMismatch);
         assert!(dispatcher.sent().is_empty());
     }
 

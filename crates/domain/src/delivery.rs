@@ -1,7 +1,7 @@
 //! What arrived, and what we are willing to act on.
 
 use crate::event::present;
-use crate::{Blank, Origin, OriginId, Signature, SignatureMismatch, Timestamp};
+use crate::{Blank, Origin, OriginId, Proof, ProofMismatch, Timestamp};
 
 /// A Delivery's identity, minted at the inbound boundary.
 ///
@@ -132,19 +132,19 @@ impl Delivery {
     ///
     /// # Errors
     ///
-    /// [`SignatureMismatch`] if the two signatures differ, including when they
+    /// [`ProofMismatch`] if the two signatures differ, including when they
     /// differ only in length. The Delivery is consumed either way, so a
     /// rejected one cannot be retried against another signature until it
     /// happens to match.
     pub fn verify(
         self,
-        claimed: &Signature,
-        computed: &Signature,
-    ) -> Result<VerifiedDelivery, SignatureMismatch> {
+        claimed: &Proof,
+        computed: &Proof,
+    ) -> Result<VerifiedDelivery, ProofMismatch> {
         if claimed.matches(computed) {
             Ok(VerifiedDelivery { delivery: self })
         } else {
-            Err(SignatureMismatch)
+            Err(ProofMismatch)
         }
     }
 }
@@ -188,7 +188,7 @@ impl Origin {
 #[cfg(test)]
 mod tests {
     use super::{Body, Delivery, DeliveryId};
-    use crate::{Origin, OriginId, SecretId, Signature, Timestamp};
+    use crate::{Origin, OriginId, Proof, SecretId, Timestamp};
 
     fn an_origin() -> OriginId {
         OriginId::new("github").expect("a non-blank origin identity")
@@ -231,8 +231,8 @@ mod tests {
     #[test]
     fn matching_signatures_yield_a_verified_delivery_over_the_same_bytes() {
         let raw = b"payload".to_vec();
-        let claimed = Signature::from_bytes([9, 9, 9]);
-        let computed = Signature::from_bytes([9, 9, 9]);
+        let claimed = Proof::from_bytes([9, 9, 9]);
+        let computed = Proof::from_bytes([9, 9, 9]);
 
         let verified = delivery_of(raw.clone())
             .verify(&claimed, &computed)
@@ -244,8 +244,8 @@ mod tests {
 
     #[test]
     fn differing_signatures_are_rejected_and_produce_nothing_to_act_on() {
-        let claimed = Signature::from_bytes([9, 9, 9]);
-        let computed = Signature::from_bytes([9, 9, 8]);
+        let claimed = Proof::from_bytes([9, 9, 9]);
+        let computed = Proof::from_bytes([9, 9, 8]);
 
         let outcome = delivery_of(b"payload".to_vec()).verify(&claimed, &computed);
 
@@ -282,7 +282,7 @@ mod tests {
     fn a_verified_delivery_keeps_the_identity_and_arrival_it_was_given() {
         // The identity has to survive verification, because the loss report that
         // names it is written after a Dispatch has failed, long past this point.
-        let signature = Signature::from_bytes([7, 7, 7]);
+        let signature = Proof::from_bytes([7, 7, 7]);
 
         let verified = delivery_of(b"payload".to_vec())
             .verify(&signature, &signature)

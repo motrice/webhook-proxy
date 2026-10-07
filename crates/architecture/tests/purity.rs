@@ -506,10 +506,10 @@ mod scanner {
     #[test]
     fn a_vendor_name_in_prose_is_not_a_violation() {
         // The domain is allowed to *explain* that it does not know about
-        // GitHub — signature.rs does exactly that — it just may not name it in
+        // GitHub — proof.rs does exactly that — it just may not name it in
         // a type, a field or a function.
         let src = "/// Nothing here knows that GitHub uses HMAC-SHA256.\n\
-                   pub struct Signature;\n";
+                   pub struct Proof;\n";
 
         assert!(
             vendor_names_in(src).is_empty(),

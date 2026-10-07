@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use application::ports::{Clock, Dispatcher, Ids, Signatures, Translator};
+use application::ports::{Clock, Dispatcher, Ids, Proofs, Translator};
 use application::{Refused, Relay};
 use axum::Router;
 use axum::body::Bytes;
@@ -30,7 +30,7 @@ const SIGNATURE_HEADER: &str = "x-hub-signature-256";
 /// would be inflicted on every caller for no benefit.
 #[derive(Clone)]
 pub struct Inbound {
-    signatures: Arc<dyn Signatures>,
+    signatures: Arc<dyn Proofs>,
     translator: Arc<dyn Translator>,
     dispatcher: Arc<dyn Dispatcher>,
     clock: Arc<dyn Clock>,
@@ -46,7 +46,7 @@ impl Inbound {
     /// Wires the front door to the application.
     #[must_use]
     pub fn new(
-        signatures: Arc<dyn Signatures>,
+        signatures: Arc<dyn Proofs>,
         translator: Arc<dyn Translator>,
         dispatcher: Arc<dyn Dispatcher>,
         clock: Arc<dyn Clock>,
@@ -159,7 +159,7 @@ async fn receive(
             }
             StatusCode::ACCEPTED
         }
-        Err(Refused::SignatureMismatch) => StatusCode::UNAUTHORIZED,
+        Err(Refused::ProofMismatch) => StatusCode::UNAUTHORIZED,
         Err(Refused::SecretUnavailable) => StatusCode::SERVICE_UNAVAILABLE,
         Err(Refused::Untranslatable) => StatusCode::BAD_REQUEST,
     }
@@ -172,7 +172,7 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use application::ports::{
-        Clock, DispatchFailed, Dispatcher, Ids, MalformedSignature, SecretUnavailable, Signatures,
+        Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Proofs, SecretUnavailable,
         Translator, Untranslatable,
     };
     use axum::Router;
@@ -180,7 +180,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use domain::{
         Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Event, Filter,
-        Origin, OriginId, Pusher, RepositoryName, SecretId, Signature, Subscription, Timestamp,
+        Origin, OriginId, Proof, Pusher, RepositoryName, SecretId, Subscription, Timestamp,
         VerifiedDelivery,
     };
     use tower::ServiceExt;
@@ -197,21 +197,21 @@ mod tests {
     /// Reports a fixed expected signature, and records every body it was asked
     /// about so a test can prove the bytes were not re-encoded on the way.
     struct Sigs {
-        expected: Result<Signature, SecretUnavailable>,
+        expected: Result<Proof, SecretUnavailable>,
         seen: Mutex<Vec<Vec<u8>>>,
     }
 
     impl Sigs {
         fn matching() -> Arc<Self> {
             Arc::new(Self {
-                expected: Ok(Signature::from_bytes(b"abc".to_vec())),
+                expected: Ok(Proof::from_bytes(b"abc".to_vec())),
                 seen: Mutex::new(Vec::new()),
             })
         }
 
         fn mismatching() -> Arc<Self> {
             Arc::new(Self {
-                expected: Ok(Signature::from_bytes(b"xyz".to_vec())),
+                expected: Ok(Proof::from_bytes(b"xyz".to_vec())),
                 seen: Mutex::new(Vec::new()),
             })
         }
@@ -228,8 +228,8 @@ mod tests {
         }
     }
 
-    impl Signatures for Sigs {
-        fn expected(&self, _origin: &Origin, body: &Body) -> Result<Signature, SecretUnavailable> {
+    impl Proofs for Sigs {
+        fn expected(&self, _origin: &Origin, body: &Body) -> Result<Proof, SecretUnavailable> {
             self.seen
                 .lock()
                 .expect("not poisoned")
@@ -239,11 +239,11 @@ mod tests {
 
         /// A stand-in scheme: `ok:<bytes>`. Anything else is unreadable, which is
         /// how the malformed-header case is driven.
-        fn claimed(&self, presented: &str) -> Result<Signature, MalformedSignature> {
+        fn claimed(&self, presented: &str) -> Result<Proof, MalformedProof> {
             presented
                 .strip_prefix("ok:")
-                .map(|rest| Signature::from_bytes(rest.as_bytes().to_vec()))
-                .ok_or(MalformedSignature::UnknownScheme)
+                .map(|rest| Proof::from_bytes(rest.as_bytes().to_vec()))
+                .ok_or(MalformedProof::UnknownScheme)
         }
     }
 

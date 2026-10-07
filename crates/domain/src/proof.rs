@@ -1,4 +1,4 @@
-//! Signatures over a [`Delivery`](crate::Delivery)'s body.
+//! Proofs over a [`Delivery`](crate::Delivery)'s body.
 
 /// A signature over a Delivery's body.
 ///
@@ -6,13 +6,13 @@
 /// signatures, it never computes them, so nothing here knows or cares that
 /// GitHub happens to use HMAC-SHA256.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Signature(Vec<u8>);
+pub struct Proof(Vec<u8>);
 
 /// A Delivery whose claimed signature did not match the computed one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignatureMismatch;
+pub struct ProofMismatch;
 
-impl Signature {
+impl Proof {
     /// Takes a signature as raw bytes, however the sender encoded it.
     #[must_use]
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
@@ -37,42 +37,42 @@ impl Signature {
     }
 }
 
-impl core::fmt::Debug for Signature {
+impl core::fmt::Debug for Proof {
     /// Prints the length and nothing else. A signature is not itself a secret,
     /// but printing one invites printing the secret next to it.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Signature({} bytes)", self.0.len())
+        write!(f, "Proof({} bytes)", self.0.len())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Signature;
+    use super::Proof;
 
     #[test]
     fn identical_signatures_match() {
-        assert!(Signature::from_bytes([1, 2, 3]).matches(&Signature::from_bytes([1, 2, 3])));
+        assert!(Proof::from_bytes([1, 2, 3]).matches(&Proof::from_bytes([1, 2, 3])));
     }
 
     #[test]
     fn a_single_differing_byte_does_not_match() {
-        assert!(!Signature::from_bytes([1, 2, 3]).matches(&Signature::from_bytes([1, 2, 4])));
+        assert!(!Proof::from_bytes([1, 2, 3]).matches(&Proof::from_bytes([1, 2, 4])));
     }
 
     #[test]
     fn signatures_of_different_lengths_do_not_match() {
-        assert!(!Signature::from_bytes([1, 2, 3]).matches(&Signature::from_bytes([1, 2, 3, 4])));
+        assert!(!Proof::from_bytes([1, 2, 3]).matches(&Proof::from_bytes([1, 2, 3, 4])));
     }
 
     #[test]
     fn a_prefix_does_not_match_the_whole() {
         // Guards against a comparison that stops at the shorter length.
-        assert!(!Signature::from_bytes([1, 2]).matches(&Signature::from_bytes([1, 2, 0])));
+        assert!(!Proof::from_bytes([1, 2]).matches(&Proof::from_bytes([1, 2, 0])));
     }
 
     #[test]
     fn debug_output_does_not_reproduce_the_signature_bytes() {
-        let printed = format!("{:?}", Signature::from_bytes([0xde, 0xad, 0xbe, 0xef]));
+        let printed = format!("{:?}", Proof::from_bytes([0xde, 0xad, 0xbe, 0xef]));
 
         assert!(printed.contains('4'), "{printed}");
         assert!(!printed.contains("de"), "{printed}");

@@ -13,9 +13,7 @@
 //! can be driven by twenty-line fakes in a test.
 
 use async_trait::async_trait;
-use domain::{
-    Body, DeliveryId, Destination, Event, Origin, Signature, Timestamp, VerifiedDelivery,
-};
+use domain::{Body, DeliveryId, Destination, Event, Origin, Proof, Timestamp, VerifiedDelivery};
 
 /// The signature an Origin's secret produces over a body.
 ///
@@ -27,7 +25,7 @@ use domain::{
 /// Nothing here names a header, an encoding or an algorithm. An implementation
 /// that needed to would be telling you it is a transport detail wearing a port's
 /// clothes.
-pub trait Signatures: Send + Sync {
+pub trait Proofs: Send + Sync {
     /// The signature this Origin's secret produces over these bytes.
     ///
     /// # Errors
@@ -35,7 +33,7 @@ pub trait Signatures: Send + Sync {
     /// [`SecretUnavailable`] if the Origin's secret cannot be obtained. This is
     /// deliberately not the same outcome as a mismatch: one means we could not
     /// check, the other means we checked and it was wrong.
-    fn expected(&self, origin: &Origin, body: &Body) -> Result<Signature, SecretUnavailable>;
+    fn expected(&self, origin: &Origin, body: &Body) -> Result<Proof, SecretUnavailable>;
 
     /// Read the signature a sender claimed, from whatever it presented.
     ///
@@ -51,15 +49,15 @@ pub trait Signatures: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`MalformedSignature`] if the value is not a signature we can compare.
+    /// [`MalformedProof`] if the value is not a signature we can compare.
     /// Distinct from a mismatch: the sender presented nothing usable, so no
     /// comparison was possible.
-    fn claimed(&self, presented: &str) -> Result<Signature, MalformedSignature>;
+    fn claimed(&self, presented: &str) -> Result<Proof, MalformedProof>;
 }
 
 /// A sender presented something that is not a signature we can compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MalformedSignature {
+pub enum MalformedProof {
     /// The scheme is absent or not one we recognise.
     UnknownScheme,
     /// The scheme was recognised, but the value could not be read.
