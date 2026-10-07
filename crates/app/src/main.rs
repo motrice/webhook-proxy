@@ -17,6 +17,7 @@ use domain::Verification;
 use element_notices::ElementNotices;
 use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
+use grafana_payload::GrafanaPayload;
 use inbound_http::{AUTHORIZATION_HEADER, Inbound, SIGNATURE_HEADER, Sender, router};
 use shared_values::SharedValues;
 use std::path::PathBuf;
@@ -207,6 +208,7 @@ async fn run() -> Result<(), Unstartable> {
             let translator: Arc<dyn Translator> = match declared.speaks {
                 Speaks::Github => Arc::new(GithubPayload),
                 Speaks::Alertmanager => Arc::new(AlertmanagerPayload),
+                Speaks::Grafana => Arc::new(GrafanaPayload),
             };
             (
                 path.clone(),

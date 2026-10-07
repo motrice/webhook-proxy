@@ -125,6 +125,25 @@ impl Severity {
 }
 
 impl AlertStatus {
+    /// Reads a status as a sender spelled it.
+    ///
+    /// `None` for anything else, which is not the same as a default: a sender
+    /// that cannot say whether something is still happening is not describing an
+    /// alert, and guessing would mean telling a room "resolved" about something
+    /// still firing. Every sender so far uses these two words.
+    ///
+    /// Lives here rather than in each inbound adapter because two senders want
+    /// it and adapters may not depend on each other — and because it is the same
+    /// kind of knowledge as [`Severity::from_label`], which was already here.
+    #[must_use]
+    pub fn from_label(stated: &str) -> Option<Self> {
+        match stated.trim().to_lowercase().as_str() {
+            "firing" => Some(Self::Firing),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+
     /// How this appears as a label value.
     #[must_use]
     pub fn as_label(&self) -> &'static str {
@@ -208,6 +227,25 @@ mod tests {
         );
         // Nothing to match on, so no label at all rather than a blank one.
         assert_eq!(Severity::Unstated.as_label(), None);
+    }
+
+    #[test]
+    fn a_status_is_read_however_the_sender_spelled_it() {
+        assert_eq!(AlertStatus::from_label("firing"), Some(AlertStatus::Firing));
+        assert_eq!(
+            AlertStatus::from_label("  Resolved \n"),
+            Some(AlertStatus::Resolved)
+        );
+        assert_eq!(AlertStatus::from_label("FIRING"), Some(AlertStatus::Firing));
+    }
+
+    #[test]
+    fn a_status_we_do_not_know_is_none_rather_than_a_default() {
+        // Guessing would mean telling a room "resolved" about something still
+        // firing, which is the one mistake here with real consequences.
+        for unknown in ["", "   ", "flapping", "pending", "alerting"] {
+            assert_eq!(AlertStatus::from_label(unknown), None, "{unknown}");
+        }
     }
 
     #[test]

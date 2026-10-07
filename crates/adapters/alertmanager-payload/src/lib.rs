@@ -35,8 +35,7 @@
 
 use application::ports::{Translator, Untranslatable};
 use domain::{
-    AlertId, AlertStatus, Event, LabelName, LabelValue, Labels, Permalink, Severity, Summary,
-    Timestamp, VerifiedDelivery,
+    AlertId, AlertStatus, Event, Labels, Permalink, Severity, Summary, Timestamp, VerifiedDelivery,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -101,7 +100,7 @@ impl Translator for AlertmanagerPayload {
 /// One alert, or nothing.
 fn translate_alert(raw: &Firing) -> Result<Event, Untranslatable> {
     let id = AlertId::new(&raw.fingerprint).map_err(|_| Untranslatable)?;
-    let status = status_of(&raw.status).ok_or(Untranslatable)?;
+    let status = AlertStatus::from_label(&raw.status).ok_or(Untranslatable)?;
     let started = started_at(&raw.starts_at).ok_or(Untranslatable)?;
 
     let severity = raw
@@ -122,16 +121,6 @@ fn translate_alert(raw: &Firing) -> Result<Event, Untranslatable> {
         started,
         permalink,
     })
-}
-
-/// Alertmanager says one of two words. Anything else means this is not the
-/// payload it claims to be.
-fn status_of(stated: &str) -> Option<AlertStatus> {
-    match stated {
-        "firing" => Some(AlertStatus::Firing),
-        "resolved" => Some(AlertStatus::Resolved),
-        _ => None,
-    }
 }
 
 /// When the sender says it began, as milliseconds since the epoch.
@@ -177,20 +166,17 @@ fn permalink_of(raw: &Firing) -> Option<Permalink> {
 
 /// The alert's labels, as sent.
 ///
-/// A label the domain will not accept is dropped rather than refusing the alert:
-/// one odd label is no reason for a room to hear nothing. The severity label is
-/// kept as sent even though a typed Severity was read from it, because the typed
-/// value is projected over it when routing — so there is one answer, and this
-/// crate does not have to decide what the sender meant.
+/// The severity label is kept as sent even though a typed Severity was read from
+/// it, because the typed value is projected over it when routing — so there is
+/// one answer, and this crate does not have to decide what the sender meant.
+/// Dropping an unusable pair rather than refusing the alert is
+/// [`Labels::from_pairs`]'s doing, shared with every other inbound adapter.
 fn labels_of(raw: &Firing) -> Labels {
-    raw.labels
-        .iter()
-        .fold(Labels::none(), |labels, (name, value)| {
-            match (LabelName::new(name), LabelValue::new(value)) {
-                (Ok(name), Ok(value)) => labels.with(name, value),
-                _ => labels,
-            }
-        })
+    Labels::from_pairs(
+        raw.labels
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )
 }
 
 #[cfg(test)]
