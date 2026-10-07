@@ -12,3 +12,8 @@
 
 # Generated artefacts
 /sbom.spdx.json
+# bd worktree. These are worktrees inside the repository, which `bd worktree`
+# creates and adds here one at a time — so an older one left behind shows up as
+# untracked and fails the REUSE check, which is how gc-4l5 was noticed again.
+gc-rl5/
+gc-4l5/

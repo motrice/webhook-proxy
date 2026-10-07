@@ -13,6 +13,18 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 > source of truth; don't `bd import` during normal operation; don't
 > reach for third-party Dolt hosting before trying the default).
 
+## Skills
+
+The skill table lives in `CLAUDE.md`, under "Skills", and is the single list —
+deliberately, because two tables of the same thing drift and the one nobody
+edited becomes the one somebody believes. The skills themselves are in
+`.claude/skills/`.
+
+Load one before doing the thing it covers, not after. The one most easily missed
+is `rest-api-profil`: Sweden's national REST API-profil and its lint tool, which
+applies before designing or changing any HTTP interface meant for a public-sector
+consumer, and before claiming any degree of conformance to it.
+
 ## The ledger is not published from this repository
 
 `bd dolt push` had put the whole bead database on the git remote as
