@@ -39,10 +39,34 @@ fn is_nameable(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
+/// Which vocabulary a sender speaks, so the composition root can pick the
+/// translation.
+///
+/// Deliberately separate from the verification mechanism: how a sender proves
+/// itself and what shape it sends are independent facts, and conflating them
+/// would mean a sender that signed an Alertmanager notification was
+/// untranslatable with nothing in the file saying why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaks {
+    /// A forge push payload.
+    Github,
+    /// A monitoring notification.
+    Alertmanager,
+}
+
+/// An Origin as the file declares it, with the vocabulary it speaks.
+#[derive(Debug, Clone)]
+pub struct Declared {
+    /// Who it is and what it must prove.
+    pub origin: Origin,
+    /// What shape it sends.
+    pub speaks: Speaks,
+}
+
 /// Everything the composition root needs in order to start.
 #[derive(Clone)]
 pub struct Configuration {
-    origins: HashMap<String, Origin>,
+    origins: HashMap<String, Declared>,
     subscriptions: Vec<Subscription>,
     secrets: HashMap<String, String>,
     webhooks: HashMap<String, String>,
@@ -124,6 +148,7 @@ struct Document {
 #[serde(deny_unknown_fields)]
 struct OriginEntry {
     id: String,
+    speaks: SpeaksEntry,
     /// A map of exactly one entry, not an enum.
     ///
     /// serde reads an externally tagged enum from a YAML *tag* — `!hmac_sha256`
@@ -133,6 +158,14 @@ struct OriginEntry {
     /// mechanism" and "declares two" become errors this crate phrases, instead of
     /// serde's wording for a shape it did not expect.
     verify: BTreeMap<String, MechanismEntry>,
+}
+
+/// Which vocabulary a sender speaks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum SpeaksEntry {
+    Github,
+    Alertmanager,
 }
 
 /// The one field every mechanism has.
@@ -274,8 +307,17 @@ impl Configuration {
                 }
             };
 
-            self.origins
-                .insert(entry.id.trim().to_owned(), Origin::new(id, verify));
+            let speaks = match entry.speaks {
+                SpeaksEntry::Github => Speaks::Github,
+                SpeaksEntry::Alertmanager => Speaks::Alertmanager,
+            };
+            self.origins.insert(
+                entry.id.trim().to_owned(),
+                Declared {
+                    origin: Origin::new(id, verify),
+                    speaks,
+                },
+            );
         }
         Ok(())
     }
@@ -457,7 +499,7 @@ impl Configuration {
 
     /// Every Origin, by the identity a request names.
     #[must_use]
-    pub fn origins(&self) -> &HashMap<String, Origin> {
+    pub fn origins(&self) -> &HashMap<String, Declared> {
         &self.origins
     }
 
@@ -546,6 +588,7 @@ mod tests {
 version: 1
 origins:
   - id: a-forge
+    speaks: github
     verify:
       hmac_sha256:
         secret: a-secret
@@ -681,13 +724,20 @@ subscriptions:
         let config = Configuration::read(Path::new(EXAMPLE), dir.path()).expect("it parses");
 
         assert!(matches!(
-            config.origins()["github"].verify(),
+            config.origins()["github"].origin.verify(),
             Verification::Signed { .. }
         ));
         assert!(matches!(
-            config.origins()["alertmanager"].verify(),
+            config.origins()["alertmanager"].origin.verify(),
             Verification::Shared { .. }
         ));
+
+        // And what each speaks, which is independent of how it proves itself.
+        assert_eq!(config.origins()["github"].speaks, super::Speaks::Github);
+        assert_eq!(
+            config.origins()["alertmanager"].speaks,
+            super::Speaks::Alertmanager
+        );
     }
 
     #[test]
@@ -802,7 +852,7 @@ subscriptions:
     fn two_origins_with_one_identity_are_refused() {
         let bad = sound().replace(
             "destinations:",
-            "  - id: a-forge\n    verify:\n      bearer:\n        secret: a-secret\ndestinations:",
+            "  - id: a-forge\n    speaks: github\n    verify:\n      bearer:\n        secret: a-secret\ndestinations:",
         );
         let e = refused(&bad);
 

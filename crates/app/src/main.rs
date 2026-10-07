@@ -10,25 +10,19 @@ use std::fmt;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use application::ports::Dispatcher;
+use alertmanager_payload::AlertmanagerPayload;
+use application::ports::{Dispatcher, Proofs, Translator};
 use axum::routing::get;
-use domain::{
-    Destination, DestinationId, DestinationKind, Filter, Origin, OriginId, SecretId, Subscription,
-    Verification,
-};
+use domain::Verification;
 use element_notices::ElementNotices;
 use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
-use inbound_http::{Inbound, router};
+use inbound_http::{AUTHORIZATION_HEADER, Inbound, SIGNATURE_HEADER, Sender, router};
+use shared_values::SharedValues;
+use std::path::PathBuf;
 use std::sync::Arc;
 use system::{RandomIds, SystemClock};
-
-/// The name this deployment knows its one Origin by. It appears in the webhook
-/// path, so GitHub is configured to post to `/webhook/github`.
-const ORIGIN: &str = "github";
-
-/// The name the Origin's secret is held under. An internal label, not a value.
-const SECRET: &str = "github-webhook-secret";
+use yaml_config::{Configuration, Speaks};
 
 /// Why the process will not start.
 ///
@@ -36,10 +30,11 @@ const SECRET: &str = "github-webhook-secret";
 /// startup error is the single most likely thing to be pasted into a chat window.
 #[derive(Debug)]
 enum Unstartable {
-    /// A required variable is absent or blank.
-    Missing(&'static str),
     /// A variable is present but unusable.
     Unusable { name: &'static str, why: String },
+    /// The routing file cannot be used. Its own message names the file and the
+    /// field, so this adds nothing to it.
+    Configuration(String),
     /// The HTTP client for the destination could not be built.
     NoClient,
     /// The listening socket could not be served.
@@ -49,37 +44,38 @@ enum Unstartable {
 impl fmt::Display for Unstartable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing(name) => write!(f, "{name} is not set"),
             Self::Unusable { name, why } => write!(f, "{name} is unusable: {why}"),
+            Self::Configuration(why) => write!(f, "{why}"),
             Self::NoClient => write!(f, "the HTTP client for the destination could not be built"),
             Self::Serving(why) => write!(f, "could not serve: {why}"),
         }
     }
 }
 
-/// Shorthand for the `Missing` case, since configuration reading only has that
-/// one failure.
-type Missing = Unstartable;
-
-/// Everything the process needs to start.
+/// Everything the process needs to start that is not policy.
+///
+/// Who may send and who hears what live in the routing file, because a human
+/// reviews those as a diff. What is left here is what the process needs in order
+/// to run: where to listen, how long to wait, how much to accept, and where to
+/// find the file and the secrets it names. Bead gc-ast.3 drew that line.
 struct Config {
     listen: String,
     max_body: usize,
     timeout: Duration,
-    github_secret: String,
-    element_url: String,
-    element_room: String,
+    file: PathBuf,
+    secrets: PathBuf,
 }
 
 impl Config {
     /// Reads configuration from the environment.
     ///
-    /// Secrets have no defaults and no fallbacks. A deployment missing one fails
-    /// to start rather than starting in a state where it cannot authenticate
-    /// what it receives — this proxy is the authentication boundary, so running
-    /// without a secret would be worse than not running.
-    fn from_env() -> Result<Self, Missing> {
-        Ok(Self {
+    /// Nothing here is a secret any more: the file names them and the values are
+    /// read from a mounted directory. What remains has defaults, because a
+    /// missing listen address is an inconvenience where a missing secret would be
+    /// a proxy that cannot authenticate what it receives. The file itself has no
+    /// fallback — a deployment without one refuses to start.
+    fn from_env() -> Self {
+        Self {
             listen: optional("WEBHOOK_PROXY_LISTEN", "127.0.0.1:8080"),
             max_body: optional("WEBHOOK_PROXY_MAX_BODY", "1048576")
                 .parse()
@@ -89,18 +85,16 @@ impl Config {
                     .parse()
                     .unwrap_or(5_000),
             ),
-            github_secret: required("GITHUB_WEBHOOK_SECRET")?,
-            element_url: required("ELEMENT_WEBHOOK_URL")?,
-            element_room: required("ELEMENT_ROOM")?,
-        })
+            file: PathBuf::from(optional(
+                "WEBHOOK_PROXY_CONFIG",
+                "/etc/webhook-proxy/config.yaml",
+            )),
+            secrets: PathBuf::from(optional(
+                "WEBHOOK_PROXY_SECRETS_DIR",
+                "/etc/webhook-proxy/secrets",
+            )),
+        }
     }
-}
-
-fn required(name: &'static str) -> Result<String, Missing> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(Unstartable::Missing(name))
 }
 
 fn optional(name: &str, fallback: &str) -> String {
@@ -140,58 +134,66 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), Unstartable> {
-    let config = Config::from_env()?;
+    let config = Config::from_env();
 
-    let signatures = Arc::new(GithubSignatures::new(HashMap::from([(
-        SECRET.to_owned(),
-        config.github_secret.into_bytes(),
-    )])));
+    // Everything about who may send and who hears what comes from here. The file
+    // refuses itself if anything is wrong, naming the file and the field, so this
+    // adds nothing to its message.
+    let routing = Configuration::read(&config.file, &config.secrets)
+        .map_err(|why| Unstartable::Configuration(why.to_string()))?;
 
-    let room = DestinationId::new(&config.element_room).map_err(|blank| Unstartable::Unusable {
-        name: "ELEMENT_ROOM",
-        why: blank.to_string(),
-    })?;
+    // One verifier per mechanism, each holding every secret. Which Origin gets
+    // which is decided below, from what that Origin declared — never here, and
+    // never from anything in a request.
+    let secrets: HashMap<String, Vec<u8>> = routing
+        .secrets()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.as_bytes().to_vec()))
+        .collect();
+    let signing: Arc<dyn Proofs> = Arc::new(GithubSignatures::new(secrets.clone()));
+    let sharing: Arc<dyn Proofs> = Arc::new(SharedValues::new(secrets));
+
     let dispatcher: Arc<dyn Dispatcher> = Arc::new(
-        ElementNotices::new(
-            HashMap::from([(config.element_room.clone(), config.element_url)]),
-            config.timeout,
-        )
-        .map_err(|_| Unstartable::NoClient)?,
+        ElementNotices::new(routing.webhooks().clone(), config.timeout)
+            .map_err(|_| Unstartable::NoClient)?,
     );
 
-    let subscriptions = vec![Subscription::new(
-        Destination::new(room, DestinationKind::ChatRoom),
-        Filter::Everything,
-    )];
-
-    // Both names are consts in this file rather than configuration, so neither
-    // can be blank today. Reported rather than unwrapped all the same: the
-    // composition root is where a bad name becomes a refusal to start, and the
-    // moment either comes from a file (gc-ast.11) this is already the right
-    // shape. Same idiom as ELEMENT_ROOM above.
-    let origin_id = OriginId::new(ORIGIN).map_err(|blank| Unstartable::Unusable {
-        name: "the Origin identity",
-        why: blank.to_string(),
-    })?;
-    let secret_id = SecretId::new(SECRET).map_err(|blank| Unstartable::Unusable {
-        name: "the secret name",
-        why: blank.to_string(),
-    })?;
-    // Signed, because GitHub signs. A second mechanism is a configuration
-    // change, never a fallback this code could choose (gc-ast.2).
-    let origins = HashMap::from([(
-        ORIGIN.to_owned(),
-        Origin::new(origin_id, Verification::Signed { secret: secret_id }),
-    )]);
+    // The one place that maps a declaration onto what enforces it.
+    //
+    // Both matches are exhaustive, so every mechanism has exactly one verifier
+    // and one header, and every vocabulary exactly one translator. A new
+    // mechanism or a new sender cannot be added without the compiler stopping
+    // here and asking which. Bead gc-dy4.
+    let senders: HashMap<String, Sender> = routing
+        .origins()
+        .iter()
+        .map(|(path, declared)| {
+            let (proofs, presented) = match declared.origin.verify() {
+                Verification::Signed { .. } => (Arc::clone(&signing), SIGNATURE_HEADER),
+                Verification::Shared { .. } => (Arc::clone(&sharing), AUTHORIZATION_HEADER),
+            };
+            let translator: Arc<dyn Translator> = match declared.speaks {
+                Speaks::Github => Arc::new(GithubPayload),
+                Speaks::Alertmanager => Arc::new(AlertmanagerPayload),
+            };
+            (
+                path.clone(),
+                Sender {
+                    origin: declared.origin.clone(),
+                    proofs,
+                    translator,
+                    presented,
+                },
+            )
+        })
+        .collect();
 
     let inbound = Inbound::new(
-        signatures,
-        Arc::new(GithubPayload),
+        senders,
         dispatcher,
         Arc::new(SystemClock),
         Arc::new(RandomIds),
-        subscriptions,
-        origins,
+        routing.subscriptions().to_vec(),
     );
 
     let app = router(inbound, config.max_body).route("/health", get(health));

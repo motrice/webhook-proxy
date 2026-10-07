@@ -108,24 +108,26 @@ where it cannot authenticate what it receives.
 
 | Variable | Required | Meaning |
 | -------- | -------- | ------- |
-| `GITHUB_WEBHOOK_SECRET` | yes | the shared secret configured on the GitHub webhook |
-| `ELEMENT_WEBHOOK_URL` | yes | the hookshot webhook URL. A bearer credential — never commit it |
-| `ELEMENT_ROOM` | yes | the Destination identity, used in routing and in logs |
+| `WEBHOOK_PROXY_CONFIG` | no | default `/etc/webhook-proxy/config.yaml`; the routing file |
+| `WEBHOOK_PROXY_SECRETS_DIR` | no | default `/etc/webhook-proxy/secrets`; one file per named secret |
 | `WEBHOOK_PROXY_LISTEN` | no | default `127.0.0.1:8080`; `0.0.0.0:8080` in a container |
 | `WEBHOOK_PROXY_MAX_BODY` | no | default 1 MiB, refused before anything is verified or parsed |
 | `WEBHOOK_PROXY_TIMEOUT_MS` | no | default 5000, bounding each dispatch |
 
-Three of those are on their way out. Many senders, many rooms and overlapping
-routing rules do not fit in environment variables, and the point of a file is
-that a human reviews the routing as a diff. `deploy/config.example.yaml` is the
-shape that replaces them — `GITHUB_WEBHOOK_SECRET`, `ELEMENT_WEBHOOK_URL` and
-`ELEMENT_ROOM` become entries in it, with secret *names* in the file and values
-read from a mounted directory. The variables above still describe what runs
-today; bead `gc-ast.11` is what makes the file real.
+None of those is a secret, and none of them is policy. Who may send and who
+hears what live in `WEBHOOK_PROXY_CONFIG` — see `deploy/config.example.yaml` —
+because a human reviews routing as a diff rather than as a list of variables.
+Secrets are named in that file and read by name from `WEBHOOK_PROXY_SECRETS_DIR`,
+so no secret value appears in the file or in the environment.
 
-To run it against a real repository: start it with the three required variables
-set, expose the port to the internet however you normally would (`ssh -R`, a
-tunnel, or an Ingress), then add a webhook to the repository pointing at
+A deployment whose routing file is absent, unparseable, or names a secret with no
+value behind it exits non-zero before the socket is bound, naming the file and
+the path to the field. A broken deployment never looks healthy.
+
+To run it against a real repository: write a routing file and a secrets
+directory as `deploy/config.example.yaml` shows, start it pointing at them,
+expose the port to the internet however you normally would (`ssh -R`, a tunnel,
+or an Ingress), then add a webhook to the repository pointing at
 `https://<host>/webhook/github` with content type `application/json`, the same
 secret, and just the push event. Push something. The room should say who pushed
 what where; if it does not, `GET /health` tells you the process is alive and the
