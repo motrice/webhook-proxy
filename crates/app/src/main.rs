@@ -122,6 +122,24 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    // One argument, and only one, so there is no argument parser to go wrong.
+    // `check` validates the routing file and prints what it would route, which
+    // is what a reviewer runs on a pull request and what the operations
+    // repository's own pipeline runs. It opens no socket and reaches no network,
+    // so it is safe anywhere — including a pipeline with no cluster access.
+    if std::env::args().nth(1).as_deref() == Some("check") {
+        return match check() {
+            Ok(table) => {
+                print!("{table}");
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                eprintln!("webhook-proxy cannot start: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
@@ -131,6 +149,20 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Reads the routing file and says what it would route.
+///
+/// Exactly the same read the process does at start-up, so a file this accepts is
+/// a file the process will start with, and a file it refuses is one the process
+/// would refuse too. Sharing the path is the point: a check that validated
+/// something slightly different from what runs would be worse than no check.
+fn check() -> Result<String, Unstartable> {
+    let config = Config::from_env();
+    let routing = Configuration::read(&config.file, &config.secrets)
+        .map_err(|why| Unstartable::Configuration(why.to_string()))?;
+
+    Ok(routing.routing_table())
 }
 
 async fn run() -> Result<(), Unstartable> {
