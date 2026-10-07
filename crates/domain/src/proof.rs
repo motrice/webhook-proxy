@@ -1,27 +1,52 @@
-//! Proofs over a [`Delivery`](crate::Delivery)'s body.
+//! What a sender presents to show a [`Delivery`](crate::Delivery) is genuine.
 
-/// A signature over a Delivery's body.
+/// What a sender presented to show a Delivery is genuine.
 ///
-/// Deliberately length-agnostic and algorithm-agnostic: the domain compares
-/// signatures, it never computes them, so nothing here knows or cares that
-/// GitHub happens to use HMAC-SHA256.
-#[derive(Clone, PartialEq, Eq)]
+/// Deliberately length-agnostic and mechanism-agnostic: the domain compares
+/// proofs, it never computes them, so nothing here knows or cares that one
+/// sender digests the body while another presents a shared value as it stands.
+///
+/// Those two are not equally strong, and the domain is the wrong place to pretend
+/// otherwise — a proof computed over the body cannot be replayed against
+/// different content, and one that is merely presented can. What the domain can
+/// guarantee is that whichever it is, it is compared the same way and a
+/// [`VerifiedDelivery`](crate::VerifiedDelivery) exists only when it matched.
+///
+/// **No `PartialEq`, on purpose.** Deriving it would hand every caller a
+/// short-circuiting `==` that leaks where two proofs first differ, and the only
+/// thing standing between that and a timing oracle would be everybody remembering
+/// not to use it. Without the derive, [`Proof::matches`] is the only comparison
+/// that exists, and the wrong one does not compile:
+///
+/// ```compile_fail
+/// # use domain::Proof;
+/// let a = Proof::from_bytes([1, 2, 3]);
+/// let b = Proof::from_bytes([1, 2, 3]);
+/// let _ = a == b;
+/// ```
+#[derive(Clone)]
 pub struct Proof(Vec<u8>);
 
-/// A Delivery whose claimed signature did not match the computed one.
+/// A Delivery whose presented proof did not match the expected one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProofMismatch;
 
 impl Proof {
-    /// Takes a signature as raw bytes, however the sender encoded it.
+    /// Takes a proof as raw bytes, however the sender encoded it.
     #[must_use]
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self(bytes.into())
     }
 
-    /// Compares two signatures without leaking *where* they differ through
-    /// timing. Differing lengths are rejected immediately: a signature's
-    /// length is not secret, its contents are.
+    /// Compares two proofs without leaking *where* they differ through timing.
+    ///
+    /// Differing lengths are rejected immediately. For a proof computed over the
+    /// body that is free: its length is fixed by the algorithm and is not secret.
+    /// For a proof that is a shared value presented as it stands, the length *is*
+    /// the secret's length — acceptable because such values are generated at a
+    /// mandated minimum length, so knowing it tells an attacker nothing they
+    /// could not assume. If they ever become human-chosen, compare digests of
+    /// both sides instead, which makes this length-independent. Bead gc-ast.2.
     #[must_use]
     pub fn matches(&self, other: &Self) -> bool {
         if self.0.len() != other.0.len() {

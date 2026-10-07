@@ -26,7 +26,8 @@ that as the defect, ahead of anything about the code.
 
 | Term | Meaning | Not to be confused with |
 | ---- | ------- | ----------------------- |
-| **Origin** | An external system permitted to send us webhooks, together with the identity of the secret its signatures are checked against. GitHub is the first. | *Provider* — not used; pick Origin. |
+| **Origin** | An external system permitted to send us webhooks, together with how it proves a Delivery is genuine. GitHub is the first. | *Provider* — not used; pick Origin. |
+| **Verification** | How an Origin proves itself: `Signed`, where the Proof is computed over the Body and so is bound to what was sent, or `Shared`, where the Proof is a value shared in advance and presented as it stands. Each names the secret it uses. | A *choice made per request*. The mechanism is the Origin's, read from configuration; a sender presenting the weaker one to an Origin that declares the stronger is refused, never retried. Named for what the Proof is, not for the wire scheme — that word is the configuration file's. |
 | **Delivery** | One webhook as it arrived from an Origin: raw body bytes, headers, arrival time. Unverified by definition. | *Event* — a Delivery is a transport fact, an Event is a business fact. |
 | **Body** | A Delivery's payload exactly as it arrived, as raw bytes. Never a `String`: a signature covers the bytes that were sent, so re-encoding destroys the evidence. | *Event* — the Body is bytes, the Event is meaning. |
 | **Proof** | What a sender presents to show a Delivery is genuine, as raw bytes, independent of mechanism. The domain compares proofs; adapters produce them. | The *secret* — a Proof is presented, the value that produced or equals it is not. And a *signature*, which is one kind of Proof: a signature covers the Body, so replaying it with different content fails; a bearer token covers nothing, so it does not. |

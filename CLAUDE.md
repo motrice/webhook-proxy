@@ -170,12 +170,12 @@ in full. Three rules bind the code, and none of them is a preference:
 
 - **Never add a way to skip verification.** No flag, no environment variable, no
   test mode, no "just for local development". If a test needs to bypass it, the
-  test is wrong — inject a fake `Signatures` port instead.
+  test is wrong — inject a fake `Proofs` port instead.
 - **Fail closed.** An unknown Origin, an unreadable payload or an oversized body
   is refused. There is no path where uncertainty results in forwarding.
 - **Treat every field of an Event as attacker-influenced text.** Commit messages
-  and branch names come from whoever can push, not from the sender whose
-  signature we checked. Render them as text, never as markup.
+  and branch names come from whoever can push, not from the sender whose proof we
+  checked. Render them as text, never as markup.
 
 ## Commands
 

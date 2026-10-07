@@ -14,11 +14,44 @@ pub struct OriginId(String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretId(String);
 
+/// How an Origin proves a Delivery is genuine.
+///
+/// One variant per mechanism, which is what makes two things true without a
+/// check: an Origin cannot declare no mechanism, and it cannot declare two.
+///
+/// The mechanism belongs to the Origin and is read from configuration. It is
+/// never chosen by looking at the request — a sender presenting the weaker
+/// mechanism to an Origin that declares the stronger one is refused, not retried.
+/// Otherwise a downgrade would be something an attacker could ask for rather than
+/// something a reviewer has to approve. Bead gc-ast.2.
+///
+/// Named for what the proof *is* rather than for the wire scheme that carries it.
+/// `crates/architecture`'s purity test forbids transport vocabulary in this crate,
+/// and the words the operator-facing configuration uses for these two are exactly
+/// the kind it forbids — which is the right split anyway: the file names a wire
+/// mechanism, the domain names a property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verification {
+    /// The proof is computed over the Body, so it is bound to what was sent.
+    /// Replaying it against different content fails.
+    Signed {
+        /// Which secret produces it.
+        secret: SecretId,
+    },
+    /// The proof is a value shared in advance, presented as it stands. It shows
+    /// possession of that value and says nothing whatever about the Body, so a
+    /// replay with different content still verifies.
+    Shared {
+        /// Which secret it must equal.
+        secret: SecretId,
+    },
+}
+
 /// An external system permitted to send us webhooks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
     id: OriginId,
-    secret: SecretId,
+    verify: Verification,
 }
 
 impl OriginId {
@@ -64,11 +97,21 @@ impl SecretId {
     }
 }
 
-impl Origin {
-    /// Registers an Origin and the secret its signatures are checked against.
+impl Verification {
+    /// Which secret this mechanism uses.
     #[must_use]
-    pub fn new(id: OriginId, secret: SecretId) -> Self {
-        Self { id, secret }
+    pub fn secret(&self) -> &SecretId {
+        match self {
+            Self::Signed { secret } | Self::Shared { secret } => secret,
+        }
+    }
+}
+
+impl Origin {
+    /// Registers an Origin and how it proves a Delivery is genuine.
+    #[must_use]
+    pub fn new(id: OriginId, verify: Verification) -> Self {
+        Self { id, verify }
     }
 
     /// Which Origin this is.
@@ -77,16 +120,75 @@ impl Origin {
         &self.id
     }
 
-    /// Which secret to check its signatures against.
+    /// How it proves a Delivery is genuine.
+    #[must_use]
+    pub fn verify(&self) -> &Verification {
+        &self.verify
+    }
+
+    /// Which secret to check it against, whichever mechanism it declares.
     #[must_use]
     pub fn secret(&self) -> &SecretId {
-        &self.secret
+        self.verify.secret()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Origin, OriginId, SecretId};
+    use super::{Origin, OriginId, SecretId, Verification};
+
+    #[test]
+    fn an_origin_declares_how_it_proves_itself() {
+        // Not whether it proves itself — that is not a question an Origin can
+        // answer. Which mechanism, and the secret that mechanism uses.
+        let signing = Origin::new(
+            OriginId::new("a-forge").expect("an identity"),
+            Verification::Signed {
+                secret: SecretId::new("its-secret").expect("a name"),
+            },
+        );
+        let sharing = Origin::new(
+            OriginId::new("a-monitor").expect("an identity"),
+            Verification::Shared {
+                secret: SecretId::new("its-value").expect("a name"),
+            },
+        );
+
+        assert_eq!(signing.secret().as_str(), "its-secret");
+        assert_eq!(sharing.secret().as_str(), "its-value");
+        assert!(matches!(signing.verify(), Verification::Signed { .. }));
+        assert!(matches!(sharing.verify(), Verification::Shared { .. }));
+    }
+
+    #[test]
+    fn no_origin_can_declare_no_mechanism_or_two() {
+        // Both halves are the type's doing rather than a check's. `verify()`
+        // returns a Verification and not an Option, so there is no Origin without
+        // one; and a Verification is one variant, so there is no Origin with two.
+        // This test exists to say that out loud — the next person should not have
+        // to infer it from the absence of a guard.
+        let origin = Origin::new(
+            OriginId::new("a-forge").expect("an identity"),
+            Verification::Signed {
+                secret: SecretId::new("its-secret").expect("a name"),
+            },
+        );
+
+        let _: &Verification = origin.verify();
+    }
+
+    #[test]
+    fn the_same_secret_under_two_mechanisms_is_two_different_declarations() {
+        // The mechanism is part of what an Origin *is*. If these compared equal,
+        // a configuration change from one to the other could pass review as a
+        // no-op — which is the downgrade gc-ast.2 exists to prevent.
+        let secret = || SecretId::new("shared").expect("a name");
+
+        assert_ne!(
+            Verification::Signed { secret: secret() },
+            Verification::Shared { secret: secret() }
+        );
+    }
 
     #[test]
     fn an_origin_identity_cannot_be_blank() {
@@ -125,7 +227,9 @@ mod tests {
     fn an_origin_names_its_secret_rather_than_carrying_it() {
         let origin = Origin::new(
             OriginId::new("github").expect("a non-blank origin identity"),
-            SecretId::new("github-webhook-secret").expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new("github-webhook-secret").expect("a non-blank secret name"),
+            },
         );
 
         // The point is structural, not textual: there is no constructor, field
@@ -156,7 +260,9 @@ mod tests {
     fn debug_output_shows_only_names_so_a_log_line_cannot_leak_a_secret() {
         let origin = Origin::new(
             OriginId::new("github").expect("a non-blank origin identity"),
-            SecretId::new("github-webhook-secret").expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new("github-webhook-secret").expect("a non-blank secret name"),
+            },
         );
 
         let printed = format!("{origin:?}");

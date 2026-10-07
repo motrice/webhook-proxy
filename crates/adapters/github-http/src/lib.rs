@@ -181,7 +181,7 @@ mod tests {
     use domain::{
         Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Event, Filter,
         Origin, OriginId, Proof, Pusher, RepositoryName, SecretId, Subscription, Timestamp,
-        VerifiedDelivery,
+        Verification, VerifiedDelivery,
     };
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
@@ -365,7 +365,9 @@ mod tests {
             "github".to_owned(),
             Origin::new(
                 OriginId::new("github").expect("a non-blank origin identity"),
-                SecretId::new("a-secret").expect("a non-blank secret name"),
+                Verification::Signed {
+                    secret: SecretId::new("a-secret").expect("a non-blank secret name"),
+                },
             ),
         )
     }

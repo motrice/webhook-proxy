@@ -188,7 +188,7 @@ impl Origin {
 #[cfg(test)]
 mod tests {
     use super::{Body, Delivery, DeliveryId};
-    use crate::{Origin, OriginId, Proof, SecretId, Timestamp};
+    use crate::{Origin, OriginId, Proof, SecretId, Timestamp, Verification};
 
     fn an_origin() -> OriginId {
         OriginId::new("github").expect("a non-blank origin identity")
@@ -258,7 +258,9 @@ mod tests {
     fn an_origin_recognises_only_deliveries_that_claim_to_be_from_it() {
         let origin = Origin::new(
             an_origin(),
-            SecretId::new("github-webhook-secret").expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new("github-webhook-secret").expect("a non-blank secret name"),
+            },
         );
 
         assert!(origin.sent(&delivery_of(b"x".to_vec())));
