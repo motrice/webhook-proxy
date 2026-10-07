@@ -124,6 +124,44 @@ A deployment whose routing file is absent, unparseable, or names a secret with n
 value behind it exits non-zero before the socket is bound, naming the file and
 the path to the field. A broken deployment never looks healthy.
 
+### Checking a routing file before deploying it
+
+```bash
+webhook-proxy check          # reads WEBHOOK_PROXY_CONFIG and _SECRETS_DIR
+```
+
+It performs exactly the read the process does at start-up, then prints what the
+file would actually route:
+
+```text
+senders
+  /webhook/alertmanager  presents a shared value, speaks alertmanager
+  /webhook/github  signs its body, speaks github
+
+rooms  (* marks a label only a sender can supply)
+  audit-room
+    - everything
+  devsecops-room
+    - branch=main origin=github repository=motrice/webhook-proxy
+    - origin=alertmanager severity=critical
+  platform-room
+    - namespace*=platform origin=alertmanager
+
+2 sender(s), 3 room(s), 4 rule(s), 5 secret(s) present
+```
+
+**The operations repository's pipeline should run this on every change to the
+file**, and a reviewer should read its output on the pull request. It opens no
+socket and reaches no network, so it is safe in a pipeline with no cluster
+access, and it prints no secret value — only how many were found.
+
+It exists because the most expensive mistake this file can carry cannot be
+rejected. A rule may name any label, and must: an alert carries whatever the
+sender attached, so `namespace` cannot be validated against anything. A mistyped
+`repositry` is therefore a perfectly valid file describing a room that will never
+hear anything. The table shows that as `repositry*=…` and as
+`(nothing selects this room)` — obvious to a person, impossible as a rule.
+
 To run it against a real repository: write a routing file and a secrets
 directory as `deploy/config.example.yaml` shows, start it pointing at them,
 expose the port to the internet however you normally would (`ssh -R`, a tunnel,

@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use domain::{
@@ -497,6 +498,70 @@ impl Configuration {
         Ok(id)
     }
 
+    /// The routing this file actually produces, for a person to read.
+    ///
+    /// The honest substitute for a validation that cannot exist. gc-ast.1 wanted
+    /// configuration to reject a matcher name no Event could ever offer, but an
+    /// alert carries whatever the sender attached, so `namespace` cannot be
+    /// validated against anything and rejecting it would make the file unable to
+    /// express the main thing it is for.
+    ///
+    /// So instead of guessing at intent, this shows the consequence. A typo
+    /// appears as a room with no rules, or as a rule every one of whose names
+    /// only a sender can supply — both obvious to someone reading a pull
+    /// request, neither expressible as a rule that could refuse the file.
+    ///
+    /// No secret value appears, only how many were found.
+    #[must_use]
+    pub fn routing_table(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str("senders\n");
+        let mut senders: Vec<_> = self.origins.iter().collect();
+        senders.sort_by_key(|(path, _)| path.as_str());
+        for (path, declared) in senders {
+            let how = match declared.origin.verify() {
+                Verification::Signed { .. } => "signs its body",
+                Verification::Shared { .. } => "presents a shared value",
+            };
+            let speaks = match declared.speaks {
+                Speaks::Github => "github",
+                Speaks::Alertmanager => "alertmanager",
+            };
+            let _ = writeln!(out, "  /webhook/{path}  {how}, speaks {speaks}");
+        }
+
+        out.push_str("\nrooms  (* marks a label only a sender can supply)\n");
+        let mut rooms: Vec<&String> = self.webhooks.keys().collect();
+        rooms.sort();
+        for room in rooms {
+            let _ = writeln!(out, "  {room}");
+            let mut selected = 0usize;
+            for subscription in &self.subscriptions {
+                if subscription.destination().id().as_str() != room {
+                    continue;
+                }
+                selected += 1;
+                let _ = writeln!(out, "    - {}", describe(subscription.filter()));
+            }
+            if selected == 0 {
+                // The failure this exists to make visible.
+                out.push_str("    (nothing selects this room)\n");
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "\n{} sender(s), {} room(s), {} rule(s), {} secret(s) present",
+            self.origins.len(),
+            self.webhooks.len(),
+            self.subscriptions.len(),
+            self.secrets.len()
+        );
+
+        out
+    }
+
     /// Every Origin, by the identity a request names.
     #[must_use]
     pub fn origins(&self) -> &HashMap<String, Declared> {
@@ -519,6 +584,23 @@ impl Configuration {
     #[must_use]
     pub fn webhooks(&self) -> &HashMap<String, String> {
         &self.webhooks
+    }
+}
+
+/// One rule, as the labels it requires.
+fn describe(filter: &Filter) -> String {
+    match filter {
+        Filter::Everything => "everything".to_owned(),
+        Filter::Labelled(required) => required
+            .iter()
+            .map(|(name, value)| {
+                // The marker is the whole point: a name the system never produces
+                // can only match if a sender chooses to send it.
+                let mark = if name.is_projected() { "" } else { "*" };
+                format!("{}{mark}={}", name.as_str(), value.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -752,6 +834,99 @@ subscriptions:
         let printed = format!("{config:?}");
         assert!(!printed.contains("SUPERSECRETHOOKID"), "{printed}");
         assert!(!printed.contains("shhh"), "{printed}");
+    }
+
+    // ---- the routing table ----------------------------------------------
+
+    #[test]
+    fn the_table_shows_what_the_published_example_actually_routes() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        secrets_for_the_example(dir.path());
+        let config = Configuration::read(Path::new(EXAMPLE), dir.path()).expect("it parses");
+
+        let table = config.routing_table();
+
+        // Each sender, by the path it answers on and how it proves itself.
+        assert!(
+            table.contains("/webhook/github  signs its body, speaks github"),
+            "{table}"
+        );
+        assert!(
+            table.contains("/webhook/alertmanager  presents a shared value, speaks alertmanager"),
+            "{table}"
+        );
+
+        // Each room with the rules that select it.
+        assert!(table.contains("devsecops-room"), "{table}");
+        // Alphabetical, because Labels is a map and a table a reader compares
+        // between deploys must not reorder itself.
+        assert!(
+            table.contains("- branch=main origin=github repository=motrice/webhook-proxy"),
+            "{table}"
+        );
+        assert!(table.contains("everything"), "{table}");
+
+        assert!(
+            table.contains("2 sender(s), 3 room(s), 4 rule(s), 5 secret(s) present"),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn a_label_only_a_sender_can_supply_is_marked() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        secrets_for_the_example(dir.path());
+        let config = Configuration::read(Path::new(EXAMPLE), dir.path()).expect("it parses");
+
+        let table = config.routing_table();
+
+        // namespace is the sender's, so it carries the marker; origin and
+        // severity are ours, so they do not.
+        assert!(table.contains("namespace*=platform"), "{table}");
+        assert!(table.contains("severity=critical"), "{table}");
+        assert!(!table.contains("severity*="), "{table}");
+        assert!(!table.contains("origin*="), "{table}");
+    }
+
+    #[test]
+    fn a_room_nothing_selects_says_so() {
+        // The failure this whole subcommand exists to make visible: a typo in a
+        // rule leaves a room that will never hear anything, and nothing about the
+        // file is invalid.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        fs::write(dir.path().join("b-url"), "https://rooms.example/hook/B").expect("writable");
+
+        let yaml = sound().replace(
+            "destinations:\n  - id: a-room",
+            "destinations:\n  - id: forgotten-room\n    kind: chat_room\n    webhook:\n      secret: b-url\n  - id: a-room",
+        );
+        let file = written(dir.path(), &yaml);
+        let config = Configuration::read(&file, dir.path()).expect("it parses");
+
+        let table = config.routing_table();
+
+        assert!(table.contains("forgotten-room"), "{table}");
+        assert!(table.contains("(nothing selects this room)"), "{table}");
+        // And the room that is selected does not say it.
+        let after = table.split("a-room").nth(1).expect("a-room appears");
+        assert!(!after.starts_with("\n    (nothing"), "{table}");
+    }
+
+    #[test]
+    fn the_table_never_prints_a_secret_value() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        let file = written(dir.path(), &sound());
+        let config = Configuration::read(&file, dir.path()).expect("it parses");
+
+        let table = config.routing_table();
+
+        assert!(!table.contains("SUPERSECRETHOOKID"), "{table}");
+        assert!(!table.contains("shhh"), "{table}");
+        assert!(!table.contains("://"), "{table}");
+        // The count is fine; the values are not.
+        assert!(table.contains("2 secret(s) present"), "{table}");
     }
 
     // ---- what a human will get wrong -------------------------------------

@@ -29,6 +29,33 @@ use crate::event::present;
 /// Reserved: see [`RESERVED`].
 pub const ORIGIN: &str = "origin";
 
+/// The label a forge Event is routed by when a rule names a repository.
+pub const REPOSITORY: &str = "repository";
+
+/// The label a forge Event is routed by when a rule names a branch.
+pub const BRANCH: &str = "branch";
+
+/// The label an Alert is routed by when a rule names an urgency.
+pub const SEVERITY: &str = "severity";
+
+/// The label an Alert is routed by when a rule names firing or resolved.
+pub const STATUS: &str = "status";
+
+/// Every label name this system produces itself.
+///
+/// The point of the list is what is *not* on it. A rule may name any label and
+/// must be able to — an alert carries whatever the sender attached, so
+/// `namespace` or `team` cannot be validated against anything. But a rule naming
+/// something absent from here can only ever be satisfied by a sender choosing to
+/// send it, and that is worth saying to whoever reads a routing file: it is the
+/// difference between a rule that is narrow and a rule that is a typo. Bead
+/// gc-w3j prints it.
+///
+/// A test constructs one of every Event and asserts that every label it offers
+/// appears here, so a new projected label cannot be added without this list
+/// learning about it.
+pub const PROJECTED: &[&str] = &[ORIGIN, REPOSITORY, BRANCH, SEVERITY, STATUS];
+
 /// Label names only this crate may set.
 ///
 /// A sender that could set one of these could lie about something the system
@@ -76,6 +103,15 @@ impl LabelName {
     /// panic that could never fire.
     pub(crate) fn known(name: &'static str) -> Self {
         Self(name.to_owned())
+    }
+
+    /// Whether this is a name the system produces itself.
+    ///
+    /// `false` means a rule naming it can only be satisfied by a sender choosing
+    /// to send it — see [`PROJECTED`].
+    #[must_use]
+    pub fn is_projected(&self) -> bool {
+        PROJECTED.contains(&self.0.as_str())
     }
 
     /// The name as text.
@@ -208,6 +244,63 @@ mod tests {
         let names: Vec<&str> = set.iter().map(|(name, _)| name.as_str()).collect();
 
         assert_eq!(names, vec!["alertname", "namespace", "service"]);
+    }
+
+    #[test]
+    fn every_label_the_system_projects_is_listed_as_projected() {
+        // Completeness, checked rather than trusted: a new projected label cannot
+        // be added without this failing, because the list is what tells a reader
+        // which of their matcher names can never match on its own.
+        use crate::{
+            AlertId, AlertStatus, BranchName, Commit, CommitId, Event, Permalink, Pusher,
+            RepositoryName, Severity, Summary, Timestamp,
+        };
+
+        let push = Event::PushedCommits {
+            repository: RepositoryName::new("r").expect("a name"),
+            branch: BranchName::new("b").expect("a name"),
+            pusher: Pusher::new("p").expect("a name"),
+            commits: vec![Commit::new(
+                CommitId::new("c").expect("an id"),
+                Summary::new("s").expect("a summary"),
+            )],
+            permalink: Some(Permalink::new("https://forge.example/x").expect("a reference")),
+        };
+        let deletion = Event::DeletedBranch {
+            repository: RepositoryName::new("r").expect("a name"),
+            branch: BranchName::new("b").expect("a name"),
+            pusher: Pusher::new("p").expect("a name"),
+        };
+        let alert = Event::Alert {
+            id: AlertId::new("a").expect("an identity"),
+            severity: Severity::Critical,
+            status: AlertStatus::Firing,
+            summary: Summary::new("s").expect("a summary"),
+            // No stored labels, so only what the Event projects is left.
+            labels: Labels::none(),
+            started: Timestamp::from_millis_since_epoch(0),
+            permalink: None,
+        };
+
+        for event in [push, deletion, alert] {
+            for (name, _) in event.labels().iter() {
+                assert!(
+                    name.is_projected(),
+                    "{} is projected by an Event but missing from PROJECTED",
+                    name.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_a_sender_invented_is_not_projected() {
+        for invented in ["namespace", "service", "team", "alertname"] {
+            assert!(
+                !LabelName::new(invented).expect("a name").is_projected(),
+                "{invented}"
+            );
+        }
     }
 
     #[test]

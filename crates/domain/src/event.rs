@@ -1,7 +1,7 @@
 //! What happened, stated without reference to whoever told us about it.
 
 use crate::alert::{AlertId, AlertStatus, Severity};
-use crate::label::{LabelName, LabelValue, Labels};
+use crate::label::{BRANCH, LabelName, LabelValue, Labels, REPOSITORY, SEVERITY, STATUS};
 use crate::time::Timestamp;
 
 /// A value that carries meaning may not be blank. Carries the concept that was
@@ -142,18 +142,6 @@ pub enum Event {
         permalink: Option<Permalink>,
     },
 }
-
-/// The label a rule names to select alerts by urgency.
-const SEVERITY: &str = "severity";
-
-/// The label a rule names to select firing or resolved alerts.
-const STATUS: &str = "status";
-
-/// The label a forge Event is routed by when a rule names a repository.
-const REPOSITORY: &str = "repository";
-
-/// The label a forge Event is routed by when a rule names a branch.
-const BRANCH: &str = "branch";
 
 impl Event {
     /// The labels this can be routed by.

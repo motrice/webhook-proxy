@@ -557,3 +557,167 @@ async fn an_absent_routing_file_stops_the_process_rather_than_starting_empty() {
 
     assert!(why.contains("absent.yaml"), "{why}");
 }
+
+/// Runs the built binary's `check`, with no listener and no network.
+fn check(env: &HashMap<&'static str, String>) -> (bool, String, String) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_app"));
+    command.arg("check").env_clear();
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let done = command.output().expect("the binary runs");
+    (
+        done.status.success(),
+        String::from_utf8_lossy(&done.stdout).into_owned(),
+        String::from_utf8_lossy(&done.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn check_prints_what_the_published_example_would_route() {
+    // The published example, read by the binary an operator would run. Nothing
+    // else parses that file in a deployment, so this is what stops it rotting.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    for name in [
+        "github-webhook-secret",
+        "alertmanager-token",
+        "devsecops-room-url",
+        "platform-room-url",
+        "audit-room-url",
+    ] {
+        fs::write(dir.path().join(name), format!("not-real-{name}")).expect("writable");
+    }
+
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../deploy/config.example.yaml"
+            )
+            .to_owned(),
+        ),
+        (
+            "WEBHOOK_PROXY_SECRETS_DIR",
+            dir.path().to_str().expect("a utf-8 path").to_owned(),
+        ),
+    ]);
+
+    let (ok, out, err) = check(&env);
+
+    assert!(ok, "check refused the published example: {err}{out}");
+    assert!(out.contains("/webhook/github"), "{out}");
+    assert!(out.contains("/webhook/alertmanager"), "{out}");
+    assert!(out.contains("namespace*=platform"), "{out}");
+    assert!(out.contains("5 secret(s) present"), "{out}");
+    // Never a value, in the output a reviewer pastes into a pull request.
+    assert!(!out.contains("not-real-"), "{out}");
+}
+
+#[test]
+fn check_refuses_a_file_the_process_would_refuse_and_says_where() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("config.yaml");
+    fs::write(
+        &file,
+        "version: 1
+origins:
+  - id: a-forge
+    speaks: github
+    verify:
+      hmac_sha256:
+        secret: a-secret
+destinations:
+  - id: a-room
+    kind: chat_room
+    webhook:
+      secret: a-url
+subscriptions:
+  - destination: typo-room
+    match:
+      origin: a-forge
+",
+    )
+    .expect("writable");
+    fs::write(dir.path().join("a-secret"), "shhh").expect("writable");
+    fs::write(dir.path().join("a-url"), "http://127.0.0.1:1/hook").expect("writable");
+
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            file.to_str().expect("a utf-8 path").to_owned(),
+        ),
+        (
+            "WEBHOOK_PROXY_SECRETS_DIR",
+            dir.path().to_str().expect("a utf-8 path").to_owned(),
+        ),
+    ]);
+
+    let (ok, _out, err) = check(&env);
+
+    assert!(!ok, "check accepted a file naming an undeclared room");
+    assert!(err.contains("config.yaml"), "{err}");
+    assert!(err.contains("subscriptions[0].destination"), "{err}");
+    assert!(err.contains("typo-room"), "{err}");
+    assert!(!err.contains("shhh"), "{err}");
+}
+
+#[test]
+fn check_shows_a_room_that_a_typo_left_unreachable() {
+    // The case no validation rule could catch: the file is entirely valid, and a
+    // room will simply never hear anything. Visible as a line in a pull request.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("config.yaml");
+    fs::write(
+        &file,
+        "version: 1
+origins:
+  - id: a-forge
+    speaks: github
+    verify:
+      hmac_sha256:
+        secret: a-secret
+destinations:
+  - id: watched-room
+    kind: chat_room
+    webhook:
+      secret: a-url
+  - id: forgotten-room
+    kind: chat_room
+    webhook:
+      secret: b-url
+subscriptions:
+  - destination: watched-room
+    match:
+      repositry: motrice/webhook-proxy
+",
+    )
+    .expect("writable");
+    for (name, value) in [
+        ("a-secret", "shhh"),
+        ("a-url", "http://127.0.0.1:1/a"),
+        ("b-url", "http://127.0.0.1:1/b"),
+    ] {
+        fs::write(dir.path().join(name), value).expect("writable");
+    }
+
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            file.to_str().expect("a utf-8 path").to_owned(),
+        ),
+        (
+            "WEBHOOK_PROXY_SECRETS_DIR",
+            dir.path().to_str().expect("a utf-8 path").to_owned(),
+        ),
+    ]);
+
+    let (ok, out, err) = check(&env);
+
+    // Valid, so it starts. And useless, which only the table can tell you.
+    assert!(ok, "{err}{out}");
+    assert!(out.contains("(nothing selects this room)"), "{out}");
+    // And the typo itself: a name no Event ever offers, so it can only match if
+    // a sender chooses to send it — which a forge never will.
+    assert!(out.contains("repositry*="), "{out}");
+}
