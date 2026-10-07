@@ -1,0 +1,21 @@
+[package]
+name = "alertmanager-payload"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain" }
+application = { path = "../../application" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Alertmanager sends startsAt as RFC 3339, and an Alert carries when the sender
+# says it began. That is a different fact from when we received it, so the
+# arrival time is not a substitute. Date arithmetic with offsets and leap years
+# is exactly what a library should do rather than this crate.
+time = { version = "0.3", features = ["parsing"] }
+
+[lints]
+workspace = true

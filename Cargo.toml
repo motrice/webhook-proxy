@@ -10,6 +10,7 @@ resolver = "3"
 members = [
     "crates/domain",
     "crates/application",
+    "crates/adapters/alertmanager-payload",
     "crates/adapters/element-notices",
     "crates/adapters/github-http",
     "crates/adapters/github-payload",

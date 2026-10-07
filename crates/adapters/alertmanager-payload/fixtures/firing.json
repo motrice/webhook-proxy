@@ -1,0 +1,61 @@
+{
+  "receiver": "webhook-proxy",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighLatency",
+        "severity": "critical",
+        "namespace": "prod",
+        "service": "api"
+      },
+      "annotations": {
+        "summary": "api latency above target\nsecond line that must not travel",
+        "description": "p99 has been over 500ms for 10 minutes",
+        "runbook_url": "https://runbooks.example/high-latency"
+      },
+      "startsAt": "2026-10-07T09:15:00.000Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://prometheus.example/graph?g0.expr=latency",
+      "fingerprint": "7b1a177c8d03f9e9"
+    },
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "DiskFilling",
+        "namespace": "prod",
+        "service": "api"
+      },
+      "annotations": {
+        "description": "only a description, no summary annotation"
+      },
+      "startsAt": "2026-10-07T09:16:30.500Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "",
+      "fingerprint": "0adf246e0adf246e"
+    },
+    {
+      "status": "resolved",
+      "labels": {
+        "alertname": "CertExpiring",
+        "severity": "page-the-duty-officer",
+        "namespace": "platform"
+      },
+      "annotations": {
+        "summary": "<b>cert</b> expires soon — see [here](https://evil.example)"
+      },
+      "startsAt": "2026-10-06T22:00:00+02:00",
+      "endsAt": "2026-10-07T08:00:00+02:00",
+      "generatorURL": "https://prometheus.example/graph?g0.expr=cert",
+      "fingerprint": "6113728f27ae82c7"
+    }
+  ],
+  "groupLabels": { "alertname": "HighLatency" },
+  "commonLabels": { "namespace": "prod" },
+  "commonAnnotations": {},
+  "externalURL": "https://alertmanager.example",
+  "version": "4",
+  "groupKey": "{}:{alertname=\"HighLatency\"}",
+  "truncatedAlerts": 0
+}
