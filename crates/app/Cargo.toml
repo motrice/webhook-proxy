@@ -13,6 +13,9 @@ element-notices = { path = "../adapters/element-notices" }
 inbound-http = { path = "../adapters/inbound-http" }
 github-payload = { path = "../adapters/github-payload" }
 github-signatures = { path = "../adapters/github-signatures" }
+shared-values = { path = "../adapters/shared-values" }
+alertmanager-payload = { path = "../adapters/alertmanager-payload" }
+yaml-config = { path = "../adapters/yaml-config" }
 system = { path = "../adapters/system" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
@@ -20,6 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
+# Each acceptance test writes its own routing file and secrets directory.
+tempfile = "3"
 # The acceptance test drives the built binary over real HTTP, and stands up a
 # stub hookshot to receive what comes out the other side.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

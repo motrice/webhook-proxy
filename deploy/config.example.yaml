@@ -33,6 +33,11 @@ version: 1
 origins:
   # Signs the body, so the proof is bound to what was sent.
   - id: github
+    # Which vocabulary this sender speaks, so the right translation is applied.
+    # Separate from `verify` on purpose: how a sender proves itself and what
+    # shape it sends are independent, and a sender that signed an Alertmanager
+    # notification would otherwise be untranslatable with nothing saying why.
+    speaks: github
     verify:
       hmac_sha256:
         secret: github-webhook-secret
@@ -41,6 +46,7 @@ origins:
   # nothing about the payload. Weaker, deliberately accepted, and the cost is
   # written down in gc-ast.2.
   - id: alertmanager
+    speaks: alertmanager
     verify:
       bearer:
         secret: alertmanager-token

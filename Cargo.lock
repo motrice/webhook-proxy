@@ -26,6 +26,7 @@ dependencies = [
 name = "app"
 version = "0.0.0"
 dependencies = [
+ "alertmanager-payload",
  "application",
  "axum",
  "domain",
@@ -35,10 +36,13 @@ dependencies = [
  "inbound-http",
  "reqwest",
  "serde_json",
+ "shared-values",
  "system",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "yaml-config",
 ]
 
 [[package]]

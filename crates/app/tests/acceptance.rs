@@ -12,6 +12,7 @@
 //! pass unnoticed.
 
 use std::collections::HashMap;
+use std::fs;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +35,19 @@ const DELETION_SIGNATURE: &str =
     include_str!("../../adapters/github-signatures/fixtures/branch-delete.signature");
 
 const ROOM: &str = "devsecops-room";
+const PLATFORM: &str = "platform-room";
+
+/// The value the monitoring sender shares. Long enough to be a real one, and
+/// obviously not.
+const TOKEN: &str = "not-a-real-token-but-long-enough-to-look-like-one";
+
+/// A real Alertmanager notification: three alerts, deliberately matching two
+/// rooms, one room, and no room respectively.
+const NOTIFICATION: &[u8] =
+    include_bytes!("../../adapters/alertmanager-payload/fixtures/firing.json");
+
+/// What the stub hookshot recorded: which room, and the body it was sent.
+type Notices = Arc<Mutex<Vec<(String, String)>>>;
 
 /// Kills the child when the test ends, however it ends.
 #[derive(Debug)]
@@ -51,14 +65,18 @@ impl Drop for Proxy {
 }
 
 /// A stub hookshot. Returns its URL and the bodies it was sent.
-async fn hookshot() -> (String, Arc<Mutex<Vec<String>>>) {
-    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+async fn hookshot() -> (String, Notices) {
+    // Which room received what, not just what was received: a test that cannot
+    // tell the rooms apart cannot say that a rule selected the right one.
+    let seen: Notices = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .route(
             "/hook/{id}",
             post(
-                |State(seen): State<Arc<Mutex<Vec<String>>>>, body: String| async move {
-                    seen.lock().expect("not poisoned").push(body);
+                |State(seen): State<Notices>,
+                 axum::extract::Path(id): axum::extract::Path<String>,
+                 body: String| async move {
+                    seen.lock().expect("not poisoned").push((id, body));
                     (StatusCode::OK, r#"{"ok":true}"#)
                 },
             ),
@@ -73,7 +91,9 @@ async fn hookshot() -> (String, Arc<Mutex<Vec<String>>>) {
         axum::serve(listener, app).await.expect("the stub serves");
     });
 
-    (format!("http://{address}/hook/SECRETHOOKID"), seen)
+    // The base; each room's own address is this plus its identity, so the stub
+    // can say which rule selected it.
+    (format!("http://{address}/hook"), seen)
 }
 
 /// Starts the binary and waits until it says which port it took.
@@ -116,133 +136,348 @@ async fn start(extra: HashMap<&str, String>) -> Result<Proxy, String> {
     Ok(Proxy { child, address })
 }
 
-fn configured(url: &str) -> HashMap<&'static str, String> {
-    HashMap::from([
-        ("GITHUB_WEBHOOK_SECRET", SECRET.to_owned()),
-        ("ELEMENT_WEBHOOK_URL", url.to_owned()),
-        ("ELEMENT_ROOM", ROOM.to_owned()),
-    ])
+/// The routing this deployment is given, written where the binary will find it.
+///
+/// Two senders on two mechanisms and three rules, because that is the shape a
+/// reviewer has to believe. The `TempDir` is returned so the files outlive the
+/// call: dropping it would delete them before the binary read them.
+fn configured(base: &str) -> (tempfile::TempDir, HashMap<&'static str, String>) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir(&secrets).expect("a writable temporary directory");
+
+    for (name, value) in [
+        ("github-webhook-secret", SECRET.to_owned()),
+        ("alertmanager-token", TOKEN.to_owned()),
+        ("devsecops-room-url", format!("{base}/{ROOM}")),
+        ("platform-room-url", format!("{base}/{PLATFORM}")),
+    ] {
+        fs::write(secrets.join(name), value).expect("a writable temporary directory");
+    }
+
+    let file = dir.path().join("config.yaml");
+    fs::write(
+        &file,
+        format!(
+            "version: 1
+origins:
+  - id: github
+    speaks: github
+    verify:
+      hmac_sha256:
+        secret: github-webhook-secret
+  - id: alertmanager
+    speaks: alertmanager
+    verify:
+      bearer:
+        secret: alertmanager-token
+destinations:
+  - id: {ROOM}
+    kind: chat_room
+    webhook:
+      secret: devsecops-room-url
+  - id: {PLATFORM}
+    kind: chat_room
+    webhook:
+      secret: platform-room-url
+subscriptions:
+  - destination: {ROOM}
+    match:
+      origin: github
+  - destination: {ROOM}
+    match:
+      origin: alertmanager
+      severity: critical
+  - destination: {PLATFORM}
+    match:
+      origin: alertmanager
+      namespace: prod
+"
+        ),
+    )
+    .expect("a writable temporary directory");
+
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            file.to_str().expect("a utf-8 path").to_owned(),
+        ),
+        (
+            "WEBHOOK_PROXY_SECRETS_DIR",
+            secrets.to_str().expect("a utf-8 path").to_owned(),
+        ),
+    ]);
+    (dir, env)
+}
+
+/// What a sender presents, and under which header.
+enum Credential<'a> {
+    /// A signature over the body.
+    Signature(&'a str),
+    /// A value shared in advance.
+    Shared(&'a str),
+    /// Nothing at all.
+    None,
+}
+
+async fn post_as(
+    address: &str,
+    sender: &str,
+    credential: Credential<'_>,
+    body: &[u8],
+) -> StatusCode {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(format!("http://{address}/webhook/{sender}"))
+        .header("content-type", "application/json")
+        .body(body.to_vec());
+    request = match credential {
+        Credential::Signature(value) => request.header("X-Hub-Signature-256", value),
+        Credential::Shared(value) => request.header("Authorization", format!("Bearer {value}")),
+        Credential::None => request,
+    };
+
+    request.send().await.expect("the proxy answers").status()
 }
 
 async fn post_webhook(address: &str, signature: Option<&str>, body: &[u8]) -> StatusCode {
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post(format!("http://{address}/webhook/github"))
-        .header("content-type", "application/json")
-        .body(body.to_vec());
-    if let Some(value) = signature {
-        request = request.header("X-Hub-Signature-256", value);
-    }
-
-    request.send().await.expect("the proxy answers").status()
+    let credential = signature.map_or(Credential::None, Credential::Signature);
+    post_as(address, "github", credential, body).await
 }
 
 /// The stub is answered asynchronously, so give it a moment — bounded, and
 /// polled rather than slept through, so a working path is fast and a broken one
 /// still fails.
-async fn delivered(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+/// Waits until at least `wanted` notices have arrived, or gives up.
+///
+/// Takes the count rather than waiting for the first, because a test asserting
+/// that three alerts reached two rooms has to wait for all of them: returning on
+/// the first would make the assertion race the dispatcher.
+async fn delivered(
+    seen: &Arc<Mutex<Vec<(String, String)>>>,
+    wanted: usize,
+) -> Vec<(String, String)> {
     for _ in 0..50 {
         let received = seen.lock().expect("not poisoned").clone();
-        if !received.is_empty() {
+        if received.len() >= wanted {
             return received;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    Vec::new()
+    seen.lock().expect("not poisoned").clone()
+}
+
+/// What one room was told, as text.
+fn told(received: &[(String, String)], room: &str) -> Vec<String> {
+    received
+        .iter()
+        .filter(|(id, _)| id == room)
+        .map(|(_, body)| {
+            let sent: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+            sent["text"].as_str().expect("a text field").to_owned()
+        })
+        .collect()
 }
 
 #[tokio::test]
-async fn a_signed_push_reaches_the_room() {
-    let (url, seen) = hookshot().await;
-    let proxy = start(configured(&url)).await.expect("the proxy starts");
+async fn two_senders_prove_themselves_two_ways_through_one_front_door() {
+    // The test a reviewer reads to believe this epic. One deployment, two
+    // Origins, two mechanisms, and neither accepts the other's credential.
+    let (base, _seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
 
-    let status = post_webhook(&proxy.address, Some(SIGNATURE), PAYLOAD).await;
+    // Each with its own credential: accepted.
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "github",
+            Credential::Signature(SIGNATURE),
+            PAYLOAD
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "alertmanager",
+            Credential::Shared(TOKEN),
+            NOTIFICATION
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
 
-    assert_eq!(status, StatusCode::ACCEPTED);
+    // Each with the other's: refused. A mechanism is not a fallback, and the
+    // header a sender happens to send does not decide which one applies.
+    assert_eq!(
+        post_as(&proxy.address, "github", Credential::Shared(TOKEN), PAYLOAD).await,
+        StatusCode::UNAUTHORIZED,
+        "the signing Origin accepted a shared value"
+    );
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "alertmanager",
+            Credential::Signature(SIGNATURE),
+            NOTIFICATION
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "the sharing Origin accepted a signature"
+    );
+}
 
-    let received = delivered(&seen).await;
-    assert_eq!(received.len(), 1, "the room should have been told once");
+#[tokio::test]
+async fn a_push_and_an_alert_reach_only_their_own_subscribers() {
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
 
-    let sent: serde_json::Value = serde_json::from_str(&received[0]).expect("valid JSON");
-    let text = sent["text"].as_str().expect("a text field");
-    assert!(text.contains("motrice/webhook-proxy"), "{text}");
-    assert!(text.contains("main"), "{text}");
-    assert!(text.contains("bjornmolin"), "{text}");
-    // The link the sender published, carried through the domain as a Permalink
-    // and rendered last. Nothing along the way knows how to build such an
-    // address, which is what made carrying it possible at all — see gc-3pa.13.
+    assert_eq!(
+        post_webhook(&proxy.address, Some(SIGNATURE), PAYLOAD).await,
+        StatusCode::ACCEPTED
+    );
+
+    let received = delivered(&seen, 1).await;
+    let devsecops = told(&received, ROOM);
+    assert_eq!(devsecops.len(), 1, "{received:?}");
+    assert!(devsecops[0].contains("bjornmolin"), "{devsecops:?}");
+
+    // The room that only subscribes to alerts hears nothing about a push.
+    assert!(told(&received, PLATFORM).is_empty(), "{received:?}");
+}
+
+#[tokio::test]
+async fn an_alert_reaches_every_room_whose_rule_matches_and_no_others() {
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
+
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "alertmanager",
+            Credential::Shared(TOKEN),
+            NOTIFICATION
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+
+    // The notification carries three alerts, chosen so that one matches two
+    // rules, one matches one, and one matches none:
+    //
+    //   critical / prod    -> devsecops (severity) and platform (namespace)
+    //   unstated / prod    -> platform only
+    //   unrecognised / platform -> nothing at all
+    let received = delivered(&seen, 3).await;
+
+    let devsecops = told(&received, ROOM);
+    assert_eq!(devsecops.len(), 1, "devsecops: {received:?}");
     assert!(
-        text.ends_with(
-            "\nhttps://github.com/motrice/webhook-proxy/compare/9049f1265b7d...6113728f27ae"
-        ),
-        "{text}"
+        devsecops[0].starts_with("firing — critical:"),
+        "{devsecops:?}"
+    );
+
+    let platform = told(&received, PLATFORM);
+    assert_eq!(platform.len(), 2, "platform: {received:?}");
+
+    // And the third reached nobody, which is not an error: the sender was told
+    // its notification was accepted.
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert!(
+        !received
+            .iter()
+            .any(|(_, body)| body.contains("CertExpiring")),
+        "an alert matching no rule was delivered anyway: {received:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_wrongly_signed_push_reaches_nobody() {
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
+
+    // A well-formed signature of the right length for the wrong body.
+    let wrong = format!("sha256={}", "0".repeat(64));
+    assert_eq!(
+        post_webhook(&proxy.address, Some(&wrong), PAYLOAD).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(delivered(&seen, 1).await.is_empty());
+}
+
+#[tokio::test]
+async fn no_configured_sender_can_be_reached_without_its_credential() {
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
+
+    for (sender, body) in [("github", PAYLOAD), ("alertmanager", NOTIFICATION)] {
+        assert_eq!(
+            post_as(&proxy.address, sender, Credential::None, body).await,
+            StatusCode::UNAUTHORIZED,
+            "{sender} was reachable with no credential"
+        );
+    }
+    assert!(delivered(&seen, 1).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_path_naming_no_configured_sender_is_not_found() {
+    let (base, _seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
+
+    // Not 401: there is nothing here to authenticate against. The set of senders
+    // stays unenumerable either way, because a wrong credential for a real
+    // sender and a real credential for no sender both end the conversation.
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "somebody-else",
+            Credential::Signature(SIGNATURE),
+            PAYLOAD
+        )
+        .await,
+        StatusCode::NOT_FOUND
     );
 }
 
 #[tokio::test]
 async fn a_signed_branch_deletion_reaches_the_room_as_a_deletion() {
-    // The whole path for the second Event: a signed payload whose `deleted` flag
-    // the inbound adapter reads, a domain Event with no commits to be empty, and
-    // a Notice that says what happened rather than describing it as a push of
-    // nothing. Tested here because no single layer can prove the sentence that
-    // comes out the far end.
-    let (url, seen) = hookshot().await;
-    let proxy = start(configured(&url)).await.expect("the proxy starts");
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
 
-    let status = post_webhook(&proxy.address, Some(DELETION_SIGNATURE), DELETION).await;
-
-    assert_eq!(status, StatusCode::ACCEPTED);
-
-    let received = delivered(&seen).await;
-    assert_eq!(received.len(), 1, "the room should have been told once");
-
-    let sent: serde_json::Value = serde_json::from_str(&received[0]).expect("valid JSON");
-    let text = sent["text"].as_str().expect("a text field");
-    assert!(text.contains("deleted"), "{text}");
-    assert!(text.contains("bead/gc-old"), "{text}");
-    assert!(text.contains("bjornmolin"), "{text}");
-    assert!(
-        !text.contains("no commits"),
-        "a deletion must not be reported as a push that carried nothing: {text}"
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "github",
+            Credential::Signature(DELETION_SIGNATURE),
+            DELETION
+        )
+        .await,
+        StatusCode::ACCEPTED
     );
-    // The deletion payload publishes a compare link; it is deliberately dropped,
-    // because comparing against a ref that no longer exists tells a reader
-    // nothing. DeletedBranch has no field for one.
-    assert!(!text.contains("://"), "{text}");
-}
 
-#[tokio::test]
-async fn a_wrongly_signed_push_reaches_nobody() {
-    let (url, seen) = hookshot().await;
-    let proxy = start(configured(&url)).await.expect("the proxy starts");
-
-    // A well-formed signature of the right length for the wrong body.
-    let wrong = format!("sha256={}", "0".repeat(64));
-    let status = post_webhook(&proxy.address, Some(&wrong), PAYLOAD).await;
-
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(
-        delivered(&seen).await.is_empty(),
-        "an unverified push must reach nobody"
-    );
-}
-
-#[tokio::test]
-async fn an_unsigned_push_reaches_nobody() {
-    let (url, seen) = hookshot().await;
-    let proxy = start(configured(&url)).await.expect("the proxy starts");
-
-    let status = post_webhook(&proxy.address, None, PAYLOAD).await;
-
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(delivered(&seen).await.is_empty());
+    let received = delivered(&seen, 1).await;
+    let devsecops = told(&received, ROOM);
+    assert_eq!(devsecops.len(), 1, "{received:?}");
+    assert!(devsecops[0].contains("deleted"), "{devsecops:?}");
+    assert!(!devsecops[0].contains("no commits"), "{devsecops:?}");
+    assert!(!devsecops[0].contains("://"), "{devsecops:?}");
 }
 
 #[tokio::test]
 async fn health_answers_without_asking_the_destination() {
-    let (url, _) = hookshot().await;
-    let proxy = start(configured(&url)).await.expect("the proxy starts");
+    let (base, _seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
 
     let body = reqwest::get(format!("http://{}/health", proxy.address))
         .await
@@ -255,21 +490,70 @@ async fn health_answers_without_asking_the_destination() {
 }
 
 #[tokio::test]
-async fn a_missing_secret_stops_the_process_and_says_which_one() {
-    let (url, _) = hookshot().await;
-    let mut without = configured(&url);
-    without.remove("GITHUB_WEBHOOK_SECRET");
+async fn a_routing_file_that_cannot_be_used_stops_the_process_and_says_where() {
+    // The whole operator experience of a bad deploy. It must happen before the
+    // socket is bound, so a broken deployment never looks healthy.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("config.yaml");
+    fs::write(
+        &file,
+        "version: 1
+origins:
+  - id: a-forge
+    speaks: github
+    verify:
+      hmac_sha256:
+        secret: a-secret
+destinations:
+  - id: a-room
+    kind: chat_room
+    webhook:
+      secret: a-url
+subscriptions:
+  - destination: no-such-room
+    match:
+      origin: a-forge
+",
+    )
+    .expect("writable");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir(&secrets).expect("writable");
+    fs::write(secrets.join("a-secret"), "shhh").expect("writable");
+    fs::write(secrets.join("a-url"), "http://127.0.0.1:1/hook").expect("writable");
 
-    let complaint = start(without)
-        .await
-        .expect_err("it must refuse to start without a secret");
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            file.to_str().expect("a utf-8 path").to_owned(),
+        ),
+        (
+            "WEBHOOK_PROXY_SECRETS_DIR",
+            secrets.to_str().expect("a utf-8 path").to_owned(),
+        ),
+    ]);
 
-    assert!(
-        complaint.contains("GITHUB_WEBHOOK_SECRET"),
-        "the complaint must name the variable: {complaint}"
-    );
-    assert!(
-        !complaint.contains(SECRET.trim()),
-        "the complaint must not contain a secret value: {complaint}"
-    );
+    let why = start(env).await.expect_err("it must refuse to start");
+
+    assert!(why.contains("config.yaml"), "{why}");
+    assert!(why.contains("subscriptions[0].destination"), "{why}");
+    assert!(why.contains("no-such-room"), "{why}");
+    // No secret value, ever, in the line most likely to be pasted somewhere.
+    assert!(!why.contains("shhh"), "{why}");
+}
+
+#[tokio::test]
+async fn an_absent_routing_file_stops_the_process_rather_than_starting_empty() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let env = HashMap::from([(
+        "WEBHOOK_PROXY_CONFIG",
+        dir.path()
+            .join("absent.yaml")
+            .to_str()
+            .expect("a utf-8 path")
+            .to_owned(),
+    )]);
+
+    let why = start(env).await.expect_err("it must refuse to start");
+
+    assert!(why.contains("absent.yaml"), "{why}");
 }

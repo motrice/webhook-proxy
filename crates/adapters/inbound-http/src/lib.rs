@@ -8,6 +8,7 @@
 //! dispatcher without going through `Relay::relay`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,8 +21,60 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use domain::{Body, Origin, Subscription};
 
-/// Where GitHub presents its signature.
-const SIGNATURE_HEADER: &str = "x-hub-signature-256";
+/// Where a sender's credential arrives.
+///
+/// One variant, because one is all any sender needs today. A mechanism that
+/// presented a credential some other way would add one, and the compiler would
+/// then find every place that has to decide — which is the point of its being a
+/// type rather than an `Option<&str>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presented {
+    /// In a header of this name, lowercased as hyper stores them.
+    Header(&'static str),
+}
+
+/// Where a sender that signs its body presents the signature.
+pub const SIGNATURE_HEADER: Presented = Presented::Header("x-hub-signature-256");
+
+/// Where a sender that shares a value in advance presents it.
+pub const AUTHORIZATION_HEADER: Presented = Presented::Header("authorization");
+
+/// Everything that varies from one sender to the next.
+///
+/// The three things in here used to be properties of the deployment: one
+/// verifier, one translator, one header for everybody. They are properties of a
+/// *sender*, and saying so is what lets two senders prove themselves different
+/// ways through one front door. Bead gc-dy4.
+///
+/// The composition root builds these from each Origin's declared mechanism, so
+/// the verifier an Origin gets is derived from the same declaration that says
+/// what it must prove — there is no second place for the two to drift.
+#[derive(Clone)]
+pub struct Sender {
+    /// Who this is, and what it must prove.
+    pub origin: Origin,
+    /// What checks it.
+    pub proofs: Arc<dyn Proofs>,
+    /// What reads its payload, once verified.
+    pub translator: Arc<dyn Translator>,
+    /// Where its credential arrives.
+    pub presented: Presented,
+}
+
+/// A count and the names, never a credential.
+///
+/// Written by hand because a derived one would print whatever a `Proofs`
+/// implementation holds, and those hold secrets.
+impl fmt::Debug for Sender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Sender({}, {:?})",
+            self.origin.id().as_str(),
+            self.presented
+        )
+    }
+}
 
 /// Everything the front door needs, shareable across requests.
 ///
@@ -30,38 +83,39 @@ const SIGNATURE_HEADER: &str = "x-hub-signature-256";
 /// would be inflicted on every caller for no benefit.
 #[derive(Clone)]
 pub struct Inbound {
-    signatures: Arc<dyn Proofs>,
-    translator: Arc<dyn Translator>,
+    /// Every sender permitted to reach this proxy, by the name in the request
+    /// path. A path naming anything absent here cannot be authenticated and is
+    /// therefore refused — which is also what keeps the set of senders
+    /// unenumerable from outside.
+    senders: Arc<HashMap<String, Sender>>,
     dispatcher: Arc<dyn Dispatcher>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn Ids>,
     subscriptions: Arc<Vec<Subscription>>,
-    /// The Origins we hold a secret for, by the name in the request path. An
-    /// Origin absent here cannot be authenticated and is therefore refused.
-    origins: Arc<HashMap<String, Origin>>,
     losses: Arc<AtomicU64>,
 }
 
 impl Inbound {
     /// Wires the front door to the application.
+    /// Five arguments where there were seven.
+    ///
+    /// The verifier, the translator and the Origin table collapsed into
+    /// `senders`, because each of them belongs to one sender rather than to the
+    /// deployment.
     #[must_use]
     pub fn new(
-        signatures: Arc<dyn Proofs>,
-        translator: Arc<dyn Translator>,
+        senders: HashMap<String, Sender>,
         dispatcher: Arc<dyn Dispatcher>,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn Ids>,
         subscriptions: Vec<Subscription>,
-        origins: HashMap<String, Origin>,
     ) -> Self {
         Self {
-            signatures,
-            translator,
+            senders: Arc::new(senders),
             dispatcher,
             clock,
             ids,
             subscriptions: Arc::new(subscriptions),
-            origins: Arc::new(origins),
             losses: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -112,27 +166,30 @@ async fn receive(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    // An Origin we hold no secret for cannot be authenticated, so it is refused
-    // here rather than anywhere further in.
-    let Some(origin) = inbound.origins.get(&origin) else {
+    // A path naming a sender we do not serve cannot be authenticated, so it is
+    // refused here rather than anywhere further in.
+    let Some(sender) = inbound.senders.get(&origin) else {
         return StatusCode::NOT_FOUND;
     };
 
+    // Where the credential is read from follows from what this sender declared,
+    // never from what the request happens to carry. A request bearing the other
+    // mechanism's header is refused rather than retried under it — that is the
+    // downgrade gc-ast.2 forbids, and this is the line that forbids it.
+    let Presented::Header(name) = sender.presented;
+
     // Nothing below this point runs without something to compare. There is no
     // flag, no environment variable and no build feature that skips it.
-    let Some(presented) = headers
-        .get(SIGNATURE_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(presented) = headers.get(name).and_then(|value| value.to_str().ok()) else {
         return StatusCode::UNAUTHORIZED;
     };
-    let Ok(claimed) = inbound.signatures.claimed(presented) else {
+    let Ok(claimed) = sender.proofs.claimed(presented) else {
         return StatusCode::UNAUTHORIZED;
     };
 
     let relay = Relay::new(
-        inbound.signatures.as_ref(),
-        inbound.translator.as_ref(),
+        sender.proofs.as_ref(),
+        sender.translator.as_ref(),
         inbound.dispatcher.as_ref(),
         inbound.clock.as_ref(),
         inbound.ids.as_ref(),
@@ -142,7 +199,7 @@ async fn receive(
     // The body is handed over as the bytes that arrived. This crate never parses
     // it: translation is a port, reached only after verification.
     match relay
-        .relay(origin, Body::from_bytes(body.to_vec()), &claimed)
+        .relay(&sender.origin, Body::from_bytes(body.to_vec()), &claimed)
         .await
     {
         Ok(relayed) => {
@@ -186,7 +243,7 @@ mod tests {
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
 
-    use super::{Inbound, router};
+    use super::{Inbound, SIGNATURE_HEADER, Sender, router};
 
     /// The shape of thing that must never reach a log line. There is no URL in
     /// this crate to leak — a `Destination` is an identity and a kind, with no
@@ -415,13 +472,19 @@ mod tests {
         let ids = Arc::new(CountingIds(Mutex::new(0)));
         let (name, origin) = an_origin();
         let inbound = Inbound::new(
-            sigs.clone(),
-            Arc::new(Says(says)),
+            HashMap::from([(
+                name,
+                Sender {
+                    origin,
+                    proofs: sigs.clone(),
+                    translator: Arc::new(Says(says)),
+                    presented: SIGNATURE_HEADER,
+                },
+            )]),
             dispatcher.clone(),
             Arc::new(FixedClock),
             ids.clone(),
             to_rooms(rooms),
-            HashMap::from([(name, origin)]),
         );
 
         Wired {
