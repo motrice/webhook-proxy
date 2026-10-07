@@ -167,7 +167,7 @@ mod tests {
     use domain::{
         Blank, Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Event,
         Filter, LabelName, LabelValue, Labels, Origin, OriginId, Proof, Pusher, RepositoryName,
-        SecretId, Subscription, Timestamp, VerifiedDelivery,
+        SecretId, Subscription, Timestamp, Verification, VerifiedDelivery,
     };
 
     use super::{Refused, Relay};
@@ -251,7 +251,9 @@ mod tests {
     fn an_origin() -> Origin {
         Origin::new(
             OriginId::new("a-forge").expect("a non-blank origin identity"),
-            SecretId::new("a-secret").expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new("a-secret").expect("a non-blank secret name"),
+            },
         )
     }
 

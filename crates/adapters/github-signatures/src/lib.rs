@@ -82,7 +82,7 @@ mod tests {
     use std::collections::HashMap;
 
     use application::ports::Proofs;
-    use domain::{Body, Origin, OriginId, SecretId};
+    use domain::{Body, Origin, OriginId, SecretId, Verification};
 
     use application::ports::MalformedProof;
 
@@ -108,7 +108,9 @@ mod tests {
     fn origin() -> Origin {
         Origin::new(
             OriginId::new("a-forge").expect("a non-blank origin identity"),
-            SecretId::new(SECRET_NAME).expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new(SECRET_NAME).expect("a non-blank secret name"),
+            },
         )
     }
 
@@ -158,7 +160,9 @@ mod tests {
     fn an_unknown_secret_name_is_unavailable_rather_than_a_mismatch() {
         let unknown = Origin::new(
             OriginId::new("a-forge").expect("a non-blank origin identity"),
-            SecretId::new("not-configured").expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new("not-configured").expect("a non-blank secret name"),
+            },
         );
 
         let outcome = verifier().expected(&unknown, &Body::from_bytes(BODY.to_vec()));
@@ -170,30 +174,37 @@ mod tests {
     fn a_header_without_the_scheme_is_malformed() {
         let digest = SIGNATURE.trim_start_matches("sha256=");
 
+        // Proof has no PartialEq by design, so a Result carrying one cannot be
+        // compared whole. The error is what this asserts anyway.
         assert_eq!(
-            verifier().claimed(digest),
-            Err(MalformedProof::UnknownScheme)
+            verifier().claimed(digest).err(),
+            Some(MalformedProof::UnknownScheme)
         );
-        assert_eq!(verifier().claimed(""), Err(MalformedProof::UnknownScheme));
         assert_eq!(
-            verifier().claimed(&format!("sha1={digest}")),
-            Err(MalformedProof::UnknownScheme)
+            verifier().claimed("").err(),
+            Some(MalformedProof::UnknownScheme)
+        );
+        assert_eq!(
+            verifier().claimed(&format!("sha1={digest}")).err(),
+            Some(MalformedProof::UnknownScheme)
         );
     }
 
     #[test]
     fn a_header_that_is_not_a_sha256_digest_is_malformed() {
         assert_eq!(
-            verifier().claimed("sha256="),
-            Err(MalformedProof::Unreadable)
+            verifier().claimed("sha256=").err(),
+            Some(MalformedProof::Unreadable)
         );
         assert_eq!(
-            verifier().claimed("sha256=abcd"),
-            Err(MalformedProof::Unreadable)
+            verifier().claimed("sha256=abcd").err(),
+            Some(MalformedProof::Unreadable)
         );
         assert_eq!(
-            verifier().claimed(&format!("sha256={}", "z".repeat(64))),
-            Err(MalformedProof::Unreadable)
+            verifier()
+                .claimed(&format!("sha256={}", "z".repeat(64)))
+                .err(),
+            Some(MalformedProof::Unreadable)
         );
     }
 
@@ -217,7 +228,9 @@ mod tests {
     fn no_secret_value_appears_in_an_error_or_in_debug_output() {
         let unknown = Origin::new(
             OriginId::new("a-forge").expect("a non-blank origin identity"),
-            SecretId::new("not-configured").expect("a non-blank secret name"),
+            Verification::Signed {
+                secret: SecretId::new("not-configured").expect("a non-blank secret name"),
+            },
         );
         let error = verifier()
             .expected(&unknown, &Body::from_bytes(BODY.to_vec()))

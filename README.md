@@ -17,7 +17,7 @@ deciding whether this was the right thing to build.
 
 ## What it promises
 
-**A webhook is acknowledged once its signature is verified, then delivered to
+**A webhook is acknowledged once it is verified, then delivered to
 each matching destination on a bounded number of attempts; nothing is persisted,
 so a dispatch that exhausts its attempts or outlives the process is lost — and
 every loss is logged and counted.**
@@ -25,7 +25,7 @@ every loss is logged and counted.**
 That is best-effort, stated plainly, and the rest follows from it:
 
 - **Acknowledgement means accepted, not delivered.** The sender gets a 2xx once
-  the signature checks out. A destination failing afterwards must not turn into
+  verification succeeds. A destination failing afterwards must not turn into
   a 5xx, because the sender would retry and re-deliver to the destinations that
   already succeeded.
 - **Losses are visible.** A dropped dispatch is logged with the delivery's
@@ -60,9 +60,11 @@ Three obligations follow, and they are not negotiable:
 
 - **Verification happens before anything else, and nothing can switch it off.**
   There is no configuration flag, environment variable, or debug mode that skips
-  a signature check. `Delivery::verify` is the only route to a
-  `VerifiedDelivery`, and translation is a port precisely so that nothing is
-  parsed before its signature matched.
+  verification. `Delivery::verify` is the only route to a `VerifiedDelivery`, and
+  translation is a port precisely so that nothing is parsed before it was
+  verified. An Origin declares *which* mechanism proves it — a Proof computed over
+  the body, or a value shared in advance — and that is read from configuration,
+  never chosen by looking at the request.
 - **Unknown senders are refused, and failure is closed.** An Origin we hold no
   secret for is `SecretUnavailable` — never "allow it through". A body larger
   than the configured limit is rejected before any work is done on it.

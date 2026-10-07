@@ -14,6 +14,7 @@ use application::ports::Dispatcher;
 use axum::routing::get;
 use domain::{
     Destination, DestinationId, DestinationKind, Filter, Origin, OriginId, SecretId, Subscription,
+    Verification,
 };
 use element_notices::ElementNotices;
 use github_http::{Inbound, router};
@@ -176,7 +177,12 @@ async fn run() -> Result<(), Unstartable> {
         name: "the secret name",
         why: blank.to_string(),
     })?;
-    let origins = HashMap::from([(ORIGIN.to_owned(), Origin::new(origin_id, secret_id))]);
+    // Signed, because GitHub signs. A second mechanism is a configuration
+    // change, never a fallback this code could choose (gc-ast.2).
+    let origins = HashMap::from([(
+        ORIGIN.to_owned(),
+        Origin::new(origin_id, Verification::Signed { secret: secret_id }),
+    )]);
 
     let inbound = Inbound::new(
         signatures,

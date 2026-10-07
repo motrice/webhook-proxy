@@ -25,7 +25,7 @@ pub use event::{
     Blank, BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary,
 };
 pub use label::{LabelName, LabelValue, Labels};
-pub use origin::{Origin, OriginId, SecretId};
+pub use origin::{Origin, OriginId, SecretId, Verification};
 pub use proof::{Proof, ProofMismatch};
 pub use routing::{
     Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,
