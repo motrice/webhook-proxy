@@ -9,11 +9,28 @@
 //!
 //! Its audience is people. Every field of an Event is written by whoever can
 //! push, not by the sender whose signature we checked, so a Notice is an
-//! injection target. The defence is to send no markup at all: a plain-text
-//! Notice has nothing to escape and nothing to get wrong. That is only a
-//! complete defence if hookshot does not itself render markdown in the `text`
-//! field, which is an open question on the live instance — so the claim here is
-//! "we send no markup", not "markup cannot appear".
+//! injection target.
+//!
+//! This used to defend by sending no markup at all, on the reasoning that a
+//! plain-text Notice has nothing to escape. That defence was conditional and the
+//! condition turned out to be false: hookshot renders markdown in the `text`
+//! field — proved on the live instance, bead gc-fks — so a commit message
+//! reading `[Payroll portal has moved](http://attacker.example)` became a
+//! clickable link with wording of its attacker's choosing, in a room that trusts
+//! the forge. We sent no markup and markup appeared anyway, because the
+//! destination made it.
+//!
+//! Escaping markdown instead cannot work: no escape stops a bare URL
+//! autolinking, and one of the URLs is our own permalink, which should be a
+//! link. So a Notice is now sent twice — `text` as before, for a client that
+//! falls back to it, and `html` which hookshot uses verbatim. In HTML we say
+//! what is a link, under one rule:
+//!
+//! **a link may appear only when its visible text is exactly its destination.**
+//!
+//! A link that says one thing and goes to another is the whole attack; a link
+//! whose text is where it goes cannot lie, so a reader can judge it before
+//! clicking. Our permalink qualifies. Nothing a sender wrote ever does.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -85,23 +102,39 @@ impl fmt::Debug for ElementNotices {
     }
 }
 
-/// An Event as a line of prose for people to read.
+/// An Event as prose for people to read, in plain text.
 ///
-/// Plain text, deliberately. Nothing here interpolates into markup, so no field
-/// needs escaping and no escaping can be forgotten.
+/// The fallback body. A client that cannot render the HTML shows this, so it has
+/// to say the same thing — which is why both renderings come from one
+/// [`Composed`] rather than from two renderers written side by side.
 #[must_use]
 pub fn notice(event: &Event) -> String {
+    composed(event).as_text()
+}
+
+/// The same Event as HTML, which is what a reader actually sees.
+///
+/// Every borrowed string is escaped and nothing a sender wrote can become
+/// markup. The only element produced is an anchor for the permalink, and only
+/// when its visible text is exactly its destination.
+#[must_use]
+pub fn notice_html(event: &Event) -> String {
+    composed(event).as_html()
+}
+
+/// A Notice's structure, before it is either kind of text.
+fn composed(event: &Event) -> Composed {
     match event {
         Event::DeletedBranch {
             repository,
             branch,
             pusher,
-        } => format!(
+        } => Composed::said(format!(
             "{} deleted branch {} in {}",
             pusher.as_str(),
             branch.as_str(),
             repository.as_str()
-        ),
+        )),
         Event::Alert {
             severity,
             status,
@@ -141,17 +174,18 @@ pub fn notice(event: &Event) -> String {
 ///
 /// Every part of it except the status and the severity word is written by whoever
 /// can deploy a workload, which is a wider set of people than whoever can push to
-/// a repository. So: no markup is produced, nothing is interpreted, line breaks
-/// in a value are neutralised so a value cannot forge a line, and every borrowed
-/// string is bounded so one alert cannot fill a room.
+/// a repository. So: line breaks in a value are neutralised so a value cannot
+/// forge a line, every borrowed string is bounded so one alert cannot fill a
+/// room, and nothing written here is markup — the HTML rendering escapes what it
+/// is given, so a value cannot become one either.
 fn alerted(
     severity: &Severity,
     status: AlertStatus,
     summary: &str,
     labels: &Labels,
     permalink: Option<&Permalink>,
-) -> String {
-    let mut text = match severity.as_label() {
+) -> Composed {
+    let header = match severity.as_label() {
         // A severity the sender did not state has nothing to print, so the line
         // does not claim one rather than inventing a default.
         None => format!(
@@ -167,16 +201,14 @@ fn alerted(
         ),
     };
 
+    let mut composed = Composed::said(header);
+
     let shown = label_line(labels);
     if !shown.is_empty() {
-        write!(text, "\n  {shown}").expect("writing to a String cannot fail");
+        composed.hanging(shown);
     }
-
-    if let Some(link) = permalink {
-        write!(text, "\n{}", link.as_str()).expect("writing to a String cannot fail");
-    }
-
-    text
+    composed.pointing_at(permalink);
+    composed
 }
 
 /// The labels, on one line, in the order the domain keeps them.
@@ -261,31 +293,169 @@ fn pushed(
     pusher: &str,
     commits: &[Commit],
     permalink: Option<&Permalink>,
-) -> String {
-    let mut text = if commits.is_empty() {
-        format!("{pusher} pushed no commits to {branch} in {repository}")
+) -> Composed {
+    let mut composed = if commits.is_empty() {
+        Composed::said(format!(
+            "{pusher} pushed no commits to {branch} in {repository}"
+        ))
     } else {
         let count = commits.len();
         let plural = if count == 1 { "commit" } else { "commits" };
-        let mut listed = format!("{pusher} pushed {count} {plural} to {branch} in {repository}");
+        let mut listed = Composed::said(format!(
+            "{pusher} pushed {count} {plural} to {branch} in {repository}"
+        ));
         for commit in commits {
             let id = commit.id().as_str();
             let short = id.get(..SHORT_ID).unwrap_or(id);
-            write!(listed, "\n  {short} {}", commit.summary().as_str())
-                .expect("writing to a String cannot fail");
+            listed.hanging(format!("{short} {}", commit.summary().as_str()));
         }
         listed
     };
 
     // Last, on its own line and unindented: a reader sees what happened first
     // and where to look second, and the line is not mistaken for another commit.
-    // Sent as plain characters like everything else here — there is no markup to
-    // escape because none is produced.
-    if let Some(link) = permalink {
-        write!(text, "\n{}", link.as_str()).expect("writing to a String cannot fail");
+    composed.pointing_at(permalink);
+    composed
+}
+
+/// A Notice's structure, before it is text of either kind.
+///
+/// It exists so there is one source of structure and two renderings of it. Two
+/// renderers maintained side by side drift, and the one that drifts is the one
+/// nobody reads — which here would be the plain-text fallback, seen by exactly
+/// the clients least able to cope with a surprise.
+struct Composed {
+    lines: Vec<Line>,
+    /// Where to look. Rendered last and apart, never inline.
+    link: Option<String>,
+}
+
+/// One line of a Notice, and whether it hangs under the line above it.
+enum Line {
+    /// Flush left. What happened.
+    Said(String),
+    /// Indented. A detail of the line above — a commit, or an alert's labels.
+    Hanging(String),
+}
+
+impl Composed {
+    /// Begins a Notice with the line that says what happened.
+    fn said(line: String) -> Self {
+        Self {
+            lines: vec![Line::Said(line)],
+            link: None,
+        }
     }
 
-    text
+    /// Adds a detail under what has been said so far.
+    fn hanging(&mut self, line: String) {
+        self.lines.push(Line::Hanging(line));
+    }
+
+    /// Records where to look, if the Origin published somewhere.
+    fn pointing_at(&mut self, permalink: Option<&Permalink>) {
+        self.link = permalink.map(|link| link.as_str().to_owned());
+    }
+
+    /// The plain-text rendering: the fallback body.
+    fn as_text(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            match line {
+                Line::Said(text) => out.push_str(text),
+                Line::Hanging(text) => {
+                    out.push_str("  ");
+                    out.push_str(text);
+                }
+            }
+        }
+        if let Some(link) = &self.link {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(link);
+        }
+        out
+    }
+
+    /// The HTML rendering: what a reader actually sees.
+    ///
+    /// A newline is only whitespace in HTML, so the structure is carried by
+    /// `<br>`; the indent is non-breaking, because ordinary spaces collapse and
+    /// the indent is what distinguishes a commit from the line above it.
+    fn as_html(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            if !out.is_empty() {
+                out.push_str("<br>");
+            }
+            match line {
+                Line::Said(text) => out.push_str(&escaped(text)),
+                Line::Hanging(text) => {
+                    out.push_str("&nbsp;&nbsp;");
+                    out.push_str(&escaped(text));
+                }
+            }
+        }
+        if let Some(link) = &self.link {
+            if !out.is_empty() {
+                out.push_str("<br>");
+            }
+            out.push_str(&linked(link));
+        }
+        out
+    }
+}
+
+/// Text that cannot become markup.
+///
+/// The apostrophe is escaped as well as the four that strictly must be. It is
+/// never wrong, and it means this function does not depend on the caller knowing
+/// whether what it produces will land in an attribute or between tags.
+fn escaped(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A permalink, as a link when that is safe and as characters when it is not.
+///
+/// The visible text is the destination, always. That is the whole rule: a link
+/// that says one thing and goes to another is the attack this defends against,
+/// and one whose text is where it goes cannot lie about it.
+fn linked(permalink: &str) -> String {
+    if !publishable(permalink) {
+        return escaped(permalink);
+    }
+    let shown = escaped(permalink);
+    format!("<a href=\"{shown}\">{shown}</a>")
+}
+
+/// Whether a permalink is one we are willing to make clickable.
+///
+/// `Permalink::new` checks only that it is not blank, and the value comes from
+/// the payload — so it is written by whoever can push and need not be a URL at
+/// all. `javascript:` and `data:` are the obvious ones; whitespace is refused
+/// too, because a value that is not a single token is not a thing a reader can
+/// check by looking at it.
+fn publishable(permalink: &str) -> bool {
+    let lowered = permalink.to_ascii_lowercase();
+    (lowered.starts_with("http://") || lowered.starts_with("https://"))
+        && !permalink
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
 }
 
 /// Which kind of failure a transport error is, in the Destination's terms.
@@ -318,7 +488,14 @@ impl Dispatcher for ElementNotices {
         let response = self
             .client
             .post(endpoint)
-            .json(&serde_json::json!({ "text": notice(event) }))
+            // Both. `html` is what a reader sees; `text` is the body a client
+            // falling back shows, and is also what stops hookshot applying
+            // markdown of its own — which is how an Event field became a live
+            // link in the room (gc-qev).
+            .json(&serde_json::json!({
+                "text": notice(event),
+                "html": notice_html(event),
+            }))
             .send()
             .await
             .map_err(|error| classify(&error))?;
@@ -364,7 +541,7 @@ mod tests {
         Severity, Summary, Timestamp,
     };
 
-    use super::{ElementNotices, LABEL_LIMIT, LABELS_SHOWN, SUMMARY_LIMIT, notice};
+    use super::{ElementNotices, LABEL_LIMIT, LABELS_SHOWN, SUMMARY_LIMIT, notice, notice_html};
 
     /// Stands in for the room's bearer credential.
     const HOOK_ID: &str = "SUPERSECRETHOOKID";
@@ -547,8 +724,13 @@ mod tests {
 
     #[test]
     fn a_link_appears_literally_and_is_not_made_into_markup() {
-        // Still plain text. A link is sent as the characters it is made of, so
-        // there is no markup to escape and none to get wrong.
+        // About the plain-text rendering, and it was never enough on its own.
+        // This and the other "appears literally" tests assert what this adapter
+        // SENDS, which was always true and stayed true while a commit message
+        // became a live link in the room — because the destination rendered
+        // markdown in what we sent. A test here cannot see that; the live
+        // instance was the only oracle, and gc-fks was the one that asked it.
+        // What covers the gap now is the HTML rendering and its own tests.
         let text = notice(&linked_push(
             "motrice/webhook-proxy",
             "main",
@@ -1031,9 +1213,17 @@ mod tests {
                 .contains("bjornmolin"),
             "{sent}"
         );
-        // Only `text`: nothing claims a username or HTML, because whether this
-        // instance honours those is unverified (gc-3pa.8 note).
-        assert_eq!(sent.as_object().expect("an object").len(), 1, "{sent}");
+        // `html` as well, since gc-fks established that hookshot renders the
+        // `text` field as markdown and gc-qev decided what to do about it. The
+        // two fields and no others: nothing here claims a username.
+        assert!(sent.get("html").is_some(), "{sent}");
+        assert_eq!(sent.as_object().expect("an object").len(), 2, "{sent}");
+        // And `text` stays the plain rendering. It is the body a client falling
+        // back shows, so markup in it would be the original defect wearing a
+        // different field name.
+        let text = sent["text"].as_str().expect("text is a string");
+        assert!(!text.contains('<'), "{sent}");
+        assert!(!text.contains("&nbsp;"), "{sent}");
     }
 
     #[tokio::test]
@@ -1110,5 +1300,169 @@ mod tests {
         assert!(!printed.contains(HOOK_ID), "{printed}");
         assert!(!printed.contains("https://"), "{printed}");
         assert!(printed.contains('1'), "{printed}");
+    }
+
+    /// Turns a rendering back into the characters a reader would see.
+    ///
+    /// Used to prove the two renderings say the same thing. Deliberately the
+    /// inverse of what the renderer does and nothing cleverer: if it needed to
+    /// understand HTML, it would be a second renderer and could drift too.
+    fn as_read(html: &str) -> String {
+        let mut text = html.replace("<br>", "\n").replace("&nbsp;", " ");
+        // The anchor, if any: its visible text is already between the tags.
+        while let Some(open) = text.find("<a href=\"") {
+            let close = text[open..].find('>').expect("an opened tag is closed") + open;
+            text.replace_range(open..=close, "");
+        }
+        text = text.replace("</a>", "");
+        // &amp; last, or an escaped &lt; would be decoded twice.
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn a_markdown_link_in_a_commit_message_is_shown_as_the_characters_someone_typed() {
+        // The defect this bead exists for. hookshot renders markdown in `text`,
+        // so a commit message can put a clickable link with wording of its own
+        // choosing into a room that trusts the forge. In HTML we say what is a
+        // link, and this is not one.
+        let html = notice_html(&linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[(
+                "6113728f27ae",
+                "[Payroll portal has moved](http://attacker.example)",
+            )],
+            None,
+        ));
+
+        assert!(html.contains("[Payroll portal has moved]"), "{html}");
+        assert!(
+            !html.contains("<a href=\"http://attacker.example"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_characters_that_would_otherwise_be_markup_are_escaped_everywhere() {
+        let html = notice_html(&linked_push(
+            "motrice/<b>x</b>",
+            "main&more",
+            "o'brien",
+            &[("6113728f27ae", "a \"quoted\" <script>alert(1)</script>")],
+            None,
+        ));
+
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(html.contains("&amp;more"), "{html}");
+        assert!(html.contains("&quot;quoted&quot;"), "{html}");
+        assert!(html.contains("&#39;brien"), "{html}");
+    }
+
+    #[test]
+    fn a_permalink_becomes_a_link_whose_visible_text_is_its_destination() {
+        // The whole rule in one assertion. A link that says one thing and goes
+        // to another is the attack; a link whose text is its destination cannot
+        // lie about where it goes, so a reader can judge it before clicking.
+        let html = notice_html(&linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[],
+            Some("https://forge.example/x?a=1&b=2"),
+        ));
+
+        assert!(
+            html.contains(
+                "<a href=\"https://forge.example/x?a=1&amp;b=2\">\
+                 https://forge.example/x?a=1&amp;b=2</a>"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_permalink_with_a_scheme_we_do_not_publish_is_shown_as_text() {
+        // Permalink::new checks only that it is not blank, and the value comes
+        // from the payload — so it is attacker-controlled and need not be a URL
+        // at all. Anything but http and https is printed, never linked.
+        for hostile in [
+            "javascript:alert(1)",
+            "data:text/html,<b>x</b>",
+            "https:/\nevil",
+            // Internal whitespace, which is constructible. Leading whitespace is
+            // not: Permalink::new trims, so that case cannot arise and testing it
+            // would be testing the domain's constructor from here.
+            "https://forge.example/a b",
+        ] {
+            let html = notice_html(&linked_push(
+                "motrice/webhook-proxy",
+                "main",
+                "bjornmolin",
+                &[],
+                Some(hostile),
+            ));
+
+            assert!(
+                !html.contains("<a href"),
+                "{hostile:?} became a link: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn lines_are_broken_with_br_because_a_newline_is_only_whitespace_in_html() {
+        // What the live instance showed: our newlines collapsed and the push
+        // arrived as one run-on line, losing the structure this renderer builds.
+        let html = notice_html(&linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[("6113728f27ae", "a change")],
+            Some("https://forge.example/x"),
+        ));
+
+        assert!(
+            !html.contains('\n'),
+            "a raw newline renders as a space: {html}"
+        );
+        assert_eq!(html.matches("<br>").count(), 2, "{html}");
+        // The indent survives too, which plain spaces would not.
+        assert!(html.contains("&nbsp;&nbsp;6113728f"), "{html}");
+    }
+
+    #[test]
+    fn both_renderings_say_the_same_thing() {
+        // Two renderers drift. This is what stops them: whatever a reader sees
+        // in the room must be what a client falling back to plain text sees.
+        for event in [
+            a_push(),
+            linked_push(
+                "motrice/<b>x</b>",
+                "main&more",
+                "o'brien",
+                &[("6113728f27ae", "[a](http://evil.example) & \"more\"")],
+                Some("https://forge.example/x?a=1&b=2"),
+            ),
+            deletion("motrice/webhook-proxy", "main", "bjornmolin"),
+            alert_with(
+                Severity::Critical,
+                AlertStatus::Firing,
+                "api <latency> above target",
+                &[
+                    ("namespace", "prod"),
+                    ("markup", "<b>x</b> [a](http://evil)"),
+                ],
+                Some("https://prometheus.example/graph"),
+            ),
+        ] {
+            assert_eq!(as_read(&notice_html(&event)), notice(&event));
+        }
     }
 }
