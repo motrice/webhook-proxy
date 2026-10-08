@@ -114,6 +114,11 @@ async fn started_with(env: HashMap<String, String>) -> Result<Started, String> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_webhook-proxy"));
     command
         .env_clear()
+        // No waiting. The binary waits for configuration to appear before
+        // refusing (gc-6b7), which is right in a pod and wrong here: these tests
+        // point a variable somewhere decisive and read the complaint, and
+        // nothing is going to render a file underneath them.
+        .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (name, value) in env {
