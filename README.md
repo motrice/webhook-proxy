@@ -145,6 +145,20 @@ A deployment whose routing file is absent, unparseable, or names a secret with n
 value behind it exits non-zero before the socket is bound, naming the file and
 the path to the field. A broken deployment never looks healthy.
 
+### Configuring a sender
+
+Whoever configures a sender — usually in another repository — needs
+[docs/sending-to-this-proxy.md](docs/sending-to-this-proxy.md): the URL per
+sender, which header carries which credential, the fields each payload must
+carry and what happens when one is missing, the response codes and what to do
+about each, and what is lost. It has copyable Alertmanager and Grafana blocks
+with the credential referenced rather than inlined.
+
+Every claim in it names the test that holds it, so a disagreement between the
+document and the code is findable rather than a matter of opinion. It is also
+the input to the OpenAPI specification in `gc-4oo.3` — that bead describes this
+same interface formally rather than describing it a second time.
+
 ### Checking a routing file before deploying it
 
 ```bash
