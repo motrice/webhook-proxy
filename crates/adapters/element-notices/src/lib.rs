@@ -1535,4 +1535,31 @@ mod tests {
 
         assert_eq!(outcome, Err(DispatchFailed::Intercepted));
     }
+
+    /// What the Destination itself serves for a webhook that no longer exists:
+    /// a 404, and an HTML error page from the framework under it. Recorded from
+    /// the live instance 2026-10-08, after a webhook was removed.
+    const REMOVED: &str = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+        <title>Error</title></head><body><pre>Cannot POST /168c8e0e</pre></body></html>";
+
+    #[tokio::test]
+    async fn a_webhook_that_no_longer_exists_is_the_destination_refusing() {
+        // Both of the HTML bodies this adapter has met in the wild carry a
+        // success-shaped page it cannot read, and they mean opposite things: the
+        // firewall's means the Destination never saw the request, this one means
+        // it did and has nothing at that address any more.
+        //
+        // The status is what separates them, which is why it is read first. Move
+        // the body check ahead of it to be thorough and this becomes Intercepted
+        // — sending whoever is on call to look for a firewall, when the real
+        // answer is that someone removed the webhook and the routing file now
+        // names an address that is gone.
+        let (url, _) = hookshot(StatusCode::NOT_FOUND, REMOVED, Duration::ZERO).await;
+
+        let outcome = notices_to(&url, Duration::from_secs(5))
+            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .await;
+
+        assert_eq!(outcome, Err(DispatchFailed::Rejected));
+    }
 }
