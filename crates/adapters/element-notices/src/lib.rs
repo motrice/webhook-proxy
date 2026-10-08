@@ -458,6 +458,46 @@ fn publishable(permalink: &str) -> bool {
             .any(|character| character.is_whitespace() || character.is_control())
 }
 
+/// JSON with nothing outside ASCII left on the wire.
+///
+/// There is a firewall between this proxy and the Destination, and it refuses a
+/// body containing a four-byte UTF-8 sequence — established against the live
+/// instance in bead gc-6dg, where the same emoji was refused in `text` and in
+/// `html` alike, so it is reading bytes rather than fields. A push whose commit
+/// message carries an emoji would simply never arrive, and before gc-wlx it
+/// would not even have been counted.
+///
+/// `"\ud83d\ude0d"` and `"😍"` are the same JSON string: any conformant parser
+/// produces an identical value. So the Destination cannot tell these apart, the
+/// room shows the character, and both fields are covered at once. Nothing is
+/// stripped and nothing is transliterated — this is an encoding choice, not a
+/// change to what anyone reads.
+///
+/// Everything non-ASCII is escaped rather than only what this path refuses. The
+/// rule has no boundary to get wrong, it does not record one deployment's exact
+/// threshold in this adapter, and ASCII-only JSON is the encoding that survives
+/// the most middleboxes anyway.
+///
+/// Safe without parsing: every structural character JSON produces is ASCII, so a
+/// character outside it can only be inside a string literal, which is exactly
+/// where `\uXXXX` is the escape.
+fn ascii_only(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut units = [0u16; 2];
+    for character in json.chars() {
+        if character.is_ascii() {
+            out.push(character);
+        } else {
+            // Two units above U+FFFF, which is the case the firewall refuses and
+            // the one an escaper gets wrong: JSON has no single escape for it.
+            for unit in character.encode_utf16(&mut units) {
+                write!(out, "\\u{unit:04x}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+    out
+}
+
 /// Which kind of failure a transport error is, in the Destination's terms.
 ///
 /// Nothing from the HTTP client escapes this function: a `reqwest::Error`
@@ -491,11 +531,20 @@ impl Dispatcher for ElementNotices {
             // Both. `html` is what a reader sees; `text` is the body a client
             // falling back shows, and is also what stops hookshot applying
             // markdown of its own — which is how an Event field became a live
-            // link in the room (gc-qev).
-            .json(&serde_json::json!({
-                "text": notice(event),
-                "html": notice_html(event),
-            }))
+            // link in the room (gc-qev). Upstream requires the pair: a `text`
+            // fallback must be provided whenever `html` is.
+            //
+            // Serialised here rather than by `.json()`, because that would write
+            // the string raw and `ascii_only` is the point. The content type has
+            // to be set by hand for the same reason.
+            .header("content-type", "application/json")
+            .body(ascii_only(
+                &serde_json::json!({
+                    "text": notice(event),
+                    "html": notice_html(event),
+                })
+                .to_string(),
+            ))
             .send()
             .await
             .map_err(|error| classify(&error))?;
@@ -553,7 +602,9 @@ mod tests {
         Severity, Summary, Timestamp,
     };
 
-    use super::{ElementNotices, LABEL_LIMIT, LABELS_SHOWN, SUMMARY_LIMIT, notice, notice_html};
+    use super::{
+        ElementNotices, LABEL_LIMIT, LABELS_SHOWN, SUMMARY_LIMIT, ascii_only, notice, notice_html,
+    };
 
     /// Stands in for the room's bearer credential.
     const HOOK_ID: &str = "SUPERSECRETHOOKID";
@@ -1561,5 +1612,95 @@ mod tests {
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
+    }
+
+    /// A commit message in the gitmoji style, which is ordinary and which the
+    /// path refuses when it is sent as the bytes it is made of.
+    const WITH_AN_EMOJI: &str = "feat: \u{1f60d} add the thing, för Sverige";
+
+    #[tokio::test]
+    async fn nothing_outside_ascii_is_put_on_the_wire() {
+        // There is a firewall between this proxy and the room, and it refuses a
+        // body containing a four-byte UTF-8 sequence — proved against the live
+        // instance, bead gc-6dg: the same emoji is refused in `text` and in
+        // `html` alike, so it is reading bytes and not fields. A push whose
+        // commit message carries an emoji would therefore never arrive.
+        let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
+
+        notices_to(&url, Duration::from_secs(5))
+            .dispatch(
+                &a_delivery(),
+                &linked_push(
+                    "motrice/webhook-proxy",
+                    "main",
+                    "bjornmolin",
+                    &[("6113728f27ae", WITH_AN_EMOJI)],
+                    None,
+                ),
+                &room("room"),
+            )
+            .await
+            .expect("the stub accepts");
+
+        let received = seen.lock().expect("not poisoned").clone();
+        let (_, body) = &received[0];
+
+        assert!(
+            body.is_ascii(),
+            "a non-ASCII byte reached the wire: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escaping_changes_the_bytes_and_not_the_message() {
+        // The whole argument for doing it this way. "\ud83d\ude0d" and the emoji
+        // are the same JSON string, so the far end parses an identical value and
+        // the room shows the character. Nothing is stripped and nothing is
+        // transliterated — if that stopped being true, this is the test that
+        // would say so.
+        let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
+        let event = linked_push(
+            "motrice/webhook-proxy",
+            "main",
+            "bjornmolin",
+            &[("6113728f27ae", WITH_AN_EMOJI)],
+            None,
+        );
+
+        notices_to(&url, Duration::from_secs(5))
+            .dispatch(&a_delivery(), &event, &room("room"))
+            .await
+            .expect("the stub accepts");
+
+        let received = seen.lock().expect("not poisoned").clone();
+        let (content_type, body) = &received[0];
+
+        // Still JSON, and still declared as such: the escape is an encoding
+        // choice, not a different content type.
+        assert!(content_type.contains("application/json"), "{content_type}");
+        let sent: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        assert_eq!(sent["text"].as_str(), Some(notice(&event).as_str()));
+        assert_eq!(sent["html"].as_str(), Some(notice_html(&event).as_str()));
+        // And the characters really are there once decoded.
+        assert!(
+            sent["text"]
+                .as_str()
+                .expect("a string")
+                .contains('\u{1f60d}')
+        );
+        assert!(sent["text"].as_str().expect("a string").contains('ö'));
+    }
+
+    #[test]
+    fn a_character_above_the_basic_plane_is_escaped_as_a_surrogate_pair() {
+        // The case the firewall actually refuses, and the one an escaper gets
+        // wrong: JSON has no single escape for a codepoint above U+FFFF, so it
+        // has to be written as the two UTF-16 units.
+        assert_eq!(ascii_only("\u{1f60d}"), "\\ud83d\\ude0d");
+        // And one below it, which needs only one unit.
+        assert_eq!(ascii_only("ö"), "\\u00f6");
+        // ASCII is left exactly alone, including the structure of the JSON this
+        // runs over and the backslashes already in it.
+        assert_eq!(ascii_only(r#"{"a":"b\n"}"#), r#"{"a":"b\n"}"#);
     }
 }
