@@ -508,19 +508,31 @@ impl Dispatcher for ElementNotices {
             return Err(DispatchFailed::Unreachable);
         }
 
-        // hookshot answers a success with {"ok":true}. An `ok` of false is a
-        // refusal even under a 2xx. Anything else — a body we cannot read, or
-        // one without the field — is taken as success rather than invented into
-        // a failure: the status is the contract, and this is a courtesy check.
+        // The status is not the contract. It used to be treated as one, and
+        // anything unreadable under a 2xx was taken as success — reasonable
+        // while the only thing that could answer was the Destination, and false
+        // the moment something sits in front of it. There is a web application
+        // firewall on this path, and it refuses with 200 OK and an HTML page,
+        // which looked exactly like a delivered Notice (bead gc-wlx).
+        //
+        // So a success is a success only when the Destination says so, in the
+        // words it actually uses: a 2xx carrying {"ok":true}. Recorded from the
+        // live instance rather than from documentation.
         let body = response.text().await.map_err(|error| classify(&error))?;
-        let refused = serde_json::from_str::<serde_json::Value>(&body)
-            .is_ok_and(|json| json.get("ok").and_then(serde_json::Value::as_bool) == Some(false));
+        let said = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|json| json.get("ok").and_then(serde_json::Value::as_bool));
 
-        if refused {
-            return Err(DispatchFailed::Rejected);
+        match said {
+            Some(true) => Ok(()),
+            // An explicit no, under a success status: the Destination was
+            // reached and would not take it.
+            Some(false) => Err(DispatchFailed::Rejected),
+            // Neither. Something answered that is not the Destination, or the
+            // Destination changed what it says — and a Notice counted as
+            // delivered on a guess is the one loss nothing reports.
+            None => Err(DispatchFailed::Intercepted),
         }
-
-        Ok(())
     }
 }
 
@@ -1464,5 +1476,63 @@ mod tests {
         ] {
             assert_eq!(as_read(&notice_html(&event)), notice(&event));
         }
+    }
+
+    /// What an F5 serves when it refuses a request: a success status, an HTML
+    /// page, and nothing from the far end at all. Taken from a real rejection on
+    /// the path to the live instance, 2026-10-08.
+    const REJECTED_BY_SOMETHING_ELSE: &str = "<html><head><title>Request Rejected</title>\
+        </head><body>The requested URL was rejected. Please consult with your \
+        administrator.<br><br>Your support ID is: 6946303402370565540</body></html>";
+
+    #[tokio::test]
+    async fn a_success_that_is_not_the_destination_answering_is_a_lost_dispatch() {
+        // The defect this bead exists for. There is a web application firewall
+        // in front of the Destination, and it refuses with 200 OK and an HTML
+        // page. Treating that as delivered loses the Notice in the one way that
+        // defeats the best-effort promise: nothing logged, nothing counted.
+        let (url, _) = hookshot(StatusCode::OK, REJECTED_BY_SOMETHING_ELSE, Duration::ZERO).await;
+
+        let outcome = notices_to(&url, Duration::from_secs(5))
+            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .await;
+
+        // Intercepted, not Rejected: the Destination never saw this, and an
+        // operator reading the log should not go looking in its logs for a
+        // request that did not reach it.
+        assert_eq!(outcome, Err(DispatchFailed::Intercepted));
+    }
+
+    #[tokio::test]
+    async fn the_destinations_own_answer_is_what_counts_as_delivered() {
+        // Pinned to what the live instance actually sends, recorded 2026-10-08:
+        // 202 with application/json and exactly this body. Everything else under
+        // a 2xx is something else answering.
+        let (url, _) = hookshot(StatusCode::ACCEPTED, r#"{"ok":true}"#, Duration::ZERO).await;
+
+        let outcome = notices_to(&url, Duration::from_secs(5))
+            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .await;
+
+        assert_eq!(outcome, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_success_with_nothing_in_it_is_not_a_delivery_either() {
+        // Decided deliberately, because it is the case most likely to be wrong.
+        // Every success observed from the Destination carries {"ok":true}, so an
+        // empty body is not it answering. And the two mistakes do not cost the
+        // same: nothing is retried here, so a false loss is logged, counted and
+        // visible, while a false success is silent and permanent. If a future
+        // version of the Destination starts answering 204, this shows up at once
+        // as counted losses naming the cause — which is the loud failure, and
+        // the one worth choosing.
+        let (url, _) = hookshot(StatusCode::OK, "", Duration::ZERO).await;
+
+        let outcome = notices_to(&url, Duration::from_secs(5))
+            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .await;
+
+        assert_eq!(outcome, Err(DispatchFailed::Intercepted));
     }
 }

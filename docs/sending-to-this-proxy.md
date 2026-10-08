@@ -87,6 +87,11 @@ Every loss is logged with the delivery's identity, the room's identity and the
 reason, and counted. If you need to know whether something arrived, that log is
 the answer, not the `202`.
 
+A loss can also be something between this proxy and the room answering on its
+behalf — a firewall returning a success status over a refusal. That is reported
+as `Intercepted` rather than as the room refusing, because the room never saw the
+message and its own logs will show nothing.
+
 ## Alertmanager
 
 Schema **v4** (`"version": "4"`). A notification carrying a different version is
