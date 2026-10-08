@@ -80,10 +80,17 @@ Three obligations follow, and they are not negotiable:
   genuine.** Commit messages, branch names and repository names are written by
   whoever can push; an alert's summary and labels come from a workload
   annotation, so from whoever can deploy — a wider set of people still. A Notice
-  therefore renders everything as text, never as markup, and neutralises line
-  breaks in a label so a value cannot forge a line that looks like a separate
-  message. Without that, the room is an injection target for anyone with commit
-  or deploy access.
+  therefore escapes everything it borrows, and neutralises line breaks in a label
+  so a value cannot forge a line that looks like a separate message. Without
+  that, the room is an injection target for anyone with commit or deploy access.
+- **A link may appear only when its visible text is exactly its destination.**
+  The defence used to be sending no markup at all, which was conditional on the
+  destination not adding any — and that condition turned out to be false: the
+  chat server renders markdown, so a commit message could put a link saying one
+  thing and going to another into a room that trusts the forge. A Notice is now
+  sent as both plain text and HTML, and the HTML says what is a link. The
+  permalink qualifies because its text is its address; nothing a sender wrote
+  ever does.
 
 A room's URL is still handled as a secret — named in the routing file, its value
 read from a mounted directory, never defaulted in code, never logged, never in a

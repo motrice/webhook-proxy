@@ -199,11 +199,15 @@ is sender-supplied, or a room with no rules at all, is visible there.
 
 ## Anything else
 
-Everything a room sees is sent as plain text. Markup in a summary, an
-annotation or a label value arrives as the characters it is made of, and line
-breaks inside a label value are escaped so a value cannot forge what looks
-like a separate message. Do not rely on formatting; do not assume your markup
-is inert elsewhere.
+Markup in a summary, an annotation, a commit message or a label value arrives as
+the characters it is made of. Line breaks inside a label value are escaped too, so
+a value cannot forge what looks like a separate message.
+
+Nothing you send becomes a link. A URL you write appears as text; the only link a
+room ever shows is the permalink your payload published, and it is shown with its
+address as its visible text, so a reader can see where it goes before clicking.
+
+So: do not rely on formatting, and do not assume your markup is inert elsewhere.
 
 Long values are cut: a summary at 200 characters, a label name or value at 60,
 and at most 8 labels shown with any remainder counted rather than hidden.
