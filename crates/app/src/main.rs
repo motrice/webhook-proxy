@@ -114,6 +114,49 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Resolves when the orchestrator asks the process to stop.
+///
+/// Unix only, which is the whole target: the container is Linux and development
+/// is macOS. SIGTERM is what Kubernetes sends before it waits out the grace
+/// period; SIGINT is what Ctrl-C sends, and treating them alike means the
+/// behaviour an operator sees locally is the behaviour the cluster gets.
+///
+/// Without this, SIGTERM kills the process at whatever instruction it had
+/// reached, which is routinely between dispatching a webhook and answering the
+/// sender — so the sender sees a reset connection for a Notice that did arrive,
+/// and retries it. Bead gc-d01's criterion is that a restart loses at most what
+/// is in flight, and that is only true if accepted work is allowed to finish.
+async fn asked_to_stop() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        // Nothing to fall back to, and exiting here would make the process
+        // unstartable over a signal handler. Staying up without a graceful stop
+        // is the lesser failure, and it is loud.
+        Err(why) => {
+            tracing::error!(%why, "cannot listen for SIGTERM; stops will not be graceful");
+            return std::future::pending().await;
+        }
+    };
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(stream) => stream,
+        Err(why) => {
+            tracing::error!(%why, "cannot listen for SIGINT; stops will not be graceful");
+            return std::future::pending().await;
+        }
+    };
+
+    let signalled = tokio::select! {
+        _ = terminate.recv() => "SIGTERM",
+        _ = interrupt.recv() => "SIGINT",
+    };
+    tracing::info!(
+        signal = signalled,
+        "stopping; finishing what has been accepted"
+    );
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -249,6 +292,7 @@ async fn run() -> Result<(), Unstartable> {
     tracing::info!(%address, "webhook-proxy started");
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(asked_to_stop())
         .await
         .map_err(|why| Unstartable::Serving(why.to_string()))?;
 

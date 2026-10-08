@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-proxy
+  namespace: webhook-proxy
+  labels:
+    app.kubernetes.io/name: webhook-proxy
+spec:
+  # Two, because the delivery promise is best-effort and a restart should still
+  # cost nothing. The proxy holds no state between requests — it verifies, it
+  # translates, it forwards — so a second replica is free of the coordination
+  # problem that made the Forgejo runner a single pod.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Nothing goes away before its replacement is ready, so a rolling update
+      # never leaves the endpoint unserved. A forge that retries on a 5xx would
+      # mostly survive the gap; one that does not would silently lose the push.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: webhook-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: webhook-proxy
+    spec:
+      # The process handles SIGTERM and finishes what it has accepted before
+      # exiting, which is what makes "a restart loses at most what is in flight"
+      # true rather than aspirational. The acceptance test proving it is
+      # a_termination_signal_lets_a_request_already_accepted_finish.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        # The uid distroless's `nonroot` tag provides; the image also declares it,
+        # so this is a second lock rather than the only one.
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Group ownership of the mounted volumes, which is the only way the
+        # process can read a Secret it does not own. Without it the kubelet
+        # mounts those files root-owned, the mode below makes them readable by
+        # the owner alone, and the pod crash-loops with "no secret of that name
+        # is in /etc/webhook-proxy/secrets" — a message about absence for a file
+        # that is present and unreadable. Found by applying this to a real
+        # cluster, which is why gc-d01 insists on that.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Required while the repository, and therefore the GHCR package, is
+      # private. Created with `kubectl create secret docker-registry`, never
+      # committed — see README.md. It disappears when the repository goes public,
+      # which gc-rdz carries as a reminder.
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: webhook-proxy
+          # Published by the release workflow (gc-lw3), never built here: gc-kow
+          # decided that a hand-built image would be a second path that diverges
+          # from the released one. `main` is the dev tag, rebuilt on every commit
+          # to main; the GitOps copy of this manifest pins a digest instead, which
+          # is what makes a rollback mean something.
+          image: ghcr.io/motrice/webhook-proxy:main
+          # Always, because `main` is a moving tag and any other policy would
+          # leave a node serving whatever it happened to pull first.
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            # Nothing is ever written: the routing file and the secrets are
+            # mounted read-only and the logs go to stdout.
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # 0.0.0.0, not the binary's loopback default. A pod listening on
+            # loopback is reachable by nothing at all — not the Service, not the
+            # kubelet probe — and looks healthy right up to the first request.
+            - name: WEBHOOK_PROXY_LISTEN
+              value: 0.0.0.0:8080
+            # Both paths are inside the volumes mounted below, and
+            # crates/app/tests/manifests.rs proves these are the names the binary
+            # actually reads: it points each one somewhere broken and checks the
+            # binary complains about that place rather than its own default.
+            - name: WEBHOOK_PROXY_CONFIG
+              value: /etc/webhook-proxy/routing/config.yaml
+            - name: WEBHOOK_PROXY_SECRETS_DIR
+              value: /etc/webhook-proxy/secrets
+            - name: RUST_LOG
+              value: info
+          readinessProbe:
+            httpGet:
+              path: /health
+              # The number rather than the `http` name, in all three places, so
+              # the manifest test can compare them. A probe aimed at a port
+              # nothing listens on makes every pod unready and explains nothing.
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            # The probe answers from the process alone and never touches the chat
+            # server, so a failure here really does mean this pod is wedged.
+            failureThreshold: 3
+          volumeMounts:
+            - name: routing
+              mountPath: /etc/webhook-proxy/routing
+              readOnly: true
+            # A directory of its own rather than a subPath inside the one above:
+            # mounting both at /etc/webhook-proxy would have the second shadow
+            # the first, and subPath mounts do not see a ConfigMap update.
+            - name: secrets
+              mountPath: /etc/webhook-proxy/secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # No CPU limit: throttling a proxy adds latency to the one thing it
+              # does, and the memory limit is what actually bounds a runaway.
+              memory: 128Mi
+      volumes:
+        # Both objects are bead gc-ast.13's to write — that bead mounts the
+        # routing file properly, with the checksum annotation that makes a change
+        # roll the pods. Until then these names are a promise, and a pod will not
+        # start without them; the README says what to create.
+        - name: routing
+          configMap:
+            name: webhook-proxy-routing
+        - name: secrets
+          secret:
+            secretName: webhook-proxy-secrets
+            # Owner and group, and the group is fsGroup above. Not 0400: the
+            # files are owned by root, so owner-only means nobody.
+            defaultMode: 0440

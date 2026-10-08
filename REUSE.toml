@@ -29,7 +29,7 @@ SPDX-FileCopyrightText = "2026 Motrice AB"
 SPDX-License-Identifier = "CC-BY-4.0"
 
 [[annotations]]
-path = [".github/**", ".forgejo/**", ".claude/**", ".beads/**", ".agents/**", ".codex/**", ".cursor/**", ".gitignore", ".mise.toml", ".gommitlint.yaml", "deploy/**"]
+path = [".github/**", ".forgejo/**", ".claude/**", ".beads/**", ".agents/**", ".codex/**", ".cursor/**", ".gitignore", ".dockerignore", ".mise.toml", ".gommitlint.yaml", "deploy/**"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Motrice AB"
 SPDX-License-Identifier = "CC0-1.0"

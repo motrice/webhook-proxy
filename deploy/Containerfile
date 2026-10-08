@@ -1,0 +1,62 @@
+# The product image. Built container-first: cargo runs inside this build, not
+# before it, so the only way to produce the image is the way CI produces it.
+#
+# The alternative — build a binary on the host, COPY it in — needs a build host
+# whose glibc and toolchain match the runtime image, and gives a second way to
+# make an image that looks identical and is not. Bead gc-kow chose this.
+#
+# Context is the workspace root, not deploy/. Build from the repository root:
+#
+#   docker buildx build -f deploy/Containerfile --target runtime \
+#     --platform linux/amd64,linux/arm64 .
+#
+# Both architectures, because the development cluster is arm64 under Lima while
+# CI and anything production is amd64. Deliberately no --target triple and no
+# cross-compiler: each platform builds natively (under emulation when it has to),
+# so neither architecture is the special case that only breaks in the other one's
+# pipeline.
+
+# Debian rather than Alpine, matching deploy/ci-image/Containerfile and for the
+# same reason: the gate builds against glibc, so the shipped artefact should too.
+# The channel here must stay in step with rust-toolchain.toml.
+FROM rust:1.95-bookworm AS build
+
+WORKDIR /src
+
+# One COPY of the whole workspace. A manifests-first layer to cache dependencies
+# is the usual trick, and across thirteen crates it means thirteen stub mains
+# kept in step by hand — a cache that silently stops matching the real build.
+# BuildKit cache mounts below do the same job without the bookkeeping.
+COPY . .
+
+# --locked: Cargo.lock is committed, and a release that quietly resolved a
+# different dependency tree than the gate tested is not the thing that was
+# tested.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release --locked --bin webhook-proxy \
+    && cp /src/target/release/webhook-proxy /usr/local/bin/webhook-proxy
+
+# Distroless rather than debian-slim: no shell, no package manager, nothing to
+# live off. `cc` rather than `static` because the build above is a glibc build.
+#
+# No ca-certificates layer, which looks like an omission and is not: reqwest is
+# built with rustls and webpki-roots, so the binary carries its own trust roots.
+# Adding the system store would create a second, unused source of truth for which
+# certificate authorities this proxy trusts.
+#
+# The cost is paid at debugging time: there is no shell to exec into. Diagnose
+# from logs, from `kubectl debug` with an ephemeral container, or by running the
+# image locally — not by poking at a running pod.
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+COPY --from=build /usr/local/bin/webhook-proxy /usr/local/bin/webhook-proxy
+
+# 65532, the uid distroless's `nonroot` tag provides. Stated here as well so the
+# image refuses to run as root even where no Kubernetes securityContext applies.
+USER 65532:65532
+
+# Nothing is baked in but the entrypoint. Where to listen, what to route and
+# which secrets to read all come from the environment and from mounted files, so
+# the same image is the one that was tested, deployed and rolled back to.
+ENTRYPOINT ["/usr/local/bin/webhook-proxy"]

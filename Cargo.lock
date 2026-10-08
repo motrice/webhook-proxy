@@ -39,6 +39,7 @@ dependencies = [
  "inbound-http",
  "reqwest",
  "serde_json",
+ "serde_yaml_ng",
  "shared-values",
  "system",
  "tempfile",

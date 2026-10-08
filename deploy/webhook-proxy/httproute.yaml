@@ -1,0 +1,44 @@
+# An HTTPRoute, not an Ingress.
+#
+# Bead gc-d01's criterion said Ingress. The target cluster has no Ingress
+# controller and no IngressClass at all: it runs Cilium's Gateway API
+# implementation, every other workload here attaches an HTTPRoute to the single
+# `dev-local` Gateway, and an Ingress object would be accepted by the API server
+# and then route nothing. Recorded on the bead.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: webhook-proxy
+  namespace: webhook-proxy
+  labels:
+    app.kubernetes.io/name: webhook-proxy
+spec:
+  parentRefs:
+    # The shared Gateway in `default`, whose https listener terminates TLS for
+    # *.dev.test. Cross-namespace attachment needs no ReferenceGrant because that
+    # listener accepts routes `from: All`.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: dev-local
+      namespace: default
+      sectionName: https
+  hostnames:
+    # Development only. A forge on the internet cannot resolve a reserved TLD, so
+    # reaching this from GitHub needs a real name and is the maintainer's step.
+    - webhook-proxy.dev.test
+  rules:
+    # Only the webhook endpoint is published.
+    #
+    # /health is for kubelet, which reaches the pod directly and needs no route.
+    # Publishing it would hand anyone a liveness oracle for an internal service;
+    # publishing / would publish whatever endpoint is added next without anyone
+    # deciding to.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /webhook
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: webhook-proxy
+          port: 8080
