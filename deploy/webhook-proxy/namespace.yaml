@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webhook-proxy
+  labels:
+    app.kubernetes.io/name: webhook-proxy
+    # Its own namespace because this is the one workload in the cluster that
+    # answers unauthenticated requests from the open internet. A network policy
+    # or an admission rule written for it should not have to be written for
+    # anything else, and should not be loosened by anything else arriving later.
+    app.kubernetes.io/part-of: integrations

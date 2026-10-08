@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The binary is named for the product, not for the crate. Everything else
+# already says `webhook-proxy` — the error messages, the environment variables,
+# the container — and a container whose entrypoint is `/usr/local/bin/app`
+# tells an operator nothing about what is running.
+[[bin]]
+name = "webhook-proxy"
+path = "src/main.rs"
+
 [dependencies]
 domain = { path = "../domain" }
 application = { path = "../application" }
@@ -30,6 +38,9 @@ tempfile = "3"
 # stub hookshot to receive what comes out the other side.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
+# The deployment manifests are read by a test, so a manifest that disagrees with
+# this crate's environment contract fails the build rather than a pod.
+serde_yaml_ng = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "process"] }
 
 [lints]

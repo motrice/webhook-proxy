@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The ConfigMap and the Secret are deliberately absent, for two different
+# reasons. The Secret holds a webhook secret and a hookshot URL that is itself a
+# credential, so no placeholder for either is ever committed — the same rule
+# deploy/forgejo-runner follows. The ConfigMap is bead gc-ast.13's, which mounts
+# the routing file with the checksum annotation that makes a change roll the
+# pods; a stand-in here would be the third variant of a file that already exists
+# once, at deploy/config.example.yaml.
+#
+# So `kubectl apply -k` here produces pods that wait for their volumes. README.md
+# says what to create.
+resources:
+  - namespace.yaml
+  - service.yaml
+  - deployment.yaml
+  - httproute.yaml

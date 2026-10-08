@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-proxy
+  namespace: webhook-proxy
+  labels:
+    app.kubernetes.io/name: webhook-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: webhook-proxy
+  ports:
+    # The same number on both sides on purpose. A Service that listens on 80 and
+    # forwards to 8080 reads fine and gives one more place for a port to drift
+    # out of step with what the binary was told to bind; crates/app/tests/
+    # manifests.rs checks that number against the Deployment's environment.
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
