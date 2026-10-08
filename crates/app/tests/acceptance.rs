@@ -102,6 +102,10 @@ async fn start(extra: HashMap<&str, String>) -> Result<Proxy, String> {
     command
         .env_clear()
         .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        // No waiting, unless a test asks for it. Nothing here is racing an agent
+        // that renders secrets, and the real bound in every test that proves a
+        // refusal would be half a minute of suite each.
+        .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (name, value) in extra {
@@ -803,4 +807,113 @@ async fn a_termination_signal_lets_a_request_already_accepted_finish() {
     // Killed by a signal is not a clean stop: it is what happens when nothing
     // handles SIGTERM, and it is what this asserts is no longer the case.
     assert!(stopped.success(), "did not stop cleanly: {stopped:?}");
+}
+
+#[tokio::test]
+async fn a_secret_that_arrives_a_moment_late_is_waited_for() {
+    // The deployment this has to survive: an agent renders the secrets into a
+    // tmpfs beside this process, and for the first seconds of a pod's life the
+    // directory is empty. Refusing immediately is correct about the state and
+    // wrong about the situation — and Kubernetes answers it with
+    // CrashLoopBackOff, 0s then 10s then 20s then 40s, so a pod can take a
+    // minute to come up over a race that resolved in three seconds. Bead gc-6b7.
+    //
+    // Written against the binary saying it is waiting, not against a delay. The
+    // first version of this test wrote the file after 400ms and passed with no
+    // waiting implemented at all, because a debug binary takes longer than that
+    // to reach its first read — it was measuring which of two races won.
+    let (base, _) = hookshot().await;
+    let (dir, env) = configured(&base);
+
+    let late = dir.path().join("secrets").join("github-webhook-secret");
+    let contents = fs::read_to_string(&late).expect("the fixture wrote it");
+    fs::remove_file(&late).expect("a writable temporary directory");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_webhook-proxy"));
+    command
+        .env_clear()
+        .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "10000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in &env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("the binary runs");
+
+    let mut complaints = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+    let waiting = tokio::time::timeout(Duration::from_secs(10), complaints.next_line())
+        .await
+        .expect("it says something within ten seconds")
+        .expect("stderr is readable")
+        .expect("it says it is waiting rather than exiting");
+
+    // It has looked, not found it, and said which one. Only now does it appear.
+    assert!(waiting.contains("github-webhook-secret"), "{waiting}");
+    fs::write(&late, contents).expect("a writable temporary directory");
+
+    let mut announced = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
+    let line = tokio::time::timeout(Duration::from_secs(10), announced.next_line())
+        .await
+        .expect("it starts within ten seconds")
+        .expect("stdout is readable")
+        .expect("it announces a port rather than exiting");
+
+    assert!(line.starts_with("listening on 127.0.0.1:"), "{line}");
+
+    let _ = child.start_kill();
+    drop(dir);
+}
+
+#[tokio::test]
+async fn a_secret_that_never_arrives_still_stops_the_process_and_names_it() {
+    // The other half, and the one that matters more: waiting must not turn a
+    // misconfiguration into a process that hangs. A deployment missing a secret
+    // is broken, and it should say which secret, in seconds.
+    let (base, _) = hookshot().await;
+    let (dir, mut env) = configured(&base);
+
+    fs::remove_file(dir.path().join("secrets").join("github-webhook-secret"))
+        .expect("a writable temporary directory");
+
+    env.insert("WEBHOOK_PROXY_STARTUP_WAIT_MS", "600".to_owned());
+
+    let why = start(env).await.expect_err("it must refuse to start");
+
+    assert!(why.contains("github-webhook-secret"), "{why}");
+    assert!(why.contains("secrets"), "{why}");
+}
+
+#[test]
+fn check_does_not_wait_for_anything() {
+    // `check` validates a file. Nothing is racing it, and a reviewer running it
+    // on a laptop should not sit through a timeout for a path that is simply
+    // wrong. So it reads once and says so, whatever the bound is set to.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            dir.path()
+                .join("absent.yaml")
+                .to_str()
+                .expect("a utf-8 path")
+                .to_owned(),
+        ),
+        // Twenty seconds on offer, and the assertion allows five. Long enough
+        // that honouring it is unmistakable, short enough that a regression
+        // fails in twenty seconds rather than holding up the suite — the first
+        // version offered ten minutes and took all of them to fail.
+        ("WEBHOOK_PROXY_STARTUP_WAIT_MS", "20000".to_owned()),
+    ]);
+
+    let began = std::time::Instant::now();
+    let (ok, out, err) = check(&env);
+
+    assert!(!ok, "{err}{out}");
+    assert!(err.contains("absent.yaml"), "{err}");
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
 }

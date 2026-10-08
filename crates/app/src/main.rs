@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::process::ExitCode;
 use std::time::Duration;
+use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
 use application::ports::{Dispatcher, Proofs, Translator};
@@ -65,6 +66,7 @@ struct Config {
     timeout: Duration,
     file: PathBuf,
     secrets: PathBuf,
+    startup_wait: Duration,
 }
 
 impl Config {
@@ -94,6 +96,17 @@ impl Config {
                 "WEBHOOK_PROXY_SECRETS_DIR",
                 "/etc/webhook-proxy/secrets",
             )),
+            // Settable, which the rest of this struct's defaults are not needed
+            // to be, for two reasons worth stating. A cluster whose secret store
+            // is slow to answer may need longer; and the tests that prove this
+            // refuses have to prove it without waiting out the real bound, which
+            // would otherwise put half a minute into the suite for every one of
+            // them.
+            startup_wait: Duration::from_millis(
+                optional("WEBHOOK_PROXY_STARTUP_WAIT_MS", "30000")
+                    .parse()
+                    .unwrap_or(30_000),
+            ),
         }
     }
 }
@@ -103,6 +116,60 @@ fn optional(name: &str, fallback: &str) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback.to_owned())
+}
+
+/// How often to look again while waiting for configuration.
+///
+/// Short enough that a pod is not held up by the polling itself, long enough
+/// that a directory which stays empty for the whole bound is not stat'd
+/// thousands of times for nothing.
+const LOOK_AGAIN: Duration = Duration::from_millis(250);
+
+/// Reads the routing file and its secrets, waiting for them to appear.
+///
+/// Refusing to start without them is right, and `Configuration::read` does it
+/// with a message naming what is missing. What it cannot tell apart is "missing"
+/// from "not rendered yet" — and in the deployment this runs in, an agent
+/// renders the secrets into a tmpfs beside this process, so for the first
+/// seconds of a pod's life the directory is empty by design.
+///
+/// Exiting there is answered by Kubernetes with `CrashLoopBackOff`: 0s, 10s, 20s,
+/// 40s. The agent is done in about three seconds and the pod can still take a
+/// minute to come up, because the backoff is punishing a race rather than a
+/// fault. Bead gc-6b7.
+///
+/// Any failure is retried, not only an absent file. The agent writes its
+/// templates directly rather than swapping them in atomically the way a
+/// Kubernetes volume does, so a half-written routing file is a transient state
+/// too, and telling the two apart would mean reading the reason text.
+///
+/// The bound is what keeps this from turning a misconfiguration into a process
+/// that hangs: when it expires, this refuses with exactly the message it would
+/// have refused with immediately.
+async fn configured(config: &Config) -> Result<Configuration, Unstartable> {
+    let deadline = Instant::now() + config.startup_wait;
+    let mut said = false;
+
+    loop {
+        let why = match Configuration::read(&config.file, &config.secrets) {
+            Ok(routing) => return Ok(routing),
+            Err(why) => why.to_string(),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(Unstartable::Configuration(why));
+        }
+
+        // Once, and on stderr for the same reason the refusal below is printed
+        // rather than logged: it must be readable with the log filter turned
+        // down, and stdout carries the one line saying which port was taken.
+        if !said {
+            eprintln!("webhook-proxy is waiting for its configuration: {why}");
+            said = true;
+        }
+
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
 }
 
 /// Liveness and readiness for k3s probes.
@@ -214,9 +281,8 @@ async fn run() -> Result<(), Unstartable> {
 
     // Everything about who may send and who hears what comes from here. The file
     // refuses itself if anything is wrong, naming the file and the field, so this
-    // adds nothing to its message.
-    let routing = Configuration::read(&config.file, &config.secrets)
-        .map_err(|why| Unstartable::Configuration(why.to_string()))?;
+    // adds nothing to its message — it only waits for it to be there at all.
+    let routing = configured(&config).await?;
 
     // One verifier per mechanism, each holding every secret. Which Origin gets
     // which is decided below, from what that Origin declared — never here, and
