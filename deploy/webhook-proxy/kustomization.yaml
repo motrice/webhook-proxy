@@ -1,17 +1,35 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-# The ConfigMap and the Secret are deliberately absent, for two different
-# reasons. The Secret holds a webhook secret and a hookshot URL that is itself a
-# credential, so no placeholder for either is ever committed — the same rule
-# deploy/forgejo-runner follows. The ConfigMap is bead gc-ast.13's, which mounts
-# the routing file with the checksum annotation that makes a change roll the
-# pods; a stand-in here would be the third variant of a file that already exists
-# once, at deploy/config.example.yaml.
+# No Secret object, and no placeholder for a secret value anywhere in this
+# repository. The values come from the secret store, rendered into a tmpfs by an
+# agent beside the proxy — bead gc-qkc — which is a stronger version of the rule
+# deploy/forgejo-runner already follows for its registration token.
 #
-# So `kubectl apply -k` here produces pods that wait for their volumes. README.md
-# says what to create.
+# Both ConfigMaps are generated rather than written out, so kustomize appends a
+# hash of their contents to the name and rewrites the Deployment's reference. A
+# routing change therefore rolls the pods on its own, with nothing to remember to
+# bump.
+# Set here as well as on each manifest, and not redundantly: kustomize matches a
+# generated ConfigMap to the Deployment that references it by name AND namespace.
+# Without this the generators land in `default`, the match fails silently, and the
+# hashed names are created while the Deployment goes on referencing the unhashed
+# ones — a pod mounting a ConfigMap that does not exist.
+namespace: webhook-proxy
+
 resources:
   - namespace.yaml
+  - serviceaccount.yaml
   - service.yaml
   - deployment.yaml
   - httproute.yaml
+
+configMapGenerator:
+  # The published example itself, not a copy of it: one file, which the
+  # acceptance test and yaml-config's own tests both read, so a routing file
+  # that is deployed is a routing file something checks.
+  - name: webhook-proxy-routing
+    files:
+      - config.yaml=config.example.yaml
+  - name: webhook-proxy-vault-agent
+    files:
+      - vault-agent.hcl
