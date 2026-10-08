@@ -40,7 +40,10 @@ That is best-effort, stated plainly, and the rest follows from it:
   identity, the destination's identity and the reason, and counted. A
   best-effort system whose losses are invisible is indistinguishable from a
   broken one; the log is what makes "best-effort" an engineering decision rather
-  than an excuse.
+  than an excuse. Which is why a success *status* is not taken as proof of
+  delivery: there is a web application firewall in front of the destination and
+  it refuses with `200 OK` and an HTML page, so a dispatch counts as delivered
+  only when the destination itself says so, in the words it actually uses.
 - **Duplicates are possible.** Inside the attempt budget a destination can see
   the same notice twice, when it accepted a request whose response was lost. For
   a chat room that is a cosmetic duplicate rather than corruption, but nothing

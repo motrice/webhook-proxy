@@ -125,6 +125,17 @@ pub trait Dispatcher: Send + Sync {
 pub enum DispatchFailed {
     /// The Destination was reached and would not accept it.
     Rejected,
+    /// Something that is not the Destination answered, and said yes.
+    ///
+    /// A success status whose body is not the Destination's own. Something on
+    /// the path — a proxy, a web application firewall — answered on its behalf,
+    /// so the Notice was not delivered and the Destination never saw it.
+    ///
+    /// Distinct from [`Self::Rejected`] because the difference is the whole
+    /// value of knowing: an operator told a Dispatch was refused will go and
+    /// read the Destination's logs, and find no trace of a request that never
+    /// arrived.
+    Intercepted,
     /// The Destination could not be reached.
     Unreachable,
     /// The Destination did not answer in time.
