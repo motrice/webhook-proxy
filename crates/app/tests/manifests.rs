@@ -25,22 +25,95 @@ const DEPLOYMENT: &str = include_str!("../../../deploy/webhook-proxy/deployment.
 const SERVICE: &str = include_str!("../../../deploy/webhook-proxy/service.yaml");
 const ROUTE: &str = include_str!("../../../deploy/webhook-proxy/httproute.yaml");
 const CONTAINERFILE: &str = include_str!("../../../deploy/Containerfile");
+const AGENT: &str = include_str!("../../../deploy/webhook-proxy/vault-agent.hcl");
+const ROUTING: &str = include_str!("../../../deploy/webhook-proxy/config.example.yaml");
 const IGNORED: &str = include_str!("../../../.dockerignore");
 
-/// The one container the Deployment runs.
-fn container() -> Value {
+/// The Deployment's containers, by name.
+///
+/// By name rather than by position, and not because there happen to be two. The
+/// agent beside the proxy needs no agreement with the binary at all — it needs
+/// one with the directory, which the assertions below check. Pinning this to
+/// "there is exactly one container" would mean loosening a test every time the
+/// pod gains one, which is the wrong way round.
+fn containers() -> std::collections::BTreeMap<String, Value> {
     let manifest: Value = serde_yaml_ng::from_str(DEPLOYMENT).expect("the Deployment parses");
-    let containers = manifest["spec"]["template"]["spec"]["containers"]
+    manifest["spec"]["template"]["spec"]["containers"]
         .as_sequence()
         .expect("the Deployment runs containers")
-        .clone();
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"]
+                    .as_str()
+                    .expect("a named container")
+                    .to_owned(),
+                entry.clone(),
+            )
+        })
+        .collect()
+}
 
-    assert_eq!(
-        containers.len(),
-        1,
-        "a second container would need its own agreement with the binary"
-    );
-    containers[0].clone()
+/// The container running the binary this crate builds.
+fn container() -> Value {
+    containers()
+        .remove("webhook-proxy")
+        .expect("the Deployment runs the proxy")
+}
+
+/// The volumes the pod declares, by name.
+fn volumes() -> std::collections::BTreeMap<String, Value> {
+    let manifest: Value = serde_yaml_ng::from_str(DEPLOYMENT).expect("the Deployment parses");
+    manifest["spec"]["template"]["spec"]["volumes"]
+        .as_sequence()
+        .expect("the pod declares volumes")
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().expect("a named volume").to_owned(),
+                entry.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Every secret name the routing file refers to, wherever it appears.
+///
+/// Collected by walking for the key rather than by knowing the shape, so a new
+/// place to name a secret is covered the day it is added.
+fn secrets_named_by_the_routing_file() -> std::collections::BTreeSet<String> {
+    fn walk(node: &Value, found: &mut std::collections::BTreeSet<String>) {
+        match node {
+            Value::Mapping(entries) => {
+                for (key, value) in entries {
+                    if key.as_str() == Some("secret")
+                        && let Some(name) = value.as_str()
+                    {
+                        found.insert(name.to_owned());
+                    }
+                    walk(value, found);
+                }
+            }
+            Value::Sequence(items) => items.iter().for_each(|item| walk(item, found)),
+            _ => {}
+        }
+    }
+
+    let routing: Value = serde_yaml_ng::from_str(ROUTING).expect("the routing file parses");
+    let mut found = std::collections::BTreeSet::new();
+    walk(&routing, &mut found);
+    found
+}
+
+/// Every file the agent is configured to render.
+fn files_the_agent_renders() -> std::collections::BTreeSet<String> {
+    AGENT
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("destination = \""))
+        .filter_map(|rest| rest.strip_suffix('"'))
+        .filter_map(|path| path.rsplit('/').next())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// What the manifest puts in the container's environment, by name.
@@ -478,5 +551,116 @@ fn the_containerfile_declares_the_stage_the_release_workflow_will_name() {
     assert!(
         IGNORED.lines().any(|line| line.trim() == "target/"),
         "the host's target/ would be copied into the build context"
+    );
+}
+
+#[test]
+fn the_agent_renders_exactly_the_secrets_the_routing_file_names() {
+    // The failure this prevents is quiet and total: add a room to the routing
+    // file, forget its template stanza, and the pod waits for a secret nothing
+    // will ever write — then refuses, naming a file whose absence is explained
+    // nowhere. The two lists are written in different files in different
+    // languages, so nothing but this keeps them in step.
+    assert_eq!(
+        files_the_agent_renders(),
+        secrets_named_by_the_routing_file(),
+        "the agent and the routing file disagree about which secrets exist"
+    );
+}
+
+#[test]
+fn every_rendered_secret_is_readable_by_the_group_the_proxy_runs_as() {
+    // The agent writes these files and the proxy reads them. Owner-only means
+    // nobody, and the symptom is a pod reporting a secret as absent for a file
+    // that is present and unreadable — which this deployment has already paid
+    // for once, on the Secret that preceded this (gc-d01).
+    let granting: Vec<&str> = AGENT
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("perms"))
+        .map(str::trim)
+        .collect();
+
+    assert_eq!(
+        granting.len(),
+        files_the_agent_renders().len(),
+        "a template renders a file without saying who may read it: {granting:?}"
+    );
+    for perms in granting {
+        let mode = perms
+            .trim_start_matches(['=', ' '])
+            .trim_matches('"')
+            .to_owned();
+        let group = mode
+            .chars()
+            .nth(2)
+            .and_then(|digit| digit.to_digit(8))
+            .expect("an octal mode");
+        assert!(group & 0b100 != 0, "{mode} is not readable by the group");
+    }
+}
+
+#[test]
+fn the_rendered_secrets_never_reach_a_disk() {
+    // The volume the proxy reads its secrets from is also the one the agent
+    // writes them to, and it has to be memory-backed. An ordinary emptyDir is a
+    // directory on the node, so every secret this proxy holds would be written
+    // to a disk nobody thinks of as holding secrets.
+    let declared = environment();
+    let directory = declared
+        .iter()
+        .find(|(name, _)| name.contains("SECRETS"))
+        .map(|(_, value)| value.clone())
+        .expect("a secrets directory");
+
+    let mounted = mounts();
+    let (holding, mount) = mounted
+        .iter()
+        .find(|(_, mount)| mount["mountPath"].as_str() == Some(directory.as_str()))
+        .expect("something is mounted where the secrets are read from");
+
+    assert_eq!(
+        mount["readOnly"].as_bool(),
+        Some(true),
+        "the proxy never writes a secret; it should not be able to"
+    );
+    assert_eq!(
+        volumes()[holding]["emptyDir"]["medium"].as_str(),
+        Some("Memory"),
+        "{holding} is backed by the node's disk, so every secret is written to it"
+    );
+}
+
+#[test]
+fn something_in_the_pod_actually_fills_the_directory_the_proxy_waits_on() {
+    // The proxy waits for its secrets and then refuses (gc-6b7). If nothing in
+    // the pod writes to that volume, the wait is the whole of the start-up and
+    // the refusal is guaranteed — a manifest that looks complete and produces a
+    // pod that can never start.
+    let directory = environment()
+        .into_iter()
+        .find(|(name, _)| name.contains("SECRETS"))
+        .map(|(_, value)| value)
+        .expect("a secrets directory");
+
+    let filling: Vec<String> = containers()
+        .into_iter()
+        .filter(|(name, _)| name != "webhook-proxy")
+        .filter(|(_, container)| {
+            container["volumeMounts"]
+                .as_sequence()
+                .is_some_and(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount["mountPath"].as_str() == Some(directory.as_str())
+                            && mount["readOnly"].as_bool() != Some(true)
+                    })
+                })
+        })
+        .map(|(name, _)| name)
+        .collect();
+
+    assert_eq!(
+        filling.len(),
+        1,
+        "exactly one container should write the secrets the proxy reads, found {filling:?}"
     );
 }

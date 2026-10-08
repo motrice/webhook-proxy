@@ -37,25 +37,73 @@ package to public and delete this secret along with the `imagePullSecrets` block
 — bead gc-rdz carries the reminder, because a credential nobody needs is a
 credential nobody audits.
 
-## The ConfigMap and the Secret are bead gc-ast.13's
+## Configuration, and where the values come from
 
-`deployment.yaml` mounts two volumes and will not start without them:
+`deployment.yaml` mounts three volumes:
 
-| Volume    | Object                                 | Mounted at                      |
-| --------- | -------------------------------------- | ------------------------------- |
-| `routing` | ConfigMap `webhook-proxy-routing`      | `/etc/webhook-proxy/routing`    |
-| `secrets` | Secret `webhook-proxy-secrets`         | `/etc/webhook-proxy/secrets`    |
+| Volume          | Holds                                   | Mounted at                   |
+| --------------- | --------------------------------------- | ---------------------------- |
+| `routing`       | the routing file, `config.yaml`         | `/etc/webhook-proxy/routing` |
+| `vault-config`  | the agent's `vault-agent.hcl`           | `/vault/config`              |
+| `vault-secrets` | the rendered secrets, on tmpfs          | `/vault/secrets`             |
 
-The routing file is `config.yaml` inside the ConfigMap; `deploy/config.example.yaml`
-is the published shape of it, and `webhook-proxy check` validates one without
-touching the network. The Secret holds one key per name that file refers to — a
-webhook secret or shared token per sender, and one URL per room.
+Both ConfigMaps are **generated** by kustomize from the files in this directory,
+so their names carry a hash of their contents and a routing change rolls the pods
+by itself. There is no annotation to remember to bump.
 
-**Every room URL is itself a credential.** Anyone holding it can post to that
-room (bead gc-o61), so it belongs in the Secret and never in the routing file.
+The routing file is `config.example.yaml`, used directly rather than copied —
+the same file `webhook-proxy check` validates and the acceptance tests read, so a
+routing file that is deployed is a routing file something checks.
 
-gc-ast.13 commits both objects, with the checksum annotation that makes a routing
-change actually roll the pods. Until then, create them by hand.
+**There is no Secret object, and no placeholder for a secret value anywhere in
+this repository.** Values live in the secret store; the `vault-agent` container
+authenticates with the pod's service account and renders one file per secret into
+`vault-secrets`, which is `emptyDir: { medium: Memory }` — tmpfs, so a secret
+never reaches a disk.
+
+**Every room URL is itself a credential.** Anyone holding it can post to that room
+(bead gc-o61), which is why rooms are *named* in the routing file and their URLs
+are not in it.
+
+### What to replace when copying this into the GitOps repository
+
+Everything marked `REPLACE` in `vault-agent.hcl` and `deployment.yaml`, which is:
+
+- the secret store's address, the Kubernetes auth role, and the secret path and
+  field names in all five `template` stanzas
+- the `vault-agent` container's image
+- `config.example.yaml` itself, with the real routing — the example names rooms
+  that do not exist
+- `ghcr.io/motrice/webhook-proxy:main`, which should be pinned to a digest there;
+  a moving tag cannot be rolled back to
+
+The role binding that lets this service account read those secrets lives in the
+secret store, not here.
+
+Two things each `template` stanza must get right, both of which cost a working
+deployment if missed, and both of which have already cost one once:
+
+- **`perms = "0440"`.** The agent writes these files and the proxy reads them as
+  a different process in the same group. Owner-only means nobody, and the symptom
+  is a pod reporting a secret as *absent* for a file that is present and
+  unreadable.
+- **No leading whitespace in `contents`.** `yaml-config` trims a trailing newline
+  from a secret value and nothing else. A byte in front of an HMAC secret produces
+  `401` on every signed delivery and nothing in the log to explain it.
+
+`crates/app/tests/manifests.rs` checks the first of those, and checks that the
+files the agent renders are exactly the secrets the routing file names — add a
+room and forget its stanza, and a named test fails rather than a pod waiting for
+something nothing will ever write.
+
+### Ordering
+
+The agent is a plain container, matching the pattern this cluster's GitOps uses
+for every service. It is deliberately not ordered before the proxy: the proxy
+waits for its configuration to appear, bounded and polled, and says on stderr
+what it is waiting for (bead gc-6b7). That works under a plain sidecar, a native
+one, an injector, or a plainly mounted Secret, and leaves the choice to whoever
+owns the platform.
 
 ## An HTTPRoute, not an Ingress
 
