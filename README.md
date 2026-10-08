@@ -146,7 +146,7 @@ where it cannot authenticate what it receives.
 | `WEBHOOK_PROXY_TIMEOUT_MS` | no | default 5000, bounding each dispatch |
 
 None of those is a secret, and none of them is policy. Who may send and who
-hears what live in `WEBHOOK_PROXY_CONFIG` — see `deploy/config.example.yaml` —
+hears what live in `WEBHOOK_PROXY_CONFIG` — see `deploy/webhook-proxy/config.example.yaml` —
 because a human reviews routing as a diff rather than as a list of variables.
 Secrets are named in that file and read by name from `WEBHOOK_PROXY_SECRETS_DIR`,
 so no secret value appears in the file or in the environment.
@@ -208,7 +208,7 @@ hear anything. The table shows that as `repositry*=…` and as
 `(nothing selects this room)` — obvious to a person, impossible as a rule.
 
 To run it against a real repository: write a routing file and a secrets
-directory as `deploy/config.example.yaml` shows, start it pointing at them,
+directory as `deploy/webhook-proxy/config.example.yaml` shows, start it pointing at them,
 expose the port to the internet however you normally would (`ssh -R`, a tunnel,
 or an Ingress), then add a webhook to the repository pointing at
 `https://<host>/webhook/github` with content type `application/json`, the same

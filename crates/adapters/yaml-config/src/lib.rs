@@ -646,7 +646,7 @@ mod tests {
     /// here makes the example and this parser incapable of drifting apart.
     const EXAMPLE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../deploy/config.example.yaml"
+        "/../../../deploy/webhook-proxy/config.example.yaml"
     );
 
     /// Every secret the example names, with values that are obviously not real.
