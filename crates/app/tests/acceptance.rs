@@ -597,7 +597,7 @@ fn check_prints_what_the_published_example_would_route() {
             "WEBHOOK_PROXY_CONFIG",
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../deploy/config.example.yaml"
+                "/../../deploy/webhook-proxy/config.example.yaml"
             )
             .to_owned(),
         ),
