@@ -28,6 +28,7 @@ pub use label::{LabelName, LabelValue, Labels};
 pub use origin::{Origin, OriginId, SecretId, Verification};
 pub use proof::{Proof, ProofMismatch};
 pub use routing::{
-    Destination, DestinationId, DestinationKind, Dispatch, Filter, Subscription, destinations_for,
+    Destination, DestinationId, DestinationKind, Dispatch, DispatchId, Filter, Subscription,
+    destinations_for,
 };
 pub use time::Timestamp;
