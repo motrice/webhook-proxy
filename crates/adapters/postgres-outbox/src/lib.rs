@@ -5,6 +5,8 @@
 //! that a restart does not lose what has not been sent, and that two replicas
 //! work the same queue without sending anything twice.
 
+mod outbox;
 mod stored;
 
+pub use outbox::PostgresOutbox;
 pub use stored::{Unreadable, read, written};
