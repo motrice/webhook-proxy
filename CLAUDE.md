@@ -258,10 +258,12 @@ to fetch the mise-pinned hygiene tools.
   and history stays linear.
 - **So every commit landed on `main` is hardware-signed**, and that is the audit
   trail: each one carries cryptographic evidence that a human approved it.
-  Reading it back is `git log --format='%h %G? %GK'`. One commit predates the
-  rule and is signed by the agent key — `5189569`, the intermediate commit of the
-  two-commit branch that exposed `gc-aa4`. Removing it means rewriting `main`,
-  which is the maintainer's call; the bead says what that costs.
+  Reading it back is `git log --format='%h %G? %GK'`. There are no exceptions.
+  The one that existed — the intermediate commit of the two-commit branch that
+  exposed `gc-aa4` — was re-signed on 2026-10-11 by rebasing `main` from it
+  onward with `--gpg-sign`. What that cost is in the bead: one touch per commit,
+  and a committer date that now says when the commit was re-attested rather than
+  when it landed.
 - **Keep a bead branch to one commit unless two genuinely explain each other.**
   Approving costs one touch per commit, so a branch of six costs six. The rule
   exists because signing only the tip once let an unapproved commit onto `main`

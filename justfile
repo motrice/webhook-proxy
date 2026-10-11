@@ -404,7 +404,7 @@ _ensure-devtools:
 # will become main.
 # Mirror main to the local Forgejo remote, which runs the fast gate.
 #
-# Deleted by accident in 568b71e and restored: the gate checks that this file
+# Deleted by accident in f9134d4 and restored: the gate checks that this file
 # parses, never that a recipe still exists, so a lost recipe is invisible until
 # somebody reaches for it.
 [doc("Push main to Forgejo, which runs the fast gate")]
@@ -416,8 +416,11 @@ mirror:
 #
 # Every commit, not just the tip. The first version amended the tip alone, which
 # was right while every bead branch held exactly one commit and wrong the first
-# time one held two: PR #27 landed 5189569 on main carrying the agent's software
-# key, because nothing had re-signed it. See bead gc-aa4.
+# time one held two: PR #27 landed a commit on main carrying the agent's
+# software key, because nothing had re-signed it. See bead gc-aa4. That commit
+# was re-signed on 2026-10-11, so the SHA this comment used to name no longer
+# exists; naming it here would send a reader looking for an object that is only
+# reachable from stale branches.
 #
 # The rebase is onto the branch's own merge-base, never onto a moved main. Main
 # may have advanced since CI passed, and quietly rebasing onto it would change
