@@ -151,18 +151,23 @@ neighbours in `crates/adapters/alertmanager-payload/src/lib.rs`.
 of them is delivered — better than a room hearing about two of three with nobody
 knowing the third existed.
 
-**Grouping is not preserved.** `group_by` collapses many firing alerts into one
-notification so a room gets one message; this proxy sends **one message per
-alert**, so a notification carrying twenty alerts becomes twenty messages. That
-is worth knowing before an incident rather than during one, because it is exactly
-when many alerts fire at once that your grouping matters most and that we amplify
-it most.
+**Grouping is preserved.** `group_by` collapses many firing alerts into one
+notification so a room gets one message, and that is what a room gets: one
+message per room, carrying the alerts from your notification that its rules
+selected.
 
-Nothing on your side changes this: `group_interval` and `repeat_interval` govern
-how often a notification is sent, not how many messages it becomes here. It is
-our gap and we intend to close it — bead gc-lhh decided that grouped
-notifications should arrive as one message per room, and gc-smz is the work. Until
-it lands, size your grouping knowing each alert arrives on its own.
+Different alerts in one notification can select different rooms, so each room
+sees its own subset — which means the group a room sees is one this proxy
+composed, not the one you composed. A notification whose alerts all go to one
+room arrives exactly as you grouped it.
+
+A message carrying several alerts shows **one line each** rather than the full
+rendering, with a count at the top; one carrying a single alert is rendered in
+full, as before. At most eight are listed and the rest are counted — `(+12
+more)` — because Alertmanager places no limit on alerts per notification and a
+message longer than the room is no more readable than twenty separate ones. The
+trade is deliberate: a grouped message is for scanning, and the links to each
+alert are in your monitoring system.
 
 ## Grafana
 

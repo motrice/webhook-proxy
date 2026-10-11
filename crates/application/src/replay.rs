@@ -99,11 +99,12 @@ impl<'a> Replay<'a> {
         // want it before, and cannot resurrect a fact that nobody wanted at all.
         // Stated rather than hidden, because it is the limit of what "uses the
         // current Subscriptions" can mean.
-        let mut facts = Vec::new();
+        let mut facts: Vec<&domain::Event> = Vec::new();
         for record in &stored {
-            let event = record.dispatch().event();
-            if !facts.contains(&event) {
-                facts.push(event);
+            for event in record.dispatch().events() {
+                if !facts.contains(&event) {
+                    facts.push(event);
+                }
             }
         }
 
@@ -113,17 +114,28 @@ impl<'a> Replay<'a> {
         // because `origin` is the label every trustworthy rule is built on.
         let origin = stored[0].dispatch().origin().clone();
 
-        let mut planned = Vec::new();
+        // Grouped per Destination, exactly as the request path does, so a replay
+        // arrives as one message per room rather than as the fan-out this
+        // product stopped doing (gc-lhh).
+        let mut grouped: Vec<(domain::Destination, Vec<domain::Event>)> = Vec::new();
         for event in &facts {
             for destination in destinations_for(&origin, event, self.subscriptions) {
-                planned.push(Dispatch::new(
-                    delivery.clone(),
-                    origin.clone(),
-                    (*event).clone(),
-                    destination.clone(),
-                ));
+                match grouped
+                    .iter_mut()
+                    .find(|(known, _)| known.id() == destination.id())
+                {
+                    Some((_, theirs)) => theirs.push((*event).clone()),
+                    None => grouped.push((destination.clone(), vec![(*event).clone()])),
+                }
             }
         }
+
+        let planned: Vec<Dispatch> = grouped
+            .into_iter()
+            .filter_map(|(destination, theirs)| {
+                Dispatch::new(delivery.clone(), origin.clone(), theirs, destination)
+            })
+            .collect();
 
         // Stored first, like any other Dispatch, so a replay that fails is
         // retried rather than lost — and so the new rows are distinguishable
@@ -143,7 +155,7 @@ impl<'a> Replay<'a> {
                 .dispatcher
                 .dispatch(
                     dispatch.delivery(),
-                    dispatch.event(),
+                    dispatch.events(),
                     dispatch.destination(),
                     Attempt::Replay,
                 )
@@ -196,7 +208,7 @@ mod tests {
         async fn dispatch(
             &self,
             _delivery: &DeliveryId,
-            _event: &Event,
+            _events: &[Event],
             destination: &Destination,
             attempt: Attempt,
         ) -> Result<(), DispatchFailed> {
@@ -319,9 +331,10 @@ mod tests {
                     Dispatch::new(
                         DeliveryId::new("d-1").expect("a non-blank id"),
                         OriginId::new("github").expect("a non-blank id"),
-                        a_push(),
+                        vec![a_push()],
                         room(to),
-                    ),
+                    )
+                    .expect("at least one event"),
                     1,
                     Outcome::Delivered {
                         at: Timestamp::from_millis_since_epoch(NOW),

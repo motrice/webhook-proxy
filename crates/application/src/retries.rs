@@ -85,7 +85,7 @@ impl<'a> Retries<'a> {
                 .dispatcher
                 .dispatch(
                     dispatch.delivery(),
-                    dispatch.event(),
+                    dispatch.events(),
                     dispatch.destination(),
                     // A retry is a first arrival that happens to be late:
                     // nobody has seen it, so marking it would be noise in a
@@ -165,7 +165,7 @@ mod tests {
         async fn dispatch(
             &self,
             _delivery: &DeliveryId,
-            _event: &Event,
+            _events: &[Event],
             destination: &Destination,
             _attempt: Attempt,
         ) -> Result<(), DispatchFailed> {
@@ -276,7 +276,7 @@ mod tests {
             Dispatch::new(
                 DeliveryId::new("d-1").expect("a non-blank id"),
                 OriginId::new("github").expect("a non-blank id"),
-                Event::PushedCommits {
+                vec![Event::PushedCommits {
                     repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
                     branch: BranchName::new("main").expect("a name"),
                     pusher: Pusher::new("bjornmolin").expect("a name"),
@@ -285,12 +285,13 @@ mod tests {
                         Summary::new("a change").expect("a summary"),
                     )],
                     permalink: None,
-                },
+                }],
                 Destination::new(
                     DestinationId::new(room).expect("a non-blank id"),
                     DestinationKind::ChatRoom,
                 ),
-            ),
+            )
+            .expect("at least one event"),
             attempts,
             Outcome::Waiting {
                 again_at: Timestamp::from_millis_since_epoch(NOW),

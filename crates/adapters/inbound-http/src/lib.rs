@@ -267,7 +267,7 @@ async fn receive(
                 inbound.tally.delivered(destination);
             }
 
-            for (destination, failure) in relayed.retrying() {
+            for (destination, failure, alerts) in relayed.retrying() {
                 inbound.tally.retrying(destination);
                 // Not a loss and not counted as one: it is stored and due to be
                 // tried again. An operator told a Notice was lost goes looking
@@ -275,18 +275,28 @@ async fn receive(
                 tracing::info!(
                     delivery = relayed.delivery().as_str(),
                     destination = destination.as_str(),
+                    events = alerts,
                     failure = ?failure,
                     "dispatch failed, stored for another attempt"
                 );
             }
 
-            for (destination, failure) in relayed.abandoned() {
+            for (destination, failure, alerts) in relayed.abandoned() {
                 inbound.tally.abandoned(destination);
-                // Identities and a reason. A Destination holds no address, so
-                // there is no credential here to spill.
+                // One loss, however many facts it carried: it is one message
+                // that did not arrive, and counting a grouped dispatch as
+                // several would make the number mean something different
+                // depending on how the sender configured its grouping. The
+                // count is in the line so the detail is still recoverable —
+                // gc-lhh left this to be decided here, with the code in front
+                // of us.
+                //
+                // Identities, a reason and a number. A Destination holds no
+                // address, so there is no credential here to spill.
                 tracing::warn!(
                     delivery = relayed.delivery().as_str(),
                     destination = destination.as_str(),
+                    events = alerts,
                     failure = ?failure,
                     "dispatch lost"
                 );
@@ -451,7 +461,7 @@ mod tests {
         async fn dispatch(
             &self,
             _delivery: &DeliveryId,
-            _event: &Event,
+            _events: &[Event],
             destination: &Destination,
             _attempt: Attempt,
         ) -> Result<(), DispatchFailed> {

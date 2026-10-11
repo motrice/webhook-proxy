@@ -401,8 +401,16 @@ async fn an_alert_reaches_every_room_whose_rule_matches_and_no_others() {
     //   critical / prod    -> devsecops (severity) and platform (namespace)
     //   unstated / prod    -> platform only
     //   unrecognised / platform -> nothing at all
-    let received = delivered(&seen, 3).await;
+    //
+    // Two messages, not three. The sender grouped these alerts into one
+    // notification and this proxy no longer undoes that (gc-lhh): each room
+    // gets ONE message carrying the alerts that selected it, and the subsets
+    // differ, which is why the group a room sees is one we composed rather than
+    // the one Alertmanager did.
+    let received = delivered(&seen, 2).await;
 
+    // One alert selected this room, so it arrives rendered in full — the common
+    // case outside an incident, and it must not have been made worse.
     let devsecops = told(&received, ROOM);
     assert_eq!(devsecops.len(), 1, "devsecops: {received:?}");
     assert!(
@@ -410,12 +418,22 @@ async fn an_alert_reaches_every_room_whose_rule_matches_and_no_others() {
         "{devsecops:?}"
     );
 
+    // Two selected this one, so they arrive together, counted and listed.
     let platform = told(&received, PLATFORM);
-    assert_eq!(platform.len(), 2, "platform: {received:?}");
+    assert_eq!(platform.len(), 1, "platform: {received:?}");
+    assert!(platform[0].starts_with("2 things happened"), "{platform:?}");
+    assert!(
+        platform[0].contains("api latency above target"),
+        "{platform:?}"
+    );
+    assert!(
+        platform[0].contains("only a description, no summary annotation"),
+        "{platform:?}"
+    );
 
     // And the third reached nobody, which is not an error: the sender was told
     // its notification was accepted.
-    assert_eq!(received.len(), 3, "{received:?}");
+    assert_eq!(received.len(), 2, "{received:?}");
     assert!(
         !received
             .iter()

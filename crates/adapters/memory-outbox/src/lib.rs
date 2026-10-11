@@ -237,9 +237,10 @@ mod tests {
         Dispatch::new(
             delivery(id),
             OriginId::new("github").expect("a non-blank id"),
-            a_push(summary),
+            vec![a_push(summary)],
             room(to),
         )
+        .expect("at least one event")
     }
 
     #[tokio::test]

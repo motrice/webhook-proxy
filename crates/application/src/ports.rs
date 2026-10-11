@@ -103,7 +103,12 @@ pub struct Untranslatable;
 /// every caller.
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
-    /// Deliver this Event to this Destination.
+    /// Deliver these Events to this Destination, as one message.
+    ///
+    /// More than one when a sender grouped them. An implementation renders them
+    /// together rather than once each: sending one message per Event would undo
+    /// the grouping a sender configured deliberately, which is what bead gc-lhh
+    /// decided against. Never empty.
     ///
     /// The `delivery` identity is passed so an implementation can correlate its
     /// own logs with the inbound Delivery, and so a loss can be reported against
@@ -118,7 +123,7 @@ pub trait Dispatcher: Send + Sync {
     async fn dispatch(
         &self,
         delivery: &DeliveryId,
-        event: &Event,
+        events: &[Event],
         destination: &Destination,
         attempt: Attempt,
     ) -> Result<(), DispatchFailed>;
