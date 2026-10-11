@@ -60,6 +60,12 @@ template {
   contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.alertmanager_token }}{{ end }}"
 }
 
+template {
+  destination = "/vault/secrets/grafana-token"
+  perms       = "0440"
+  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.grafana_token }}{{ end }}"
+}
+
 # Each room's URL is itself a credential: anyone holding it can post to that room
 # (bead gc-o61). That is why they are here and not in the routing file, which is
 # reviewed as a diff.

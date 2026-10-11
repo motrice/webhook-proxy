@@ -650,15 +650,38 @@ mod tests {
     );
 
     /// Every secret the example names, with values that are obviously not real.
+    /// Writes a value for every secret the published example names.
+    ///
+    /// Read out of the file rather than listed here. A list is a second place to
+    /// keep in step, and it fails for the wrong reason the day the example gains
+    /// a sender — which is what it did when it gained Grafana.
     fn secrets_for_the_example(dir: &Path) {
-        for name in [
-            "github-webhook-secret",
-            "alertmanager-token",
-            "devsecops-room-url",
-            "platform-room-url",
-            "audit-room-url",
-        ] {
-            fs::write(dir.join(name), format!("not-a-real-value-for-{name}\n"))
+        fn walk(node: &serde_yaml_ng::Value, found: &mut std::collections::BTreeSet<String>) {
+            match node {
+                serde_yaml_ng::Value::Mapping(entries) => {
+                    for (key, value) in entries {
+                        if key.as_str() == Some("secret")
+                            && let Some(name) = value.as_str()
+                        {
+                            found.insert(name.to_owned());
+                        }
+                        walk(value, found);
+                    }
+                }
+                serde_yaml_ng::Value::Sequence(items) => items.iter().for_each(|i| walk(i, found)),
+                _ => {}
+            }
+        }
+
+        let text = fs::read_to_string(EXAMPLE).expect("the published example is readable");
+        let parsed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&text).expect("the published example parses");
+        let mut named = std::collections::BTreeSet::new();
+        walk(&parsed, &mut named);
+        assert!(!named.is_empty(), "the example names no secrets at all");
+
+        for name in named {
+            fs::write(dir.join(&name), format!("not-a-real-value-for-{name}\n"))
                 .expect("a writable temporary directory");
         }
     }
@@ -749,9 +772,9 @@ subscriptions:
         let config = Configuration::read(Path::new(EXAMPLE), dir.path())
             .unwrap_or_else(|e| panic!("the published example must parse: {e}"));
 
-        assert_eq!(config.origins().len(), 2);
+        assert_eq!(config.origins().len(), 3);
         assert_eq!(config.webhooks().len(), 3);
-        assert_eq!(config.subscriptions().len(), 4);
+        assert_eq!(config.subscriptions().len(), 5);
 
         // Parsing is not the point; this is. A push to main of that repository,
         // from the forge, reaches the room watching it and the room watching
@@ -872,7 +895,7 @@ subscriptions:
         assert!(table.contains("everything"), "{table}");
 
         assert!(
-            table.contains("2 sender(s), 3 room(s), 4 rule(s), 5 secret(s) present"),
+            table.contains("3 sender(s), 3 room(s), 5 rule(s), 6 secret(s) present"),
             "{table}"
         );
     }

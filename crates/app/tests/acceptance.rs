@@ -41,6 +41,16 @@ const PLATFORM: &str = "platform-room";
 /// obviously not.
 const TOKEN: &str = "not-a-real-token-but-long-enough-to-look-like-one";
 
+/// The value the Grafana sender shares. Its own, not the monitoring one: two
+/// alerting senders with one credential would mean neither could be withdrawn
+/// without silencing the other, and a rule naming `origin: grafana` would be
+/// worth no more than one naming `origin: alertmanager`.
+const GRAFANA_TOKEN: &str = "also-not-a-real-token-and-not-the-other-one";
+
+/// A real Grafana unified-alerting notification, schema v1.
+const GRAFANA_NOTIFICATION: &[u8] =
+    include_bytes!("../../adapters/grafana-payload/fixtures/firing.json");
+
 /// A real Alertmanager notification: three alerts, deliberately matching two
 /// rooms, one room, and no room respectively.
 const NOTIFICATION: &[u8] =
@@ -153,6 +163,7 @@ fn configured(base: &str) -> (tempfile::TempDir, HashMap<&'static str, String>) 
     for (name, value) in [
         ("github-webhook-secret", SECRET.to_owned()),
         ("alertmanager-token", TOKEN.to_owned()),
+        ("grafana-token", GRAFANA_TOKEN.to_owned()),
         ("devsecops-room-url", format!("{base}/{ROOM}")),
         ("platform-room-url", format!("{base}/{PLATFORM}")),
     ] {
@@ -175,6 +186,11 @@ origins:
     verify:
       bearer:
         secret: alertmanager-token
+  - id: grafana
+    speaks: grafana
+    verify:
+      bearer:
+        secret: grafana-token
 destinations:
   - id: {ROOM}
     kind: chat_room
@@ -196,6 +212,14 @@ subscriptions:
     match:
       origin: alertmanager
       namespace: prod
+  - destination: {PLATFORM}
+    match:
+      origin: grafana
+      grafana_folder: Platform
+  - destination: {ROOM}
+    match:
+      origin: grafana
+      severity: critical
 "
         ),
     )
@@ -581,26 +605,18 @@ fn check(env: &HashMap<&'static str, String>) -> (bool, String, String) {
 fn check_prints_what_the_published_example_would_route() {
     // The published example, read by the binary an operator would run. Nothing
     // else parses that file in a deployment, so this is what stops it rotting.
+    // The names are taken from the file rather than written here. A list in
+    // this test would be a second place to keep in step, and it would fail for
+    // the wrong reason the day the example gains a sender — which is what it did
+    // when it gained Grafana.
     let dir = tempfile::tempdir().expect("a temporary directory");
-    for name in [
-        "github-webhook-secret",
-        "alertmanager-token",
-        "devsecops-room-url",
-        "platform-room-url",
-        "audit-room-url",
-    ] {
+    let wanted = secrets_named_by(EXAMPLE);
+    for name in &wanted {
         fs::write(dir.path().join(name), format!("not-real-{name}")).expect("writable");
     }
 
     let env = HashMap::from([
-        (
-            "WEBHOOK_PROXY_CONFIG",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../deploy/webhook-proxy/config.example.yaml"
-            )
-            .to_owned(),
-        ),
+        ("WEBHOOK_PROXY_CONFIG", EXAMPLE_PATH.to_owned()),
         (
             "WEBHOOK_PROXY_SECRETS_DIR",
             dir.path().to_str().expect("a utf-8 path").to_owned(),
@@ -610,12 +626,52 @@ fn check_prints_what_the_published_example_would_route() {
     let (ok, out, err) = check(&env);
 
     assert!(ok, "check refused the published example: {err}{out}");
+    // Every sender the file declares is reachable, and the file decides which
+    // those are: a published example that documents a sender the proxy will not
+    // serve is how a GitOps author gets a 404 from a correct-looking config.
     assert!(out.contains("/webhook/github"), "{out}");
     assert!(out.contains("/webhook/alertmanager"), "{out}");
+    assert!(out.contains("/webhook/grafana"), "{out}");
     assert!(out.contains("namespace*=platform"), "{out}");
-    assert!(out.contains("5 secret(s) present"), "{out}");
+    assert!(out.contains("grafana_folder*=Platform"), "{out}");
+    assert!(
+        out.contains(&format!("{} secret(s) present", wanted.len())),
+        "{out}"
+    );
     // Never a value, in the output a reviewer pastes into a pull request.
     assert!(!out.contains("not-real-"), "{out}");
+}
+
+/// The published example, as the binary and the tests both read it.
+const EXAMPLE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/webhook-proxy/config.example.yaml"
+);
+const EXAMPLE: &str = include_str!("../../../deploy/webhook-proxy/config.example.yaml");
+
+/// Every secret name a routing file refers to, wherever it appears.
+fn secrets_named_by(routing: &str) -> std::collections::BTreeSet<String> {
+    fn walk(node: &serde_yaml_ng::Value, found: &mut std::collections::BTreeSet<String>) {
+        match node {
+            serde_yaml_ng::Value::Mapping(entries) => {
+                for (key, value) in entries {
+                    if key.as_str() == Some("secret")
+                        && let Some(name) = value.as_str()
+                    {
+                        found.insert(name.to_owned());
+                    }
+                    walk(value, found);
+                }
+            }
+            serde_yaml_ng::Value::Sequence(items) => items.iter().for_each(|i| walk(i, found)),
+            _ => {}
+        }
+    }
+    let parsed: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(routing).expect("the routing file parses");
+    let mut found = std::collections::BTreeSet::new();
+    walk(&parsed, &mut found);
+    found
 }
 
 #[test]
@@ -915,5 +971,77 @@ fn check_does_not_wait_for_anything() {
         began.elapsed() < Duration::from_secs(5),
         "{:?}",
         began.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_grafana_alert_reaches_only_the_rooms_its_labels_select() {
+    // The epic's second success criterion, for the half of it that was only ever
+    // proved at the adapter. grafana-payload had unit tests and the composition
+    // root wired it, but nothing had carried a Grafana payload through
+    // verification, translation and routing — so a published example that
+    // declared no grafana sender went unnoticed, and the documentation told an
+    // operator to post at a path that answered 404. Bead gc-ceg.
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the binary starts");
+
+    let status = post_as(
+        &proxy.address,
+        "grafana",
+        Credential::Shared(GRAFANA_TOKEN),
+        GRAFANA_NOTIFICATION,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // The fixture carries three alerts, and exactly one of them is selected —
+    // by both rules at once. HighLatency is critical and sits in the Platform
+    // folder, so it reaches the room routing on severity and the room routing on
+    // folder. DiskFilling states no severity and no folder; CertExpiring is a
+    // warning in no folder. Neither is selected by anything, and a renderer that
+    // quietly sent them anyway would pass a weaker assertion.
+    let mut rooms: Vec<String> = delivered(&seen, 2)
+        .await
+        .into_iter()
+        .map(|(room, _)| room)
+        .collect();
+    rooms.sort();
+
+    assert_eq!(rooms, vec![ROOM.to_owned(), PLATFORM.to_owned()]);
+}
+
+#[tokio::test]
+async fn the_alerting_senders_do_not_share_a_credential() {
+    // Two senders, two tokens, and neither opens the other. Without this a rule
+    // naming `origin: grafana` would be worth no more than one naming
+    // `origin: alertmanager`, because whoever held either value could claim to be
+    // either — and `origin` is the one label the proxy sets rather than reads,
+    // which is the whole reason a rule may rely on it.
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the binary starts");
+
+    let borrowed = post_as(
+        &proxy.address,
+        "grafana",
+        Credential::Shared(TOKEN),
+        GRAFANA_NOTIFICATION,
+    )
+    .await;
+    let other_way = post_as(
+        &proxy.address,
+        "alertmanager",
+        Credential::Shared(GRAFANA_TOKEN),
+        NOTIFICATION,
+    )
+    .await;
+
+    assert_eq!(borrowed, StatusCode::UNAUTHORIZED);
+    assert_eq!(other_way, StatusCode::UNAUTHORIZED);
+    assert!(
+        seen.lock().expect("not poisoned").is_empty(),
+        "a refused delivery reached a room"
     );
 }

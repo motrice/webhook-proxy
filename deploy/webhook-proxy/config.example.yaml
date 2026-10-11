@@ -51,6 +51,15 @@ origins:
       bearer:
         secret: alertmanager-token
 
+  # A second alerting sender with its own credential, so one can be rotated or
+  # withdrawn without touching the other — and so a rule naming `origin: grafana`
+  # means what it says. Both speak about alerts; neither can sign.
+  - id: grafana
+    speaks: grafana
+    verify:
+      bearer:
+        secret: grafana-token
+
 # Everywhere an Event can be sent. The address is named, never written: for a
 # chat room served by a generic webhook, possession of the URL is the only
 # credential it has, so putting it here would publish it to everyone who can read
@@ -109,6 +118,15 @@ subscriptions:
     match:
       origin: alertmanager
       namespace: platform
+
+  # Grafana puts the rule's folder on every alert it sends, which makes the
+  # folder a routing key: a team owning a folder gets its alerts without anyone
+  # labelling each rule. `grafana_folder` is marked with a * by `check`, because
+  # it is a label only a sender supplies — unlike `origin`, which the proxy sets.
+  - destination: platform-room
+    match:
+      origin: grafana
+      grafana_folder: Platform
 
   # Everything, said out loud so a reviewer sees it.
   - destination: audit-room
