@@ -24,6 +24,33 @@ pub enum DestinationKind {
     Forge,
 }
 
+/// A Dispatch's identity once something is keeping track of it.
+///
+/// Minted by whatever stores it rather than at the boundary, unlike
+/// [`DeliveryId`], and for a reason worth stating: a Delivery is named when it
+/// arrives because a loss report has to name what was lost even if nothing ever
+/// stored it. A Dispatch only needs a name once there is something to refer to
+/// it by — a row to mark delivered, a row to retry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DispatchId(String);
+
+impl DispatchId {
+    /// Names a Dispatch.
+    ///
+    /// # Errors
+    ///
+    /// [`Blank`] if the identity is empty or only whitespace.
+    pub fn new(id: &str) -> Result<Self, Blank> {
+        present(id, "a dispatch identity").map(Self)
+    }
+
+    /// The identity as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One Event, bound for one Destination, from one Delivery.
 ///
 /// The unit of work the delivery promise is about. `Relay` already produces
