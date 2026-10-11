@@ -89,10 +89,18 @@ follows from it:
 - **Order is not promised.** Destinations are dispatched to independently, so
   two events can reach one destination out of order.
 
-Durability and replay are wanted eventually, and the shape here is chosen so
-they can be added without reshaping the domain — see the `Durable delivery`
-epic in `bd ready`. They are deliberately unscheduled until the loss counters
-above say how much is actually being dropped.
+Durability and replay are built — a PostgreSQL outbox a Dispatch waits in, a
+sweep that retries what is due, and a `replay` subcommand that sends a stored
+delivery to a room again. The shape above is what made that additive: the
+`Outbox` port was the only thing that had to exist, and the domain did not
+change. Which store is used is a choice at the composition root, in memory
+unless a deployment names a database.
+
+**No deployment names one yet**, so everything this proxy currently runs loses
+undelivered Dispatches on restart — see `gc-vfz`, which is where that is
+decided rather than drifted into. Deduplicating repeats is the one piece still
+unscheduled, and deliberately: it waits on a duplicate rate nobody has
+measured.
 
 ## The security boundary
 

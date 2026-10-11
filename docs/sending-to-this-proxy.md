@@ -81,9 +81,14 @@ So: do not treat `202` as proof a human saw anything, and do not retry on it.
 - **A `503` means we did not take it.** The delivery was not stored, so nothing
   was promised and nothing was sent. Send it again. If your sender does not
   retry — **GitHub does not** — somebody has to redeliver it by hand.
-- **Storage is in memory today.** A message not yet delivered when the proxy
-  restarts is gone. The `202` still means it was written down; it does not yet
-  mean it survives the process.
+- **Storage is in memory, in every deployment there is today.** A message not
+  yet delivered when the proxy restarts is gone. The `202` still means what it
+  says — written down, and attempted until it succeeds or is abandoned — but
+  "written down" is in a process, not on a disk. This is a deployment choice
+  rather than a missing feature: the proxy keeps deliveries in a database when
+  it is given one, and none of the deployments running today is. You cannot
+  tell from outside which case you are in, so if it matters to you, ask whoever
+  runs the proxy you are posting to.
 - **Repeats are possible.** Within the attempt budget a room can see the same
   message twice — when a request succeeded but its response was lost. Do not
   build anything that assumes exactly-once.
