@@ -57,6 +57,16 @@ follows from it:
   `delivered + abandoned` = what has finished; anything else is still waiting.
   Nothing here can hold an address or a secret: a destination is a name, and
   where it lives belongs to the adapter that reaches it.
+
+  They are scraped from `/metrics` on the pod's own port, in Prometheus's text
+  format, as `webhook_proxy_dispatches_delivered_total`,
+  `webhook_proxy_dispatch_attempts_retried_total` and
+  `webhook_proxy_dispatches_abandoned_total`, each labelled by `destination`.
+  Like `/health`, it is **not published through the ingress**: both answer a
+  machine that reaches the pod directly, and publishing either would say more
+  about an internal service than anyone outside should be able to ask. A scrape
+  reads a count and never the store, so polling it cannot become load on the
+  thing it is monitoring.
 - **Losses are visible, and a retry is not a loss.** A dispatch that failed and
   is due to be tried again is logged as that; only an abandoned one is counted
   as lost. Counting both would make the number rise for messages that then

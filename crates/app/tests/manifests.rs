@@ -494,9 +494,14 @@ fn the_image_is_one_that_was_published_rather_than_built_here() {
 
 #[test]
 fn the_route_publishes_the_webhook_path_and_nothing_else() {
-    // /health exists for kubelet, which reaches the pod directly. Publishing it
-    // would hand the internet a free liveness oracle for an internal service,
-    // and publishing / would hand it everything added later by accident.
+    // /health and /metrics both exist for machines that reach the pod directly
+    // — kubelet and Prometheus — and neither is routed. Publishing /health
+    // would hand the internet a free liveness oracle for an internal service;
+    // publishing /metrics would hand it which rooms exist and how busy each one
+    // is. Publishing / would hand it everything added later by accident, which
+    // is the failure this assertion is really for: it is written as "exactly
+    // /webhook" rather than "not /health", so an endpoint nobody thought about
+    // is excluded by default.
     let route: Value = serde_yaml_ng::from_str(ROUTE).expect("the HTTPRoute parses");
     let rules = route["spec"]["rules"]
         .as_sequence()

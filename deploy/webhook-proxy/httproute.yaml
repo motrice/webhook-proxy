@@ -29,10 +29,11 @@ spec:
   rules:
     # Only the webhook endpoint is published.
     #
-    # /health is for kubelet, which reaches the pod directly and needs no route.
-    # Publishing it would hand anyone a liveness oracle for an internal service;
-    # publishing / would publish whatever endpoint is added next without anyone
-    # deciding to.
+    # /health is for kubelet and /metrics is for Prometheus; both reach the pod
+    # directly and need no route. Publishing /health would hand anyone a
+    # liveness oracle for an internal service, and /metrics would say which
+    # rooms exist and how busy each one is. Publishing / would publish whatever
+    # endpoint is added next without anyone deciding to.
     - matches:
         - path:
             type: PathPrefix

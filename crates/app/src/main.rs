@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
 use application::ports::{Dispatcher, Outbox, Proofs, Translator};
-use application::{Replay, Retries, Retry, Tally};
+use application::{Counts, Replay, Retries, Retry, Tally};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
 use element_notices::ElementNotices;
@@ -370,6 +370,68 @@ fn sweeping(
     })
 }
 
+/// The counters, in the format Prometheus scrapes.
+///
+/// Beside `/health` and for the same reason: both answer a machine that reaches
+/// the pod directly, and neither is published through the Gateway. gc-d01's
+/// `HTTPRoute` carries `/webhook` and nothing else on purpose — publishing an
+/// internal endpoint hands the internet a free oracle about a service it should
+/// not be able to see, and Prometheus scrapes pods rather than routes.
+///
+/// Reads a count and nothing else. A scrape must never touch the store: a
+/// monitoring system polling every fifteen seconds would otherwise become load
+/// on the thing it is monitoring, and would go quiet exactly when the database
+/// is in trouble — which is when somebody is looking.
+fn exported(tally: &Tally) -> String {
+    let mut out = String::new();
+
+    for (name, help, pick) in [
+        (
+            "webhook_proxy_dispatches_delivered_total",
+            "Dispatches that reached a room. What a reader there actually saw.",
+            (|counts: Counts| counts.delivered) as fn(Counts) -> u64,
+        ),
+        (
+            "webhook_proxy_dispatch_attempts_retried_total",
+            "Failed attempts that were stored for another try. Attempts, not              messages: a room that is unreachable makes this climb.",
+            |counts: Counts| counts.retrying,
+        ),
+        (
+            "webhook_proxy_dispatches_abandoned_total",
+            "Dispatches given up on. These are the losses.",
+            |counts: Counts| counts.abandoned,
+        ),
+    ] {
+        writeln!(out, "# HELP {name} {help}").expect("writing to a String cannot fail");
+        writeln!(out, "# TYPE {name} counter").expect("writing to a String cannot fail");
+        for (destination, counts) in tally.all() {
+            writeln!(
+                out,
+                "{name}{{destination=\"{}\"}} {}",
+                escaped(&destination),
+                pick(counts)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+
+    out
+}
+
+/// A label value Prometheus can read back.
+///
+/// A Destination's identity cannot contain a quote, a backslash or a newline —
+/// `yaml-config` refuses a secret name that is not a usable file name, and the
+/// same names identify rooms. This escapes anyway, because that constraint
+/// lives in another crate and an exporter that depended on it silently would
+/// produce an unparseable scrape the day it changed.
+fn escaped(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 /// Liveness and readiness for k3s probes.
 ///
 /// Deliberately answers from the process alone: a probe that depended on the
@@ -570,12 +632,21 @@ async fn run() -> Result<(), Unstartable> {
     let retrying = sweeping(
         Arc::clone(&dispatcher),
         Arc::clone(&outbox),
-        tally,
+        Arc::clone(&tally),
         config.retry,
         config.sweep,
     );
 
-    let app = router(inbound, config.max_body).route("/health", get(health));
+    let scraped = Arc::clone(&tally);
+    let app = router(inbound, config.max_body)
+        .route("/health", get(health))
+        .route(
+            "/metrics",
+            get(move || {
+                let scraped = Arc::clone(&scraped);
+                async move { exported(&scraped) }
+            }),
+        );
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
