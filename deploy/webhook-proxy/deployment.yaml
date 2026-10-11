@@ -93,6 +93,19 @@ spec:
               value: /etc/webhook-proxy/routing/config.yaml
             - name: WEBHOOK_PROXY_SECRETS_DIR
               value: /vault/secrets
+            # Which store a Dispatch waits in, and therefore whether it outlives
+            # the process. Naming a secret here is what switches the PostgreSQL
+            # outbox on; without it the proxy keeps deliveries in memory and a
+            # restart loses whatever was still retrying — see bead gc-vfz, which
+            # decided that these rooms want durable delivery and accepted the
+            # cost: when the database is unreachable the proxy refuses with 503
+            # rather than accepting what it cannot promise to keep.
+            #
+            # The value is a secret NAME, not a connection string. The string
+            # carries a password, so it arrives in the secrets directory like
+            # every other secret and never through the environment.
+            - name: WEBHOOK_PROXY_DATABASE_SECRET
+              value: database-url
             - name: RUST_LOG
               value: info
           readinessProbe:

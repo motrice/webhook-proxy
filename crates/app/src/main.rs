@@ -222,10 +222,17 @@ const DATABASE_CONNECTIONS: u32 = 8;
 
 /// Where Dispatches wait, which decides whether they survive a restart.
 ///
-/// In memory unless a database is configured, and that is the honest default:
-/// nothing is lost that was not going to be lost anyway, and a deployment that
-/// wants durability says so. The port is the same either way, which is why this
+/// In memory unless a database is configured. Every deployment configures one —
+/// bead gc-vfz decided that these rooms want durable delivery, and the manifests
+/// name the secret, so the memory outbox is what a local run gets rather than
+/// what anybody is served by. The port is the same either way, which is why this
 /// is a choice at the composition root rather than a change anywhere else.
+///
+/// The cost of that decision is paid here: a database this cannot reach makes
+/// the proxy refuse with 503 rather than accept what it cannot promise to keep,
+/// so an outage of the store refuses traffic that the memory outbox would have
+/// accepted and probably delivered. That is the trade gc-vfz accepted, with the
+/// reasoning recorded there rather than argued again in a comment.
 async fn stored(config: &Config) -> Result<Arc<dyn Outbox>, Unstartable> {
     let Some(name) = config.database.as_deref() else {
         return Ok(Arc::new(MemoryOutbox::new()));
@@ -670,7 +677,10 @@ async fn run() -> Result<(), Unstartable> {
         .map_err(|why| Unstartable::Serving(why.to_string()))?;
 
     // Stopped with the listener. Anything it was mid-way through is still in
-    // the outbox, which is the point of the outbox.
+    // the outbox, which is the point of the outbox — and is only true of a
+    // durable one. Against the memory outbox this line drops whatever was
+    // waiting, silently and uncounted; that is why gc-vfz made every deployment
+    // name a database rather than leaving the sentence above to be wishful.
     retrying.abort();
 
     Ok(())

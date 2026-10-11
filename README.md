@@ -96,11 +96,17 @@ delivery to a room again. The shape above is what made that additive: the
 change. Which store is used is a choice at the composition root, in memory
 unless a deployment names a database.
 
-**No deployment names one yet**, so everything this proxy currently runs loses
-undelivered Dispatches on restart — see `gc-vfz`, which is where that is
-decided rather than drifted into. Deduplicating repeats is the one piece still
-unscheduled, and deliberately: it waits on a duplicate rate nobody has
-measured.
+The manifests name one (`gc-vfz`), and the proxy refuses to start if the
+secret holding its connection string is missing — so a deployment built from
+them is durable or it is not running, with no third state a sender cannot see.
+What that costs is deliberate and worth saying plainly: a database this proxy
+cannot reach makes it refuse with `503` rather than accept what it cannot
+promise to keep, so an outage of the store refuses traffic the memory outbox
+would have taken and probably delivered. Durability is being bought with
+availability, knowingly.
+
+Deduplicating repeats is the one piece still unscheduled, and deliberately: it
+waits on a duplicate rate nobody has measured.
 
 ## The security boundary
 

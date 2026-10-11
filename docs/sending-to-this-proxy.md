@@ -63,13 +63,22 @@ body as bytes and the translator decides whether it is JSON it understands.
 | `401` | The credential is absent, malformed, or wrong | Fix the credential. Indistinguishable on purpose — the proxy will not tell you which. |
 | `404` | No sender is configured at that path | Check the path against the routing file. |
 | `413` | The body is larger than the configured limit | Send less. Refused before anything is verified or parsed. |
-| `503` | A secret the proxy needs could not be read | Not yours to fix. Tell whoever runs the proxy; retrying later is reasonable. |
+| `503` | A secret the proxy needs could not be read, or the store it keeps deliveries in is unreachable | Not yours to fix. Tell whoever runs the proxy; retrying later is reasonable. |
 
 **`202` means accepted, not delivered**, and the distinction is deliberate. The
 proxy answers as soon as the request is verified, then dispatches to each
 matching room independently. A room being unreachable afterwards does not turn
 into a `5xx`, because a sender seeing `5xx` would retry and re-deliver to the
 rooms that already succeeded.
+
+What `202` does promise is that the delivery is written down and will be
+attempted until it succeeds or is abandoned — and written down means in a
+database, so a restart of the proxy does not lose it. You do not have to ask
+which storage you are talking to: a deployment without its database refuses to
+start, so a proxy that answered you at all is one that keeps what it accepted.
+That is also why there is a second way to get a `503`. Rather than accept
+something it cannot promise to keep, the proxy refuses everything while the
+store is unreachable — a loud refusal instead of a quiet downgrade.
 
 So: do not treat `202` as proof a human saw anything, and do not retry on it.
 
@@ -79,16 +88,9 @@ So: do not treat `202` as proof a human saw anything, and do not retry on it.
   unreachable long enough loses that message. What is queued is retried until
   the attempts run out, and then abandoned.
 - **A `503` means we did not take it.** The delivery was not stored, so nothing
-  was promised and nothing was sent. Send it again. If your sender does not
+  was promised and nothing was sent — whether that is a secret the proxy could
+  not read or a store it could not reach. Send it again. If your sender does not
   retry — **GitHub does not** — somebody has to redeliver it by hand.
-- **Storage is in memory, in every deployment there is today.** A message not
-  yet delivered when the proxy restarts is gone. The `202` still means what it
-  says — written down, and attempted until it succeeds or is abandoned — but
-  "written down" is in a process, not on a disk. This is a deployment choice
-  rather than a missing feature: the proxy keeps deliveries in a database when
-  it is given one, and none of the deployments running today is. You cannot
-  tell from outside which case you are in, so if it matters to you, ask whoever
-  runs the proxy you are posting to.
 - **Repeats are possible.** Within the attempt budget a room can see the same
   message twice — when a request succeeded but its response was lost. Do not
   build anything that assumes exactly-once.

@@ -70,7 +70,7 @@ are not in it.
 Everything marked `REPLACE` in `vault-agent.hcl` and `deployment.yaml`, which is:
 
 - the secret store's address, the Kubernetes auth role, and the secret path and
-  field names in all five `template` stanzas
+  field names in all seven `template` stanzas
 - the `vault-agent` container's image
 - `config.example.yaml` itself, with the real routing — the example names rooms
   that do not exist
@@ -79,6 +79,26 @@ Everything marked `REPLACE` in `vault-agent.hcl` and `deployment.yaml`, which is
 
 The role binding that lets this service account read those secrets lives in the
 secret store, not here.
+
+**This deployment needs a PostgreSQL database, and this repository does not
+provide one.** `WEBHOOK_PROXY_DATABASE_SECRET` names `database-url`, and the
+`database-url` stanza must resolve to a connection string for a database this
+pod can reach. Bead `gc-vfz` decided that: deliveries wait in a database so a
+restart does not lose what was still retrying. Two consequences to plan for
+rather than discover:
+
+- **The proxy will not start without it.** A named secret that nothing renders
+  is a startup failure, not a fallback to memory. That is deliberate — a
+  deployment is durable or it is not running — but it means the database has to
+  exist before the proxy is rolled out, not after.
+- **An unreachable database refuses traffic.** The proxy answers `503` rather
+  than accepting what it cannot promise to keep, so the store's availability
+  becomes the endpoint's availability. This cluster runs CloudNativePG; a
+  `Cluster` of its own rather than a schema in somebody else's is the obvious
+  shape, and its availability should be chosen with the above in mind.
+
+The schema applies itself at startup, behind the advisory lock `sqlx` takes, so
+two replicas cannot race it and there is no migration job to run.
 
 Two things each `template` stanza must get right, both of which cost a working
 deployment if missed, and both of which have already cost one once:
@@ -92,9 +112,13 @@ deployment if missed, and both of which have already cost one once:
   `401` on every signed delivery and nothing in the log to explain it.
 
 `crates/app/tests/manifests.rs` checks the first of those, and checks that the
-files the agent renders are exactly the secrets the routing file names — add a
-room and forget its stanza, and a named test fails rather than a pod waiting for
-something nothing will ever write.
+files the agent renders are exactly the secrets this deployment asks for — the
+secrets the routing file names, plus the database secret the environment names.
+Add a room or a database and forget its stanza, and a named test fails rather
+than a pod waiting for something nothing will ever write. The database is in
+that set rather than checked beside it because it is the same mistake with a
+worse blast radius: forget its stanza and the proxy refuses to start at all,
+rather than refusing one Origin.
 
 ### Ordering
 

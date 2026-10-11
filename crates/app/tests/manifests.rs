@@ -559,17 +559,61 @@ fn the_containerfile_declares_the_stage_the_release_workflow_will_name() {
     );
 }
 
+/// Every secret this deployment asks for, from both places that can name one.
+///
+/// The routing file names a secret per Origin and per Destination. The database
+/// is named in the environment instead, because which store a Dispatch waits in
+/// is a choice at the composition root and not part of routing (bead gc-vfz).
+/// Both are secrets the agent has to render, so both belong in one set.
+fn secrets_this_deployment_asks_for() -> std::collections::BTreeSet<String> {
+    let mut asked = secrets_named_by_the_routing_file();
+    if let Some(name) = environment().get("WEBHOOK_PROXY_DATABASE_SECRET") {
+        asked.insert(name.clone());
+    }
+    asked
+}
+
 #[test]
-fn the_agent_renders_exactly_the_secrets_the_routing_file_names() {
+fn the_agent_renders_exactly_the_secrets_this_deployment_asks_for() {
     // The failure this prevents is quiet and total: add a room to the routing
     // file, forget its template stanza, and the pod waits for a secret nothing
     // will ever write — then refuses, naming a file whose absence is explained
     // nowhere. The two lists are written in different files in different
     // languages, so nothing but this keeps them in step.
+    //
+    // The database secret is the same failure with a worse blast radius, which
+    // is why it is in this set rather than checked beside it: name it in the
+    // environment and forget the stanza, and the proxy refuses to start at all
+    // rather than refusing one Origin.
     assert_eq!(
         files_the_agent_renders(),
-        secrets_named_by_the_routing_file(),
-        "the agent and the routing file disagree about which secrets exist"
+        secrets_this_deployment_asks_for(),
+        "the agent and this deployment disagree about which secrets exist"
+    );
+}
+
+#[test]
+fn the_deployment_names_a_database_so_a_dispatch_outlives_the_process() {
+    // Bead gc-vfz. The outbox, the sweep and replay all landed and were reachable
+    // from nowhere: WEBHOOK_PROXY_DATABASE_SECRET was set in no deployment, so
+    // stored() fell back to memory everywhere and main.rs's claim that anything
+    // mid-way through "is still in the outbox" was false wherever it ran.
+    //
+    // This asserts the switch is on, not that the database works. What makes it
+    // meaningful is the paired test above: naming the secret here obliges the
+    // agent to render it, and the proxy refuses to start without it — so a
+    // deployment built from these manifests is durable or it is not running.
+    // There is no third state for a sender to be unable to see.
+    let declared = environment();
+    let name = declared
+        .get("WEBHOOK_PROXY_DATABASE_SECRET")
+        .expect("the deployment names the secret holding the database URL");
+
+    assert!(
+        !name.trim().is_empty(),
+        "WEBHOOK_PROXY_DATABASE_SECRET is present but empty, which the binary \
+         reads as 'no database' — the filter in Config::from_environment treats \
+         a blank name as absent, so this would silently keep the memory outbox"
     );
 }
 

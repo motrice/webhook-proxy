@@ -66,6 +66,21 @@ template {
   contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.grafana_token }}{{ end }}"
 }
 
+# Where Dispatches wait, so that a restart does not lose what was still retrying
+# (bead gc-vfz). Named in the Deployment's environment rather than in the routing
+# file, because which store is used is a choice at the composition root and not
+# part of routing -- but it is a secret like any other, because a connection
+# string carries a password.
+#
+# The proxy will not start if this file is missing while the environment names
+# it, which is deliberate: a deployment built from these manifests is durable or
+# it is not running, and a sender is never left unable to tell which.
+template {
+  destination = "/vault/secrets/database-url"
+  perms       = "0440"
+  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.database_url }}{{ end }}"
+}
+
 # Each room's URL is itself a credential: anyone holding it can post to that room
 # (bead gc-o61). That is why they are here and not in the routing file, which is
 # reviewed as a diff.
