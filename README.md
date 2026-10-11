@@ -182,6 +182,7 @@ file would actually route:
 senders
   /webhook/alertmanager  presents a shared value, speaks alertmanager
   /webhook/github  signs its body, speaks github
+  /webhook/grafana  presents a shared value, speaks grafana
 
 rooms  (* marks a label only a sender can supply)
   audit-room
@@ -191,8 +192,9 @@ rooms  (* marks a label only a sender can supply)
     - origin=alertmanager severity=critical
   platform-room
     - namespace*=platform origin=alertmanager
+    - grafana_folder*=Platform origin=grafana
 
-2 sender(s), 3 room(s), 4 rule(s), 5 secret(s) present
+3 sender(s), 3 room(s), 5 rule(s), 6 secret(s) present
 ```
 
 **The operations repository's pipeline should run this on every change to the
