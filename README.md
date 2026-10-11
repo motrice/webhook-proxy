@@ -47,6 +47,16 @@ follows from it:
   verification succeeds. A destination failing afterwards must not turn into
   a 5xx, because the sender would retry and re-deliver to the destinations that
   already succeeded.
+- **Each room's traffic is counted separately.** Three numbers per destination —
+  `delivered`, `retrying`, `abandoned` — because the question anybody asks is
+  *which* room, and a single total says a thousand messages went somewhere.
+  `delivered` is what a reader in that room actually saw. `abandoned` is a loss.
+  `retrying` counts **attempts, not messages**: a destination that is down shows
+  a number that keeps climbing, which is the signal, so it is not a backlog
+  length and does not subtract into anything. The arithmetic that *is* right is
+  `delivered + abandoned` = what has finished; anything else is still waiting.
+  Nothing here can hold an address or a secret: a destination is a name, and
+  where it lives belongs to the adapter that reaches it.
 - **Losses are visible, and a retry is not a loss.** A dispatch that failed and
   is due to be tried again is logged as that; only an abandoned one is counted
   as lost. Counting both would make the number rise for messages that then
