@@ -13,7 +13,9 @@
 //! can be driven by twenty-line fakes in a test.
 
 use async_trait::async_trait;
-use domain::{Body, DeliveryId, Destination, Event, Origin, Proof, Timestamp, VerifiedDelivery};
+use domain::{
+    Body, DeliveryId, Destination, Dispatch, Event, Origin, Proof, Timestamp, VerifiedDelivery,
+};
 
 /// The signature an Origin's secret produces over a body.
 ///
@@ -140,6 +142,66 @@ pub enum DispatchFailed {
     Unreachable,
     /// The Destination did not answer in time.
     TimedOut,
+}
+
+/// The store is not answering.
+///
+/// Separate from every other way storing can fail because the decision in
+/// gc-mbr turns on it: a 202 means the Delivery is stored, so when it cannot be
+/// stored the sender is refused rather than told something untrue. A caller that
+/// could not tell this apart from "stored, but something else went wrong" could
+/// not keep that promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageUnavailable;
+
+impl core::fmt::Display for StorageUnavailable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // No address, no credential, no driver message. gc-b0n has the long
+        // version: database drivers put the connection string in their errors,
+        // and this value is what a log line is written from.
+        write!(f, "the delivery store is unavailable")
+    }
+}
+
+impl std::error::Error for StorageUnavailable {}
+
+/// Where Dispatches wait until they have been sent.
+///
+/// The port the outbox needs. It holds what a verified Delivery *produced* — a
+/// Dispatch per Event per Destination — and not the Delivery itself, which is
+/// the one thing it cannot hold: a `VerifiedDelivery` exists only as the result
+/// of presenting two matching proofs, and there is a `compile_fail` test asserting
+/// no other way to make one. Reading one back from a store would either need a
+/// constructor that forges it, or the proof kept alongside it, and the proof is
+/// derived from a secret. Verification happens once, at the boundary; what
+/// survives it is the intent to tell somebody something.
+#[async_trait]
+pub trait Outbox: Send + Sync {
+    /// Records everything one Delivery produced, before its sender is told.
+    ///
+    /// All of them or none. A Delivery whose Dispatches were half stored and
+    /// then acknowledged is the failure this whole port exists to prevent: the
+    /// sender believes it is delivered, and the Destinations that were not
+    /// recorded are never attempted and never reported. An implementation that
+    /// cannot do this atomically cannot implement this port.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if nothing was stored. The caller refuses the
+    /// sender; it does not fall back to sending without storing.
+    async fn accept(&self, dispatches: &[Dispatch]) -> Result<(), StorageUnavailable>;
+
+    /// What was accepted under this Delivery's identity.
+    ///
+    /// In the order it was accepted, because a reader comparing two runs should
+    /// not have to sort them, and because the order a Delivery fanned out in is
+    /// the order its rules are written in.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked. An identity that
+    /// was never accepted is not an error; it is an empty answer.
+    async fn accepted(&self, delivery: &DeliveryId) -> Result<Vec<Dispatch>, StorageUnavailable>;
 }
 
 /// What time it is.
