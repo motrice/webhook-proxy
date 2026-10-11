@@ -1045,3 +1045,90 @@ async fn the_alerting_senders_do_not_share_a_credential() {
         "a refused delivery reached a room"
     );
 }
+
+#[tokio::test]
+async fn the_counters_say_which_room_was_sent_what() {
+    // The gap gc-nd9 half-closed and this finishes: the numbers existed and
+    // nothing could read them, so the first signal of alert fatigue was still
+    // somebody muting the channel.
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the binary starts");
+
+    // One push, which the routing file sends to one room.
+    let status = post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(delivered(&seen, 1).await.len(), 1);
+
+    let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
+        .await
+        .expect("the binary answers a scrape")
+        .text()
+        .await
+        .expect("a body");
+
+    assert!(
+        scraped.contains(&format!(
+            "webhook_proxy_dispatches_delivered_total{{destination=\"{ROOM}\"}} 1"
+        )),
+        "{scraped}"
+    );
+    // Declared, so a scraper knows what kind of number each one is.
+    assert!(
+        scraped.contains("# TYPE webhook_proxy_dispatches_delivered_total counter"),
+        "{scraped}"
+    );
+    assert!(
+        scraped.contains("webhook_proxy_dispatches_abandoned_total"),
+        "{scraped}"
+    );
+}
+
+#[tokio::test]
+async fn a_scrape_reveals_no_room_url_and_no_secret() {
+    // These numbers are the sort of thing that ends up on a dashboard anybody
+    // can open. A Destination is a name; where it lives belongs to the adapter
+    // that reaches it, and neither the token nor the webhook secret is anywhere
+    // near a counter.
+    let (base, seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the binary starts");
+
+    post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
+    delivered(&seen, 1).await;
+
+    let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
+        .await
+        .expect("the binary answers a scrape")
+        .text()
+        .await
+        .expect("a body");
+
+    assert!(
+        !scraped.contains(&base),
+        "a room's URL was published: {scraped}"
+    );
+    assert!(!scraped.contains("http"), "{scraped}");
+    assert!(!scraped.contains(TOKEN), "{scraped}");
+    assert!(!scraped.contains(SECRET.trim()), "{scraped}");
+}
+
+#[tokio::test]
+async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped() {
+    // Not an error and not a blank page: a scraper meeting a fresh pod should
+    // get the metric names it expects, with nothing under them, rather than
+    // having to tell "no data" apart from "no endpoint".
+    let (base, _) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the binary starts");
+
+    let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
+        .await
+        .expect("the binary answers a scrape")
+        .text()
+        .await
+        .expect("a body");
+
+    assert!(scraped.contains("# TYPE webhook_proxy_dispatches_delivered_total counter"));
+    assert!(!scraped.contains("destination="), "{scraped}");
+}
