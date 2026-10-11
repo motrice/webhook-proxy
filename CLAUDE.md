@@ -146,17 +146,29 @@ not documentation of it.
 
 ## The delivery promise
 
-Best-effort, in memory. Nothing is persisted, so a dispatch that exhausts its
-attempts or outlives the process is lost. README states the promise in full; two
-consequences bind the code:
+At-least-once until the attempts run out. A Delivery is written to an outbox
+before its sender is acknowledged, dispatched immediately, and retried from the
+outbox when that fails; a dispatch that exhausts its attempts is abandoned.
+Storage is in memory today (`memory-outbox`), so a restart still loses what has
+not been sent — making that survive the process is gc-b0n, and the port is the
+same either way. README states the promise in full; four consequences bind the
+code:
 
+- **A `202` means stored.** If the outbox cannot take a Delivery the sender is
+  refused with `503` and nothing is sent. Never accept into memory and send
+  anyway: that makes one status code mean two things, which is the failure bead
+  gc-mbr exists to forbid.
+- **A retry is not a loss.** `Relayed` reports `retrying` and `abandoned`
+  separately, and only the second is counted. An operator told a Notice was lost
+  goes looking for it; one told it will be retried waits.
 - **A Delivery carries an identity** (`DeliveryId`), generated at the inbound
   boundary through an `Ids` port. It exists now rather than later because a loss
   report that cannot name what was lost is not a loss report, and because replay
   and deduplication would both need this key retrofitted through every layer.
 - **A failed dispatch never fails the inbound response.** It is logged with the
   delivery identity, the destination identity and the reason — never with a
-  destination's URL or secret — then counted, then dropped.
+  destination's URL or secret — then left in the outbox for another attempt. It
+  is counted only once it has been abandoned.
 
 Do not add persistence, a retry queue, or a durable store under this promise
 without the `Durable delivery` epic and a `decision` bead. Changing what a

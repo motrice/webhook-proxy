@@ -37,6 +37,7 @@ dependencies = [
  "github-signatures",
  "grafana-payload",
  "inbound-http",
+ "memory-outbox",
  "reqwest",
  "serde_json",
  "serde_yaml_ng",

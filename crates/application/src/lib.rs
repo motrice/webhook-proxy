@@ -13,5 +13,7 @@
 
 pub mod ports;
 mod relay;
+mod retries;
 
-pub use relay::{Refused, Relay, Relayed};
+pub use relay::{Refused, Relay, Relayed, Retry};
+pub use retries::{Attempted, Retries};

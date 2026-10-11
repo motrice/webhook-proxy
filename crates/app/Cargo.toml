@@ -25,6 +25,7 @@ shared-values = { path = "../adapters/shared-values" }
 alertmanager-payload = { path = "../adapters/alertmanager-payload" }
 grafana-payload = { path = "../adapters/grafana-payload" }
 yaml-config = { path = "../adapters/yaml-config" }
+memory-outbox = { path = "../adapters/memory-outbox" }
 system = { path = "../adapters/system" }
 axum = "0.8"
 # "time" is for the bounded wait at start-up, not for anything in the request
