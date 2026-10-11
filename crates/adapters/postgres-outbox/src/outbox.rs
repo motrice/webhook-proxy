@@ -95,7 +95,7 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
     let origin: String = row.try_get("origin").map_err(|_| StorageUnavailable)?;
     let destination: String = row.try_get("destination").map_err(|_| StorageUnavailable)?;
     let kind: String = row.try_get("kind").map_err(|_| StorageUnavailable)?;
-    let event: serde_json::Value = row.try_get("event").map_err(|_| StorageUnavailable)?;
+    let events: serde_json::Value = row.try_get("events").map_err(|_| StorageUnavailable)?;
     let outcome: String = row.try_get("outcome").map_err(|_| StorageUnavailable)?;
     let attempts: i32 = row.try_get("attempts").map_err(|_| StorageUnavailable)?;
     let again_at: Option<i64> = row.try_get("again_at_ms").map_err(|_| StorageUnavailable)?;
@@ -118,20 +118,31 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
         _ => return Err(StorageUnavailable),
     };
 
+    let dispatch = Dispatch::new(
+        DeliveryId::new(&delivery).map_err(|_| StorageUnavailable)?,
+        OriginId::new(&origin).map_err(|_| StorageUnavailable)?,
+        events
+            .as_array()
+            .ok_or(StorageUnavailable)?
+            .iter()
+            .map(|event| stored::read(event).map_err(|_| StorageUnavailable))
+            .collect::<Result<Vec<_>, _>>()?,
+        Destination::new(
+            DestinationId::new(&destination).map_err(|_| StorageUnavailable)?,
+            match kind.as_str() {
+                "forge" => DestinationKind::Forge,
+                _ => DestinationKind::ChatRoom,
+            },
+        ),
+    )
+    // A row with no events is one this code could not have written: a Dispatch
+    // with nothing to say cannot be built. Refused rather than turned into an
+    // empty message in somebody's room.
+    .ok_or(StorageUnavailable)?;
+
     Ok(Recorded::new(
         DispatchId::new(&id.to_string()).map_err(|_| StorageUnavailable)?,
-        Dispatch::new(
-            DeliveryId::new(&delivery).map_err(|_| StorageUnavailable)?,
-            OriginId::new(&origin).map_err(|_| StorageUnavailable)?,
-            stored::read(&event).map_err(|_| StorageUnavailable)?,
-            Destination::new(
-                DestinationId::new(&destination).map_err(|_| StorageUnavailable)?,
-                match kind.as_str() {
-                    "forge" => DestinationKind::Forge,
-                    _ => DestinationKind::ChatRoom,
-                },
-            ),
-        ),
+        dispatch,
         attempts.try_into().unwrap_or(u32::MAX),
         outcome,
     ))
@@ -152,7 +163,7 @@ fn row_id(id: &DispatchId) -> Result<i64, StorageUnavailable> {
 
 /// Columns every read needs, with the moments already in milliseconds so the
 /// mapping back to `Timestamp` is one shape rather than three.
-const COLUMNS: &str = "id, delivery, origin, destination, kind, event, outcome, attempts, \
+const COLUMNS: &str = "id, delivery, origin, destination, kind, events, outcome, attempts, \
      (EXTRACT(EPOCH FROM again_at) * 1000)::BIGINT AS again_at_ms, \
      (EXTRACT(EPOCH FROM settled_at) * 1000)::BIGINT AS settled_at_ms";
 
@@ -173,7 +184,7 @@ impl Outbox for PostgresOutbox {
         for dispatch in dispatches {
             let row = sqlx::query(&format!(
                 "INSERT INTO dispatch \
-                     (delivery, origin, destination, kind, event, outcome, attempts, again_at, \
+                     (delivery, origin, destination, kind, events, outcome, attempts, again_at, \
                       accepted_at) \
                  VALUES ($1, $6, $2, $3, $4, 'waiting', 0, to_timestamp($5::BIGINT / 1000.0), \
                          to_timestamp($5::BIGINT / 1000.0)) \
@@ -182,7 +193,9 @@ impl Outbox for PostgresOutbox {
             .bind(dispatch.delivery().as_str())
             .bind(dispatch.destination().id().as_str())
             .bind(kind_of(dispatch.destination()))
-            .bind(stored::written(dispatch.event()))
+            .bind(serde_json::Value::Array(
+                dispatch.events().iter().map(stored::written).collect(),
+            ))
             .bind(at.millis_since_epoch())
             .bind(dispatch.origin().as_str())
             .fetch_one(&mut *tx)
@@ -341,11 +354,24 @@ mod tests {
         Timestamp::from_millis_since_epoch(1_759_000_000_000 + millis)
     }
 
+    fn a_push(summary: &str) -> Event {
+        Event::PushedCommits {
+            repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
+            branch: BranchName::new("main").expect("a name"),
+            pusher: Pusher::new("bjornmolin").expect("a name"),
+            commits: vec![Commit::new(
+                CommitId::new("6113728f27ae").expect("an id"),
+                Summary::new(summary).expect("a summary"),
+            )],
+            permalink: None,
+        }
+    }
+
     fn dispatch(delivery: &str, summary: &str, room: &str) -> Dispatch {
         Dispatch::new(
             DeliveryId::new(delivery).expect("a non-blank id"),
             OriginId::new("github").expect("a non-blank id"),
-            Event::PushedCommits {
+            vec![Event::PushedCommits {
                 repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
                 branch: BranchName::new("main").expect("a name"),
                 pusher: Pusher::new("bjornmolin").expect("a name"),
@@ -354,12 +380,13 @@ mod tests {
                     Summary::new(summary).expect("a summary"),
                 )],
                 permalink: None,
-            },
+            }],
             Destination::new(
                 DestinationId::new(room).expect("a non-blank id"),
                 DestinationKind::ChatRoom,
             ),
         )
+        .expect("at least one event")
     }
 
     #[tokio::test]
@@ -382,6 +409,38 @@ mod tests {
         assert_eq!(held[0].dispatch(), &stored);
         assert_eq!(held[0].attempts(), 0);
         assert_eq!(held[0].outcome(), Outcome::Waiting { again_at: at(0) });
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a database: just test-db"]
+    async fn a_grouped_dispatch_keeps_every_event_and_their_order() {
+        // One row is one message now (gc-smz), carrying the Events that selected
+        // that room. Losing one, or reordering them, would change what a reader
+        // sees when a stored message is finally delivered or replayed.
+        let outbox = outbox().await;
+        let grouped = Dispatch::new(
+            DeliveryId::new("d-grouped").expect("a non-blank id"),
+            OriginId::new("github").expect("a non-blank id"),
+            vec![a_push("first"), a_push("second"), a_push("third")],
+            Destination::new(
+                DestinationId::new("a-room").expect("a non-blank id"),
+                DestinationKind::ChatRoom,
+            ),
+        )
+        .expect("at least one event");
+
+        outbox
+            .accept(std::slice::from_ref(&grouped), at(0))
+            .await
+            .expect("available");
+
+        let held = outbox
+            .accepted(&DeliveryId::new("d-grouped").expect("a non-blank id"))
+            .await
+            .expect("available");
+        assert_eq!(held.len(), 1, "a grouped dispatch is one row");
+        assert_eq!(held[0].dispatch(), &grouped);
+        assert_eq!(held[0].dispatch().events().len(), 3);
     }
 
     #[tokio::test]

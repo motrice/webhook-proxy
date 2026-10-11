@@ -3,8 +3,8 @@
 use core::time::Duration;
 
 use domain::{
-    Body, Delivery, DeliveryId, DestinationId, Dispatch, Origin, Proof, Subscription,
-    destinations_for,
+    Body, Delivery, DeliveryId, Destination, DestinationId, Dispatch, Event, Origin, Proof,
+    Subscription, destinations_for,
 };
 
 use crate::ports::{Attempt, Clock, DispatchFailed, Dispatcher, Ids, Outbox, Proofs, Translator};
@@ -92,8 +92,8 @@ impl Retry {
 pub struct Relayed {
     delivery: DeliveryId,
     reached: Vec<DestinationId>,
-    retrying: Vec<(DestinationId, DispatchFailed)>,
-    abandoned: Vec<(DestinationId, DispatchFailed)>,
+    retrying: Vec<(DestinationId, DispatchFailed, usize)>,
+    abandoned: Vec<(DestinationId, DispatchFailed, usize)>,
 }
 
 impl Relayed {
@@ -115,7 +115,7 @@ impl Relayed {
     /// caller reporting them should say so — an operator told a Notice was lost
     /// goes looking for it, and an operator told it will be retried waits.
     #[must_use]
-    pub fn retrying(&self) -> &[(DestinationId, DispatchFailed)] {
+    pub fn retrying(&self) -> &[(DestinationId, DispatchFailed, usize)] {
         &self.retrying
     }
 
@@ -124,8 +124,14 @@ impl Relayed {
     /// These are the losses, in the sense the delivery promise means: attempted
     /// until the budget ran out and given up on. The caller logs and counts
     /// them, as it always did.
+    ///
+    /// The number is how many facts the message carried. One loss, however many
+    /// — it is one message that did not arrive, and counting a grouped dispatch
+    /// as several would make the number mean something different depending on
+    /// how a sender configured its grouping. The count is reported so the detail
+    /// is recoverable without changing what is counted.
     #[must_use]
-    pub fn abandoned(&self) -> &[(DestinationId, DispatchFailed)] {
+    pub fn abandoned(&self) -> &[(DestinationId, DispatchFailed, usize)] {
         &self.abandoned
     }
 }
@@ -222,25 +228,47 @@ impl<'a> Relay<'a> {
         // of it stored and then acknowledged would mean the sender believes it
         // delivered while the Destinations that were not recorded are never
         // attempted and never reported.
-        let mut planned = Vec::new();
+        // Per Destination, not per Event. A sender that grouped twenty alerts
+        // into one notification meant a room to get one message, and fanning
+        // them out again would undo a decision it made deliberately — bead
+        // gc-lhh. Different alerts can select different rooms, so each room gets
+        // the subset that chose it.
+        //
+        // Destinations in the order they were first selected, and Events within
+        // one in the order the sender reported them: a reader comparing two
+        // incidents should not find the same facts in a different arrangement.
+        let mut grouped: Vec<(Destination, Vec<Event>)> = Vec::new();
         for event in &events {
             // The Origin from the *verified* Delivery, not the one the caller
             // named: routing must turn on who actually signed this. The two are
             // the same value today, and asking the VerifiedDelivery means they
             // cannot drift apart later. See bead gc-srw.
             for destination in destinations_for(verified.origin(), event, self.subscriptions) {
-                planned.push(Dispatch::new(
+                match grouped
+                    .iter_mut()
+                    .find(|(known, _)| known.id() == destination.id())
+                {
+                    Some((_, theirs)) => theirs.push(event.clone()),
+                    None => grouped.push((destination.clone(), vec![event.clone()])),
+                }
+            }
+        }
+
+        let planned: Vec<Dispatch> = grouped
+            .into_iter()
+            .filter_map(|(destination, theirs)| {
+                Dispatch::new(
                     verified.id().clone(),
                     // From the *verified* Delivery, which is the same reason
                     // routing asks it rather than the caller: the Origin a
                     // replay routes by must be the one that was established,
                     // never one somebody typed.
                     verified.origin().clone(),
-                    event.clone(),
-                    destination.clone(),
-                ));
-            }
-        }
+                    theirs,
+                    destination,
+                )
+            })
+            .collect();
 
         // Stored before the sender is told anything, which is what a 202 now
         // means. Refused rather than sent-without-storing: see gc-mbr.
@@ -265,7 +293,7 @@ impl<'a> Relay<'a> {
                 .dispatcher
                 .dispatch(
                     dispatch.delivery(),
-                    dispatch.event(),
+                    dispatch.events(),
                     dispatch.destination(),
                     Attempt::First,
                 )
@@ -278,10 +306,11 @@ impl<'a> Relay<'a> {
                 // Recorded, never propagated: one Destination being down must
                 // not deny the others, nor refuse the delivery.
                 Err(failure) => {
+                    let carried = dispatch.events().len();
                     if self.settle_failed(record.id(), 1).await {
-                        retrying.push((destination, failure));
+                        retrying.push((destination, failure, carried));
                     } else {
-                        abandoned.push((destination, failure));
+                        abandoned.push((destination, failure, carried));
                     }
                 }
             }
@@ -398,7 +427,7 @@ mod tests {
         async fn dispatch(
             &self,
             _delivery: &DeliveryId,
-            _event: &Event,
+            _events: &[Event],
             destination: &Destination,
             _attempt: Attempt,
         ) -> Result<(), DispatchFailed> {
@@ -642,7 +671,11 @@ mod tests {
             relayed.retrying(),
             &[(
                 DestinationId::new("second").expect("a non-blank id"),
-                DispatchFailed::Unreachable
+                DispatchFailed::Unreachable,
+                // One fact in the message that did not arrive. Reported so a
+                // log line can say how much was in it, without changing that it
+                // counts as one.
+                1
             )]
         );
         assert!(relayed.abandoned().is_empty());

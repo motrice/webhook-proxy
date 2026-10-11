@@ -108,8 +108,56 @@ impl fmt::Debug for ElementNotices {
 /// to say the same thing — which is why both renderings come from one
 /// [`Composed`] rather than from two renderers written side by side.
 #[must_use]
-pub fn notice(event: &Event) -> String {
-    composed(event).as_text()
+pub fn notice(events: &[Event]) -> String {
+    for_sending(events).as_text()
+}
+
+/// How many Events a grouped Notice shows before it starts counting.
+///
+/// Alertmanager puts no cap on alerts per notification, so without a bound an
+/// incident could produce a message longer than the room it lands in. Eight,
+/// the same number of labels a single alert shows, because a reader scanning
+/// either is doing the same thing.
+const EVENTS_SHOWN: usize = 8;
+
+/// Several Events as one message, which is what a sender that grouped them
+/// asked for.
+///
+/// One line each, not the full rendering. An alert on its own is worth three
+/// lines — what, which labels, where to look — and twenty of those is sixty
+/// lines, which is no better than twenty messages and is harder to scan. So a
+/// grouped Notice trades detail for shape: the first line of each, and the
+/// monitoring system for the rest.
+///
+/// What that costs, said plainly: no permalinks. Twenty links is unreadable and
+/// a link whose text is not its destination is forbidden here (gc-qev), so a
+/// responder scanning a group goes to the monitoring system rather than
+/// following a link from the room. A notification carrying one alert still
+/// renders in full, which is the common case outside an incident.
+fn grouped(events: &[Event]) -> Composed {
+    let mut composed = Composed::said(format!("{} things happened", events.len()));
+    for event in events.iter().take(EVENTS_SHOWN) {
+        composed.hanging(headline(event));
+    }
+    if events.len() > EVENTS_SHOWN {
+        // Said, never silently dropped — the same wording a label line uses when
+        // it runs out of room, because a reader should not have to learn two.
+        composed.hanging(format!("(+{} more)", events.len() - EVENTS_SHOWN));
+    }
+    composed
+}
+
+/// The one line that says what an Event is.
+///
+/// Taken from the full rendering rather than written again, so a grouped entry
+/// and a single Notice cannot drift into describing the same fact differently.
+fn headline(event: &Event) -> String {
+    composed(event)
+        .lines
+        .first()
+        .map_or_else(String::new, |line| match line {
+            Line::Said(text) | Line::Hanging(text) => text.clone(),
+        })
 }
 
 /// The same Event as HTML, which is what a reader actually sees.
@@ -118,8 +166,20 @@ pub fn notice(event: &Event) -> String {
 /// markup. The only element produced is an anchor for the permalink, and only
 /// when its visible text is exactly its destination.
 #[must_use]
-pub fn notice_html(event: &Event) -> String {
-    composed(event).as_html()
+pub fn notice_html(events: &[Event]) -> String {
+    for_sending(events).as_html()
+}
+
+/// One Event in full, several as a list.
+///
+/// The common case outside an incident is one, and it should read exactly as it
+/// always did — a grouped form that made a single alert worse would have traded
+/// the everyday for the exceptional.
+fn for_sending(events: &[Event]) -> Composed {
+    match events {
+        [only] => composed(only),
+        many => grouped(many),
+    }
 }
 
 /// A Notice's structure, before it is either kind of text.
@@ -532,7 +592,7 @@ impl Dispatcher for ElementNotices {
     async fn dispatch(
         &self,
         _delivery: &DeliveryId,
-        event: &Event,
+        events: &[Event],
         destination: &Destination,
         attempt: Attempt,
     ) -> Result<(), DispatchFailed> {
@@ -558,8 +618,8 @@ impl Dispatcher for ElementNotices {
             .header("content-type", "application/json")
             .body(ascii_only(
                 &serde_json::json!({
-                    "text": marked(attempt, &notice(event)),
-                    "html": marked(attempt, &notice_html(event)),
+                    "text": marked(attempt, &notice(events)),
+                    "html": marked(attempt, &notice_html(events)),
                 })
                 .to_string(),
             ))
@@ -693,7 +753,7 @@ mod tests {
 
     #[test]
     fn a_notice_says_who_pushed_what_and_where() {
-        let text = notice(&a_push());
+        let text = notice(&[a_push()]);
 
         assert!(text.contains("bjornmolin"), "{text}");
         assert!(text.contains("main"), "{text}");
@@ -704,12 +764,12 @@ mod tests {
 
     #[test]
     fn one_commit_reads_as_one_commit() {
-        let text = notice(&push(
+        let text = notice(&[push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[("aa11bb22cc33dd44", "fix the thing")],
-        ));
+        )]);
 
         assert!(text.contains("1 commit "), "{text}");
         assert!(!text.contains("1 commits"), "{text}");
@@ -717,7 +777,7 @@ mod tests {
 
     #[test]
     fn a_commit_identity_is_shortened_for_a_reader() {
-        let text = notice(&a_push());
+        let text = notice(&[a_push()]);
 
         assert!(text.contains("aa11bb22"), "{text}");
         assert!(!text.contains("aa11bb22cc33dd44"), "{text}");
@@ -727,12 +787,12 @@ mod tests {
     fn a_commit_message_containing_markup_appears_literally() {
         // Commit messages are written by whoever can push, which is a far wider
         // set than whoever holds the webhook URL. See gc-o61.
-        let text = notice(&push(
+        let text = notice(&[push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[("aa11bb22cc33dd44", "<b>urgent</b> see [here](http://evil)")],
-        ));
+        )]);
 
         assert!(
             text.contains("<b>urgent</b> see [here](http://evil)"),
@@ -742,12 +802,12 @@ mod tests {
 
     #[test]
     fn a_branch_or_repository_containing_markup_appears_literally() {
-        let text = notice(&push(
+        let text = notice(&[push(
             "motrice/<img src=x>",
             "feature/<script>alert(1)</script>",
             "<i>nobody</i>",
             &[],
-        ));
+        )]);
 
         assert!(text.contains("motrice/<img src=x>"), "{text}");
         assert!(text.contains("feature/<script>alert(1)</script>"), "{text}");
@@ -760,13 +820,13 @@ mod tests {
 
     #[test]
     fn a_notice_ends_with_the_link_when_one_was_published() {
-        let text = notice(&linked_push(
+        let text = notice(&[linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[("aa11bb22cc33dd44", "fix the thing")],
             Some("https://forge.example/motrice/webhook-proxy/compare/a...b"),
-        ));
+        )]);
 
         // On its own line and unindented, so it is not read as another commit.
         assert!(
@@ -777,7 +837,7 @@ mod tests {
 
     #[test]
     fn a_notice_without_a_link_does_not_look_unfinished() {
-        let text = notice(&a_push());
+        let text = notice(&[a_push()]);
 
         assert!(!text.ends_with('\n'), "{text}");
         assert!(!text.contains("://"), "{text}");
@@ -791,13 +851,13 @@ mod tests {
 
     #[test]
     fn a_push_that_changed_nothing_still_carries_its_link() {
-        let text = notice(&linked_push(
+        let text = notice(&[linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[],
             Some("https://forge.example/c/1"),
-        ));
+        )]);
 
         assert!(text.contains("no commits"), "{text}");
         assert!(text.ends_with("\nhttps://forge.example/c/1"), "{text}");
@@ -812,13 +872,13 @@ mod tests {
         // markdown in what we sent. A test here cannot see that; the live
         // instance was the only oracle, and gc-fks was the one that asked it.
         // What covers the gap now is the HTML rendering and its own tests.
-        let text = notice(&linked_push(
+        let text = notice(&[linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[],
             Some("https://forge.example/x?a=1&b=<2>"),
-        ));
+        )]);
 
         assert!(text.contains("https://forge.example/x?a=1&b=<2>"), "{text}");
         assert!(!text.contains("]("), "{text}");
@@ -871,7 +931,7 @@ mod tests {
         // The whole text, pinned. Status first because whether it is still
         // happening is read first and is the most costly thing to misread; then
         // the severity; then the sender's line; then where to look.
-        let text = notice(&alert_with(
+        let text = notice(&[alert_with(
             Severity::Critical,
             AlertStatus::Firing,
             "api latency above target",
@@ -883,7 +943,7 @@ mod tests {
                 ("severity", "critical"),
             ],
             Some("https://prometheus.example/graph?g0.expr=latency"),
-        ));
+        )]);
 
         assert_eq!(
             text,
@@ -895,47 +955,47 @@ mod tests {
 
     #[test]
     fn a_resolved_alert_cannot_be_mistaken_for_a_new_firing_one() {
-        let resolved = notice(&alert_with(
+        let resolved = notice(&[alert_with(
             Severity::Critical,
             AlertStatus::Resolved,
             "api latency above target",
             &[("namespace", "prod")],
             None,
-        ));
+        )]);
 
         // The first word of the first line, so the eye reaches it before anything
         // a sender wrote.
         assert!(resolved.starts_with("resolved — "), "{resolved}");
         assert!(!resolved.contains("firing"), "{resolved}");
 
-        let firing = notice(&alert_with(
+        let firing = notice(&[alert_with(
             Severity::Critical,
             AlertStatus::Firing,
             "api latency above target",
             &[("namespace", "prod")],
             None,
-        ));
+        )]);
         assert_ne!(resolved, firing);
     }
 
     #[test]
     fn the_link_is_the_last_line_when_there_is_one_and_absent_when_there_is_not() {
-        let with = notice(&alert_with(
+        let with = notice(&[alert_with(
             Severity::Warning,
             AlertStatus::Firing,
             "disk filling",
             &[("namespace", "prod")],
             Some("https://forge.example/a"),
-        ));
+        )]);
         assert!(with.ends_with("\nhttps://forge.example/a"), "{with}");
 
-        let without = notice(&alert_with(
+        let without = notice(&[alert_with(
             Severity::Warning,
             AlertStatus::Firing,
             "disk filling",
             &[("namespace", "prod")],
             None,
-        ));
+        )]);
         // Nothing stands in its place: no empty line, no placeholder.
         assert!(!without.contains("://"), "{without}");
         assert!(!without.ends_with('\n'), "{without}");
@@ -947,13 +1007,13 @@ mod tests {
         // The bound is SUMMARY_LIMIT, 200 characters. Named here so a change to
         // it has to change this test too, which is the point of naming it.
         let long = "x".repeat(SUMMARY_LIMIT + 50);
-        let text = notice(&alert_with(
+        let text = notice(&[alert_with(
             Severity::Info,
             AlertStatus::Firing,
             &long,
             &[],
             None,
-        ));
+        )]);
 
         let first = text.lines().next().expect("a line");
         assert!(first.contains(&"x".repeat(SUMMARY_LIMIT)), "{first}");
@@ -967,13 +1027,13 @@ mod tests {
         // Counted in characters, not bytes, so the cut never lands inside one.
         // A multi-byte value is the case that would panic if it did.
         let long = "ä".repeat(LABEL_LIMIT + 10);
-        let text = notice(&alert_with(
+        let text = notice(&[alert_with(
             Severity::Info,
             AlertStatus::Firing,
             "fine",
             &[("note", &long)],
             None,
-        ));
+        )]);
 
         assert!(
             text.contains(&format!("note={}…", "ä".repeat(LABEL_LIMIT))),
@@ -988,13 +1048,13 @@ mod tests {
             .collect();
         let refs: Vec<(&str, &str)> = many.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
 
-        let text = notice(&alert_with(
+        let text = notice(&[alert_with(
             Severity::Info,
             AlertStatus::Firing,
             "fine",
             &refs,
             None,
-        ));
+        )]);
 
         // A responder who cannot see a label should at least know one exists.
         assert!(text.contains("(+3 more)"), "{text}");
@@ -1016,7 +1076,7 @@ mod tests {
             None,
         );
         notices
-            .dispatch(&a_delivery(), &event, &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[event], &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
@@ -1046,7 +1106,7 @@ mod tests {
         // like a second, separate message — including one that appears to come
         // from the push path.
         let forged = "prod\nbjornmolin pushed 3 commits to main in motrice/webhook-proxy";
-        let text = notice(&alert_with(
+        let text = notice(&[alert_with(
             Severity::Critical,
             AlertStatus::Firing,
             "something is wrong",
@@ -1055,7 +1115,7 @@ mod tests {
                 ("markup", "<b>x</b> [a](http://evil)"),
             ],
             None,
-        ));
+        )]);
 
         // The forged text is present — nothing is dropped — but it cannot have
         // produced a line of its own.
@@ -1078,13 +1138,13 @@ mod tests {
         // A lone carriage return is a line break to some clients and not to
         // others, which is worse than either: the room and the test would
         // disagree about what was sent.
-        let text = notice(&alert_with(
+        let text = notice(&[alert_with(
             Severity::Critical,
             AlertStatus::Firing,
             "something is wrong",
             &[("note", "before\rafter")],
             None,
-        ));
+        )]);
 
         assert_eq!(text.lines().count(), expected_line_count(&text), "{text}");
         assert!(
@@ -1102,11 +1162,11 @@ mod tests {
 
     #[test]
     fn an_alert_notice_says_the_severity_the_summary_and_whether_it_is_over() {
-        let text = notice(&an_alert(
+        let text = notice(&[an_alert(
             Severity::Critical,
             AlertStatus::Firing,
             "api latency above target",
-        ));
+        )]);
 
         assert!(text.contains("critical"), "{text}");
         assert!(text.contains("api latency above target"), "{text}");
@@ -1115,11 +1175,11 @@ mod tests {
 
     #[test]
     fn a_resolved_alert_says_resolved_and_not_firing() {
-        let text = notice(&an_alert(
+        let text = notice(&[an_alert(
             Severity::Warning,
             AlertStatus::Resolved,
             "disk filling",
-        ));
+        )]);
 
         assert!(text.contains("resolved"), "{text}");
         assert!(!text.contains("firing"), "{text}");
@@ -1127,11 +1187,11 @@ mod tests {
 
     #[test]
     fn an_alert_with_no_stated_severity_does_not_invent_one() {
-        let text = notice(&an_alert(
+        let text = notice(&[an_alert(
             Severity::Unstated,
             AlertStatus::Firing,
             "something",
-        ));
+        )]);
 
         assert!(text.contains("something"), "{text}");
         assert!(text.contains("firing"), "{text}");
@@ -1144,11 +1204,11 @@ mod tests {
     fn an_alert_summary_containing_markup_appears_literally() {
         // An alert summary comes from a workload annotation, so from whoever can
         // deploy. Same guarantee as the push path, tested rather than inherited.
-        let text = notice(&an_alert(
+        let text = notice(&[an_alert(
             Severity::Unrecognised("<b>sev1</b>".to_owned()),
             AlertStatus::Firing,
             "<script>alert(1)</script> see [here](http://evil)",
-        ));
+        )]);
 
         assert!(text.contains("<script>alert(1)</script>"), "{text}");
         assert!(text.contains("<b>sev1</b>"), "{text}");
@@ -1156,11 +1216,11 @@ mod tests {
 
     #[test]
     fn a_deleted_branch_reads_as_a_deletion() {
-        let text = notice(&deletion(
+        let text = notice(&[deletion(
             "motrice/webhook-proxy",
             "bead/gc-old",
             "bjornmolin",
-        ));
+        )]);
 
         assert!(text.contains("bjornmolin"), "{text}");
         assert!(text.contains("bead/gc-old"), "{text}");
@@ -1173,7 +1233,7 @@ mod tests {
 
     #[test]
     fn a_push_that_changed_nothing_says_so_and_does_not_mention_deletion() {
-        let text = notice(&push("motrice/webhook-proxy", "main", "bjornmolin", &[]));
+        let text = notice(&[push("motrice/webhook-proxy", "main", "bjornmolin", &[])]);
 
         assert!(text.contains("no commits"), "{text}");
         // The hedge is gone: this is no longer possibly-a-deletion.
@@ -1182,7 +1242,7 @@ mod tests {
 
     #[test]
     fn a_push_of_commits_lists_them() {
-        let text = notice(&a_push());
+        let text = notice(&[a_push()]);
 
         assert!(text.contains("2 commits"), "{text}");
         assert!(text.contains("docs: tidy the glossary"), "{text}");
@@ -1194,11 +1254,11 @@ mod tests {
         // The deletion path interpolates the same attacker-controlled fields as
         // the push path — whoever can delete a branch chose its name — so it
         // needs the same guarantee, not an inherited assumption. See gc-o61.
-        let text = notice(&deletion(
+        let text = notice(&[deletion(
             "motrice/<img src=x>",
             "feature/<script>alert(1)</script>",
             "<i>nobody</i>",
-        ));
+        )]);
 
         assert!(text.contains("motrice/<img src=x>"), "{text}");
         assert!(text.contains("feature/<script>alert(1)</script>"), "{text}");
@@ -1276,7 +1336,7 @@ mod tests {
         let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
@@ -1315,7 +1375,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":false}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1326,7 +1386,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::NOT_FOUND, "no such hook", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1337,7 +1397,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::INTERNAL_SERVER_ERROR, "broken", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Unreachable));
@@ -1348,7 +1408,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::from_millis(500)).await;
 
         let outcome = notices_to(&url, Duration::from_millis(50))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::TimedOut));
@@ -1361,7 +1421,7 @@ mod tests {
         let outcome = notices_to(&url, Duration::from_secs(5))
             .dispatch(
                 &a_delivery(),
-                &a_push(),
+                &[a_push()],
                 &room("some-other-room"),
                 Attempt::First,
             )
@@ -1415,7 +1475,7 @@ mod tests {
         // so a commit message can put a clickable link with wording of its own
         // choosing into a room that trusts the forge. In HTML we say what is a
         // link, and this is not one.
-        let html = notice_html(&linked_push(
+        let html = notice_html(&[linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
@@ -1424,7 +1484,7 @@ mod tests {
                 "[Payroll portal has moved](http://attacker.example)",
             )],
             None,
-        ));
+        )]);
 
         assert!(html.contains("[Payroll portal has moved]"), "{html}");
         assert!(
@@ -1435,13 +1495,13 @@ mod tests {
 
     #[test]
     fn the_characters_that_would_otherwise_be_markup_are_escaped_everywhere() {
-        let html = notice_html(&linked_push(
+        let html = notice_html(&[linked_push(
             "motrice/<b>x</b>",
             "main&more",
             "o'brien",
             &[("6113728f27ae", "a \"quoted\" <script>alert(1)</script>")],
             None,
-        ));
+        )]);
 
         assert!(!html.contains("<b>"), "{html}");
         assert!(!html.contains("<script>"), "{html}");
@@ -1456,13 +1516,13 @@ mod tests {
         // The whole rule in one assertion. A link that says one thing and goes
         // to another is the attack; a link whose text is its destination cannot
         // lie about where it goes, so a reader can judge it before clicking.
-        let html = notice_html(&linked_push(
+        let html = notice_html(&[linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[],
             Some("https://forge.example/x?a=1&b=2"),
-        ));
+        )]);
 
         assert!(
             html.contains(
@@ -1487,13 +1547,13 @@ mod tests {
             // would be testing the domain's constructor from here.
             "https://forge.example/a b",
         ] {
-            let html = notice_html(&linked_push(
+            let html = notice_html(&[linked_push(
                 "motrice/webhook-proxy",
                 "main",
                 "bjornmolin",
                 &[],
                 Some(hostile),
-            ));
+            )]);
 
             assert!(
                 !html.contains("<a href"),
@@ -1506,13 +1566,13 @@ mod tests {
     fn lines_are_broken_with_br_because_a_newline_is_only_whitespace_in_html() {
         // What the live instance showed: our newlines collapsed and the push
         // arrived as one run-on line, losing the structure this renderer builds.
-        let html = notice_html(&linked_push(
+        let html = notice_html(&[linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[("6113728f27ae", "a change")],
             Some("https://forge.example/x"),
-        ));
+        )]);
 
         assert!(
             !html.contains('\n'),
@@ -1548,7 +1608,8 @@ mod tests {
                 Some("https://prometheus.example/graph"),
             ),
         ] {
-            assert_eq!(as_read(&notice_html(&event)), notice(&event));
+            let only = [event];
+            assert_eq!(as_read(&notice_html(&only)), notice(&only));
         }
     }
 
@@ -1568,7 +1629,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, REJECTED_BY_SOMETHING_ELSE, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         // Intercepted, not Rejected: the Destination never saw this, and an
@@ -1585,7 +1646,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::ACCEPTED, r#"{"ok":true}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Ok(()));
@@ -1604,7 +1665,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, "", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Intercepted));
@@ -1631,7 +1692,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::NOT_FOUND, REMOVED, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1653,13 +1714,13 @@ mod tests {
         notices_to(&url, Duration::from_secs(5))
             .dispatch(
                 &a_delivery(),
-                &linked_push(
+                &[linked_push(
                     "motrice/webhook-proxy",
                     "main",
                     "bjornmolin",
                     &[("6113728f27ae", WITH_AN_EMOJI)],
                     None,
-                ),
+                )],
                 &room("room"),
                 Attempt::First,
             )
@@ -1683,16 +1744,16 @@ mod tests {
         // transliterated — if that stopped being true, this is the test that
         // would say so.
         let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
-        let event = linked_push(
+        let only = [linked_push(
             "motrice/webhook-proxy",
             "main",
             "bjornmolin",
             &[("6113728f27ae", WITH_AN_EMOJI)],
             None,
-        );
+        )];
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &event, &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &only, &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
@@ -1703,8 +1764,8 @@ mod tests {
         // choice, not a different content type.
         assert!(content_type.contains("application/json"), "{content_type}");
         let sent: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
-        assert_eq!(sent["text"].as_str(), Some(notice(&event).as_str()));
-        assert_eq!(sent["html"].as_str(), Some(notice_html(&event).as_str()));
+        assert_eq!(sent["text"].as_str(), Some(notice(&only).as_str()));
+        assert_eq!(sent["html"].as_str(), Some(notice_html(&only).as_str()));
         // And the characters really are there once decoded.
         assert!(
             sent["text"]
@@ -1738,11 +1799,11 @@ mod tests {
         let notices = notices_to(&url, Duration::from_secs(5));
 
         notices
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
         notices
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::Replay)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::Replay)
             .await
             .expect("the stub accepts");
 
@@ -1777,11 +1838,106 @@ mod tests {
         let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
         let received = seen.lock().expect("not poisoned").clone();
         assert!(!received[0].1.contains("replayed"), "{}", received[0].1);
+    }
+
+    // ---- what a sender that grouped them gets (gc-smz) -------------------
+
+    fn alerts(count: usize) -> Vec<Event> {
+        (0..count)
+            .map(|n| {
+                an_alert(
+                    Severity::Critical,
+                    AlertStatus::Firing,
+                    &format!("alert number {n}"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_event_still_reads_exactly_as_it_always_did() {
+        // The common case outside an incident. A grouped form that made a single
+        // alert worse would have traded the everyday for the exceptional.
+        let only = a_push();
+        let rendered = notice(std::slice::from_ref(&only));
+
+        // No count, no list: the full three-line rendering, exactly as before
+        // grouping existed.
+        assert!(!rendered.contains("things happened"), "{rendered}");
+        assert!(
+            rendered.starts_with("bjornmolin pushed 2 commits to main"),
+            "{rendered}"
+        );
+        assert!(rendered.lines().count() > 1, "{rendered}");
+    }
+
+    #[test]
+    fn several_events_arrive_as_one_message_that_says_how_many() {
+        let text = notice(&alerts(3));
+
+        assert!(text.starts_with("3 things happened"), "{text}");
+        assert!(text.contains("alert number 0"), "{text}");
+        assert!(text.contains("alert number 2"), "{text}");
+        // One line each, not the full three: twenty alerts rendered in full is
+        // sixty lines, which is no better than twenty messages.
+        assert_eq!(text.lines().count(), 4, "{text}");
+    }
+
+    #[test]
+    fn a_group_too_large_to_show_says_how_many_it_left_out() {
+        // Alertmanager puts no cap on alerts per notification, so without this
+        // an incident could produce a message longer than the room it lands in.
+        let text = notice(&alerts(20));
+
+        assert!(text.starts_with("20 things happened"), "{text}");
+        assert!(text.contains("(+12 more)"), "{text}");
+        // The header, eight alerts, and the line saying what was omitted.
+        assert_eq!(text.lines().count(), 10, "{text}");
+    }
+
+    #[test]
+    fn exactly_the_limit_is_shown_without_claiming_anything_was_omitted() {
+        let text = notice(&alerts(8));
+
+        assert!(!text.contains("more)"), "{text}");
+        assert_eq!(text.lines().count(), 9, "{text}");
+    }
+
+    #[test]
+    fn a_grouped_entry_says_the_same_thing_the_full_rendering_does() {
+        // Taken from the full rendering rather than written again, so a grouped
+        // line and a single Notice cannot drift into describing one fact two
+        // ways.
+        let alert = an_alert(Severity::Warning, AlertStatus::Resolved, "a thing ended");
+        let alone = notice(std::slice::from_ref(&alert));
+        let grouped = notice(&[alert.clone(), a_push()]);
+
+        let first = alone.lines().next().expect("a line");
+        assert!(grouped.contains(first), "{grouped}");
+    }
+
+    #[test]
+    fn a_grouped_notice_escapes_what_a_sender_wrote_like_any_other() {
+        // The injection defence has to survive the new shape: these summaries
+        // are written by whoever can deploy a workload.
+        let html = notice_html(&[
+            an_alert(
+                Severity::Critical,
+                AlertStatus::Firing,
+                "<b>cert</b> expires — see [here](https://evil.example)",
+            ),
+            a_push(),
+        ]);
+
+        assert!(html.contains("&lt;b&gt;cert&lt;/b&gt;"), "{html}");
+        assert!(!html.contains("<b>cert</b>"), "{html}");
+        assert!(html.contains("[here](https://evil.example)"), "{html}");
+        assert!(!html.contains("<a href=\"https://evil.example"), "{html}");
     }
 }

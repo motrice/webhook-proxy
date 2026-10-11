@@ -50,7 +50,10 @@ follows from it:
 - **Each room's traffic is counted separately.** Three numbers per destination —
   `delivered`, `retrying`, `abandoned` — because the question anybody asks is
   *which* room, and a single total says a thousand messages went somewhere.
-  `delivered` is what a reader in that room actually saw. `abandoned` is a loss.
+  `delivered` is what a reader in that room actually saw — **messages, not
+  alerts**: a sender that groups twenty alerts into one notification produces
+  one message per room, so this counts what landed in the room rather than how
+  many facts it carried. `abandoned` is a loss.
   `retrying` counts **attempts, not messages**: a destination that is down shows
   a number that keeps climbing, which is the signal, so it is not a backlog
   length and does not subtract into anything. The arithmetic that *is* right is

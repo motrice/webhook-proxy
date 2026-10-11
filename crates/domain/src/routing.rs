@@ -51,14 +51,19 @@ impl DispatchId {
     }
 }
 
-/// One Event, bound for one Destination, from one Delivery.
+/// What one Destination is to be told, from one Delivery.
 ///
-/// The unit of work the delivery promise is about. `Relay` already produces
-/// these implicitly — a Delivery fans out to an Event per fact and a Destination
-/// per rule, and each of those is attempted and succeeds or fails on its own.
-/// Naming it is what lets a Dispatch be stored, retried and reported on
-/// separately, which is what the promise in gc-mbr requires: one Delivery can be
-/// half delivered, and saying which half is the whole value of recording it.
+/// The unit of work the delivery promise is about: one message, attempted and
+/// succeeding or failing on its own. That is what lets a Dispatch be stored,
+/// retried and reported on separately, which gc-mbr's promise requires — one
+/// Delivery can be half delivered, and saying which half is the whole value of
+/// recording it.
+///
+/// It carries the Events that selected *this* Destination rather than one Event,
+/// because a sender that grouped them meant a room to get one message (gc-lhh).
+/// Different alerts in one notification can select different rooms, so the set
+/// differs per Destination and the group a room sees is one this proxy composed,
+/// not the one the sender did.
 ///
 /// It carries the Destination rather than only its identity because a
 /// Destination is an identity and a kind and deliberately nothing else — no URL,
@@ -67,25 +72,33 @@ impl DispatchId {
 pub struct Dispatch {
     delivery: DeliveryId,
     origin: OriginId,
-    event: Event,
+    events: Vec<Event>,
     destination: Destination,
 }
 
 impl Dispatch {
     /// What is to be sent, where, and on whose behalf.
+    ///
+    /// `None` when there is nothing to say. A Dispatch with no Events would
+    /// render an empty Notice and send it, which is a blank message in somebody's
+    /// room — so it cannot be built rather than being guarded against at every
+    /// place one is used.
     #[must_use]
     pub fn new(
         delivery: DeliveryId,
         origin: OriginId,
-        event: Event,
+        events: Vec<Event>,
         destination: Destination,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if events.is_empty() {
+            return None;
+        }
+        Some(Self {
             delivery,
             origin,
-            event,
+            events,
             destination,
-        }
+        })
     }
 
     /// Which Delivery this came from.
@@ -106,10 +119,15 @@ impl Dispatch {
         &self.origin
     }
 
-    /// What happened.
+    /// Everything that happened, in the order the sender reported it.
+    ///
+    /// More than one when a sender grouped them. Alertmanager's `group_by`
+    /// collapses many firing alerts into one notification precisely so a room
+    /// gets one message, and sending one message per alert would undo a decision
+    /// the sender made deliberately — see bead gc-lhh. Never empty.
     #[must_use]
-    pub fn event(&self) -> &Event {
-        &self.event
+    pub fn events(&self) -> &[Event] {
+        &self.events
     }
 
     /// Where it is going.
@@ -303,12 +321,12 @@ pub fn destinations_for<'s>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,
-        routing_labels,
+        Destination, DestinationId, DestinationKind, Dispatch, Filter, Subscription,
+        destinations_for, routing_labels,
     };
     use crate::{
-        AlertId, AlertStatus, BranchName, Event, LabelName, LabelValue, Labels, OriginId, Pusher,
-        RepositoryName, Severity, Summary, Timestamp,
+        AlertId, AlertStatus, BranchName, DeliveryId, Event, LabelName, LabelValue, Labels,
+        OriginId, Pusher, RepositoryName, Severity, Summary, Timestamp,
     };
 
     fn destination(id: &str) -> Destination {
@@ -640,5 +658,24 @@ mod tests {
     #[test]
     fn no_subscriptions_means_no_destinations() {
         assert!(destinations_for(&origin("a-forge"), &push_to("any"), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_dispatch_with_nothing_to_say_cannot_be_built() {
+        // It would render an empty Notice and send it, which is a blank message
+        // in somebody's room. Refused at construction rather than guarded
+        // against everywhere one is used.
+        assert!(
+            Dispatch::new(
+                DeliveryId::new("d-1").expect("a non-blank id"),
+                OriginId::new("github").expect("a non-blank id"),
+                Vec::new(),
+                Destination::new(
+                    DestinationId::new("a-room").expect("a non-blank id"),
+                    DestinationKind::ChatRoom,
+                ),
+            )
+            .is_none()
+        );
     }
 }
