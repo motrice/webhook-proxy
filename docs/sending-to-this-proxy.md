@@ -151,6 +151,19 @@ neighbours in `crates/adapters/alertmanager-payload/src/lib.rs`.
 of them is delivered — better than a room hearing about two of three with nobody
 knowing the third existed.
 
+**Grouping is not preserved.** `group_by` collapses many firing alerts into one
+notification so a room gets one message; this proxy sends **one message per
+alert**, so a notification carrying twenty alerts becomes twenty messages. That
+is worth knowing before an incident rather than during one, because it is exactly
+when many alerts fire at once that your grouping matters most and that we amplify
+it most.
+
+Nothing on your side changes this: `group_interval` and `repeat_interval` govern
+how often a notification is sent, not how many messages it becomes here. It is
+our gap and we intend to close it — bead gc-lhh decided that grouped
+notifications should arrive as one message per room, and gc-smz is the work. Until
+it lands, size your grouping knowing each alert arrives on its own.
+
 ## Grafana
 
 Unified alerting, schema **v1** (`"version": "1"`).
