@@ -120,7 +120,30 @@ pub trait Dispatcher: Send + Sync {
         delivery: &DeliveryId,
         event: &Event,
         destination: &Destination,
+        attempt: Attempt,
     ) -> Result<(), DispatchFailed>;
+}
+
+/// Whether anyone at the Destination has plausibly seen this before.
+///
+/// Carried on the port rather than worked out by the adapter, because only the
+/// application knows: an adapter sees one call and cannot tell a first send from
+/// the third copy of something a person asked to be sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// On its way for the first time.
+    ///
+    /// Including a retry of one that failed. A retry is the same message
+    /// arriving late and nobody has seen it yet, so marking it would be noise
+    /// in a room — and noise in an alert channel is the thing this product is
+    /// most careful about.
+    First,
+    /// Sent again because somebody asked for it.
+    ///
+    /// A reader has probably seen this already, which is why it is marked: an
+    /// alert arriving twice is how a responder learns that something got worse,
+    /// and a replay that looked like one would be a lie told by a tool.
+    Replay,
 }
 
 /// Why a Dispatch did not arrive.

@@ -195,8 +195,8 @@ impl Outbox for MemoryOutbox {
 #[cfg(test)]
 mod tests {
     use domain::{
-        BranchName, Commit, CommitId, Destination, DestinationId, DestinationKind, Event, Pusher,
-        RepositoryName, Summary,
+        BranchName, Commit, CommitId, Destination, DestinationId, DestinationKind, Event, OriginId,
+        Pusher, RepositoryName, Summary,
     };
 
     use super::{
@@ -234,7 +234,12 @@ mod tests {
     }
 
     fn dispatch(id: &str, summary: &str, to: &str) -> Dispatch {
-        Dispatch::new(delivery(id), a_push(summary), room(to))
+        Dispatch::new(
+            delivery(id),
+            OriginId::new("github").expect("a non-blank id"),
+            a_push(summary),
+            room(to),
+        )
     }
 
     #[tokio::test]

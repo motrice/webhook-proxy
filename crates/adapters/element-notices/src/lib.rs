@@ -37,7 +37,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use application::ports::{DispatchFailed, Dispatcher};
+use application::ports::{Attempt, DispatchFailed, Dispatcher};
 use domain::{AlertStatus, Commit, DeliveryId, Destination, Event, Labels, Permalink, Severity};
 
 /// How much of a summary a reader sees before it is cut.
@@ -498,6 +498,23 @@ fn ascii_only(json: &str) -> String {
     out
 }
 
+/// Says so, when somebody asked for this to be sent again.
+///
+/// A room is where people find out that something is wrong, and an alert
+/// arriving twice is how a responder learns it got worse. A replay that looked
+/// like a second occurrence would be a lie told by a tool, at the moment
+/// somebody is deciding whether to get out of bed.
+///
+/// Plain ASCII and in front, so it survives both renderings and is the first
+/// thing read. A retry is deliberately NOT marked: nobody has seen it, so it is
+/// a first arrival that happens to be late.
+fn marked(attempt: Attempt, notice: &str) -> String {
+    match attempt {
+        Attempt::First => notice.to_owned(),
+        Attempt::Replay => format!("(replayed) {notice}"),
+    }
+}
+
 /// Which kind of failure a transport error is, in the Destination's terms.
 ///
 /// Nothing from the HTTP client escapes this function: a `reqwest::Error`
@@ -517,6 +534,7 @@ impl Dispatcher for ElementNotices {
         _delivery: &DeliveryId,
         event: &Event,
         destination: &Destination,
+        attempt: Attempt,
     ) -> Result<(), DispatchFailed> {
         // A Destination we hold no URL for cannot be reached. This is a
         // configuration gap rather than a refusal, and it is reported as a loss
@@ -540,8 +558,8 @@ impl Dispatcher for ElementNotices {
             .header("content-type", "application/json")
             .body(ascii_only(
                 &serde_json::json!({
-                    "text": notice(event),
-                    "html": notice_html(event),
+                    "text": marked(attempt, &notice(event)),
+                    "html": marked(attempt, &notice_html(event)),
                 })
                 .to_string(),
             ))
@@ -591,7 +609,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use application::ports::{DispatchFailed, Dispatcher};
+    use application::ports::{Attempt, DispatchFailed, Dispatcher};
     use axum::Router;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
@@ -998,7 +1016,7 @@ mod tests {
             None,
         );
         notices
-            .dispatch(&a_delivery(), &event, &room("room"))
+            .dispatch(&a_delivery(), &event, &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
@@ -1258,7 +1276,7 @@ mod tests {
         let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
@@ -1297,7 +1315,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":false}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1308,7 +1326,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::NOT_FOUND, "no such hook", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1319,7 +1337,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::INTERNAL_SERVER_ERROR, "broken", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Unreachable));
@@ -1330,7 +1348,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::from_millis(500)).await;
 
         let outcome = notices_to(&url, Duration::from_millis(50))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::TimedOut));
@@ -1341,7 +1359,12 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("some-other-room"))
+            .dispatch(
+                &a_delivery(),
+                &a_push(),
+                &room("some-other-room"),
+                Attempt::First,
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Unreachable));
@@ -1545,7 +1568,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, REJECTED_BY_SOMETHING_ELSE, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         // Intercepted, not Rejected: the Destination never saw this, and an
@@ -1562,7 +1585,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::ACCEPTED, r#"{"ok":true}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Ok(()));
@@ -1581,7 +1604,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, "", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Intercepted));
@@ -1608,7 +1631,7 @@ mod tests {
         let (url, _) = hookshot(StatusCode::NOT_FOUND, REMOVED, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &a_push(), &room("room"))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1638,6 +1661,7 @@ mod tests {
                     None,
                 ),
                 &room("room"),
+                Attempt::First,
             )
             .await
             .expect("the stub accepts");
@@ -1668,7 +1692,7 @@ mod tests {
         );
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &event, &room("room"))
+            .dispatch(&a_delivery(), &event, &room("room"), Attempt::First)
             .await
             .expect("the stub accepts");
 
@@ -1702,5 +1726,62 @@ mod tests {
         // ASCII is left exactly alone, including the structure of the JSON this
         // runs over and the backslashes already in it.
         assert_eq!(ascii_only(r#"{"a":"b\n"}"#), r#"{"a":"b\n"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_replay_says_so_and_a_first_attempt_does_not() {
+        // A room is where people find out something is wrong, and an alert
+        // arriving twice is how a responder learns it got worse. A replay that
+        // looked like a second occurrence would be a lie told by a tool, at the
+        // moment somebody is deciding whether to get out of bed.
+        let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
+        let notices = notices_to(&url, Duration::from_secs(5));
+
+        notices
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .await
+            .expect("the stub accepts");
+        notices
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::Replay)
+            .await
+            .expect("the stub accepts");
+
+        let received = seen.lock().expect("not poisoned").clone();
+        let first: serde_json::Value = serde_json::from_str(&received[0].1).expect("valid JSON");
+        let again: serde_json::Value = serde_json::from_str(&received[1].1).expect("valid JSON");
+
+        assert!(!first["text"].as_str().expect("text").contains("replayed"));
+        assert!(
+            again["text"]
+                .as_str()
+                .expect("text")
+                .starts_with("(replayed) "),
+            "{again}"
+        );
+        // Both renderings, because a client showing either must say the same.
+        assert!(
+            again["html"]
+                .as_str()
+                .expect("html")
+                .starts_with("(replayed) "),
+            "{again}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_is_not_marked_because_nobody_has_seen_it() {
+        // A retry is a first arrival that happens to be late. Marking it would
+        // put noise in an alert channel, which is the thing this product is
+        // most careful about — and the worker sends retries as Attempt::First
+        // for exactly this reason.
+        let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
+
+        notices_to(&url, Duration::from_secs(5))
+            .dispatch(&a_delivery(), &a_push(), &room("room"), Attempt::First)
+            .await
+            .expect("the stub accepts");
+
+        let received = seen.lock().expect("not poisoned").clone();
+        assert!(!received[0].1.contains("replayed"), "{}", received[0].1);
     }
 }

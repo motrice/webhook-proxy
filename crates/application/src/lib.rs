@@ -13,7 +13,9 @@
 
 pub mod ports;
 mod relay;
+mod replay;
 mod retries;
 
 pub use relay::{Refused, Relay, Relayed, Retry};
+pub use replay::{Replay, Replayed, Unreplayable};
 pub use retries::{Attempted, Retries};
