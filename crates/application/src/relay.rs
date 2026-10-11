@@ -7,7 +7,7 @@ use domain::{
     destinations_for,
 };
 
-use crate::ports::{Clock, DispatchFailed, Dispatcher, Ids, Outbox, Proofs, Translator};
+use crate::ports::{Attempt, Clock, DispatchFailed, Dispatcher, Ids, Outbox, Proofs, Translator};
 
 /// Why a Delivery was not accepted at all.
 ///
@@ -231,6 +231,11 @@ impl<'a> Relay<'a> {
             for destination in destinations_for(verified.origin(), event, self.subscriptions) {
                 planned.push(Dispatch::new(
                     verified.id().clone(),
+                    // From the *verified* Delivery, which is the same reason
+                    // routing asks it rather than the caller: the Origin a
+                    // replay routes by must be the one that was established,
+                    // never one somebody typed.
+                    verified.origin().clone(),
                     event.clone(),
                     destination.clone(),
                 ));
@@ -262,6 +267,7 @@ impl<'a> Relay<'a> {
                     dispatch.delivery(),
                     dispatch.event(),
                     dispatch.destination(),
+                    Attempt::First,
                 )
                 .await
             {
@@ -328,8 +334,8 @@ mod tests {
 
     use super::{Refused, Relay, Retry};
     use crate::ports::{
-        Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs, Recorded,
-        SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
+        Attempt, Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs,
+        Recorded, SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
@@ -394,6 +400,7 @@ mod tests {
             _delivery: &DeliveryId,
             _event: &Event,
             destination: &Destination,
+            _attempt: Attempt,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
             if self.failing.contains(&id.as_str()) {

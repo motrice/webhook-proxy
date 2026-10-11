@@ -1,0 +1,13 @@
+-- Which Origin was verified as having sent a Dispatch.
+--
+-- Added for replay (gc-6a5.3), and for a reason worth recording: a Dispatch was
+-- not enough to route one again. `origin` is the one label the proxy sets rather
+-- than reads, and every rule that names it relies on that — so sending a past
+-- Delivery to whoever should hear it *now* has to use the Origin that was
+-- established at the boundary, never one an operator typed when asking.
+--
+-- Existing rows get 'unknown', which is an Origin no routing file can name, so a
+-- replay of something stored before this migration selects nothing rather than
+-- selecting the wrong rooms. Failing to route is recoverable; routing to the
+-- wrong room is not.
+ALTER TABLE dispatch ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'unknown';

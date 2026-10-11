@@ -7,15 +7,16 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
 use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
 use application::ports::{Dispatcher, Outbox, Proofs, Translator};
-use application::{Retries, Retry};
+use application::{Replay, Retries, Retry};
 use axum::routing::get;
-use domain::Verification;
+use domain::{DeliveryId, Verification};
 use element_notices::ElementNotices;
 use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
@@ -266,6 +267,62 @@ async fn stored(config: &Config) -> Result<Arc<dyn Outbox>, Unstartable> {
     }
 }
 
+/// Sends a past Delivery again, and says where it went.
+///
+/// Reads the same routing file the process runs on, so a replay routes by the
+/// rules in force now — which is usually the point, because a replay happens
+/// after somebody changed something.
+async fn replay(id: &str) -> Result<String, Unstartable> {
+    let config = Config::from_env();
+    let routing = configured(&config).await?;
+
+    let delivery = DeliveryId::new(id)
+        .map_err(|why| Unstartable::Configuration(format!("that is not a delivery: {why}")))?;
+
+    let dispatcher = ElementNotices::new(routing.webhooks().clone(), config.timeout)
+        .map_err(|_| Unstartable::NoClient)?;
+    let outbox = stored(&config).await?;
+    let clock = SystemClock;
+
+    let replay = Replay::new(
+        &dispatcher,
+        outbox.as_ref(),
+        &clock,
+        routing.subscriptions(),
+    );
+
+    let replayed = replay
+        .delivery(&delivery)
+        .await
+        .map_err(|why| Unstartable::Configuration(why.to_string()))?;
+
+    let mut said = String::new();
+    if replayed.reached.is_empty() && replayed.failed.is_empty() {
+        // Not a failure: the rules changed and nobody wants this any more.
+        // Said plainly, because "nothing happened" is the one outcome an
+        // operator is most likely to misread as success.
+        writeln!(
+            said,
+            "no rule selects that delivery any more; nothing was sent"
+        )
+        .expect("writing to a String cannot fail");
+        return Ok(said);
+    }
+    for room in &replayed.reached {
+        writeln!(said, "sent again to {}", room.as_str()).expect("writing to a String cannot fail");
+    }
+    for room in &replayed.failed {
+        writeln!(
+            said,
+            "could not reach {}; stored and will be retried",
+            room.as_str()
+        )
+        .expect("writing to a String cannot fail");
+    }
+
+    Ok(said)
+}
+
 /// Liveness and readiness for k3s probes.
 ///
 /// Deliberately answers from the process alone: a probe that depended on the
@@ -340,6 +397,27 @@ async fn main() -> ExitCode {
             }
             Err(why) => {
                 eprintln!("webhook-proxy cannot start: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // Explicit, and the only way a replay ever starts. Nothing on the request
+    // path can reach it: a replay exists because a person decided one was
+    // needed, after an outage or a bug in a renderer, and a room being sent
+    // something twice should always be traceable to somebody asking.
+    if std::env::args().nth(1).as_deref() == Some("replay") {
+        let Some(id) = std::env::args().nth(2) else {
+            eprintln!("usage: webhook-proxy replay <delivery-id>");
+            return ExitCode::FAILURE;
+        };
+        return match replay(&id).await {
+            Ok(table) => {
+                print!("{table}");
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                eprintln!("webhook-proxy cannot replay: {why}");
                 ExitCode::FAILURE
             }
         };

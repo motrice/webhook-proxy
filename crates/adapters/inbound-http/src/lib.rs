@@ -301,8 +301,8 @@ mod tests {
 
     use application::Retry;
     use application::ports::{
-        Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs, Recorded,
-        SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
+        Attempt, Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs,
+        Recorded, SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
     };
     use async_trait::async_trait;
     use axum::Router;
@@ -428,6 +428,7 @@ mod tests {
             _delivery: &DeliveryId,
             _event: &Event,
             destination: &Destination,
+            _attempt: Attempt,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
             if self.failing.contains(&id.as_str()) {

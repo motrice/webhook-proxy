@@ -2,7 +2,7 @@
 
 use domain::DispatchId;
 
-use crate::ports::{Clock, Dispatcher, Outbox, StorageUnavailable};
+use crate::ports::{Attempt, Clock, Dispatcher, Outbox, StorageUnavailable};
 use crate::relay::Retry;
 
 /// What one pass over the outbox did.
@@ -82,6 +82,7 @@ impl<'a> Retries<'a> {
                     dispatch.delivery(),
                     dispatch.event(),
                     dispatch.destination(),
+                    Attempt::First,
                 )
                 .await
             {
@@ -134,10 +135,10 @@ mod tests {
     use async_trait::async_trait;
     use domain::{
         BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId, DestinationKind,
-        Dispatch, Event, Pusher, RepositoryName, Summary, Timestamp,
+        Dispatch, Event, OriginId, Pusher, RepositoryName, Summary, Timestamp,
     };
 
-    use super::{Attempted, Clock, DispatchId, Dispatcher, Outbox, Retries, Retry};
+    use super::{Attempt, Attempted, Clock, DispatchId, Dispatcher, Outbox, Retries, Retry};
     use crate::ports::{DispatchFailed, Outcome, Recorded, StorageUnavailable};
 
     const NOW: i64 = 1_759_000_000_000;
@@ -162,6 +163,7 @@ mod tests {
             _delivery: &DeliveryId,
             _event: &Event,
             destination: &Destination,
+            _attempt: Attempt,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
             if self.failing.contains(&id.as_str()) {
@@ -269,6 +271,7 @@ mod tests {
             DispatchId::new(id).expect("a non-blank id"),
             Dispatch::new(
                 DeliveryId::new("d-1").expect("a non-blank id"),
+                OriginId::new("github").expect("a non-blank id"),
                 Event::PushedCommits {
                     repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
                     branch: BranchName::new("main").expect("a name"),

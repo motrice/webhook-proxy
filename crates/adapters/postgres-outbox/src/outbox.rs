@@ -3,7 +3,8 @@
 use application::ports::{Outbox, Outcome, Recorded, StorageUnavailable};
 use async_trait::async_trait;
 use domain::{
-    DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, DispatchId, Timestamp,
+    DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, DispatchId, OriginId,
+    Timestamp,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -91,6 +92,7 @@ impl PostgresOutbox {
 fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable> {
     let id: i64 = row.try_get("id").map_err(|_| StorageUnavailable)?;
     let delivery: String = row.try_get("delivery").map_err(|_| StorageUnavailable)?;
+    let origin: String = row.try_get("origin").map_err(|_| StorageUnavailable)?;
     let destination: String = row.try_get("destination").map_err(|_| StorageUnavailable)?;
     let kind: String = row.try_get("kind").map_err(|_| StorageUnavailable)?;
     let event: serde_json::Value = row.try_get("event").map_err(|_| StorageUnavailable)?;
@@ -120,6 +122,7 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
         DispatchId::new(&id.to_string()).map_err(|_| StorageUnavailable)?,
         Dispatch::new(
             DeliveryId::new(&delivery).map_err(|_| StorageUnavailable)?,
+            OriginId::new(&origin).map_err(|_| StorageUnavailable)?,
             stored::read(&event).map_err(|_| StorageUnavailable)?,
             Destination::new(
                 DestinationId::new(&destination).map_err(|_| StorageUnavailable)?,
@@ -149,7 +152,7 @@ fn row_id(id: &DispatchId) -> Result<i64, StorageUnavailable> {
 
 /// Columns every read needs, with the moments already in milliseconds so the
 /// mapping back to `Timestamp` is one shape rather than three.
-const COLUMNS: &str = "id, delivery, destination, kind, event, outcome, attempts, \
+const COLUMNS: &str = "id, delivery, origin, destination, kind, event, outcome, attempts, \
      (EXTRACT(EPOCH FROM again_at) * 1000)::BIGINT AS again_at_ms, \
      (EXTRACT(EPOCH FROM settled_at) * 1000)::BIGINT AS settled_at_ms";
 
@@ -170,8 +173,9 @@ impl Outbox for PostgresOutbox {
         for dispatch in dispatches {
             let row = sqlx::query(&format!(
                 "INSERT INTO dispatch \
-                     (delivery, destination, kind, event, outcome, attempts, again_at, accepted_at) \
-                 VALUES ($1, $2, $3, $4, 'waiting', 0, to_timestamp($5::BIGINT / 1000.0), \
+                     (delivery, origin, destination, kind, event, outcome, attempts, again_at, \
+                      accepted_at) \
+                 VALUES ($1, $6, $2, $3, $4, 'waiting', 0, to_timestamp($5::BIGINT / 1000.0), \
                          to_timestamp($5::BIGINT / 1000.0)) \
                  RETURNING {COLUMNS}"
             ))
@@ -180,6 +184,7 @@ impl Outbox for PostgresOutbox {
             .bind(kind_of(dispatch.destination()))
             .bind(stored::written(dispatch.event()))
             .bind(at.millis_since_epoch())
+            .bind(dispatch.origin().as_str())
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| StorageUnavailable)?;
@@ -301,8 +306,8 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     use super::{
-        DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, Outbox, PostgresOutbox,
-        Timestamp,
+        DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, OriginId, Outbox,
+        PostgresOutbox, Timestamp,
     };
 
     /// Where the test database is, if somebody started one.
@@ -339,6 +344,7 @@ mod tests {
     fn dispatch(delivery: &str, summary: &str, room: &str) -> Dispatch {
         Dispatch::new(
             DeliveryId::new(delivery).expect("a non-blank id"),
+            OriginId::new("github").expect("a non-blank id"),
             Event::PushedCommits {
                 repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
                 branch: BranchName::new("main").expect("a name"),

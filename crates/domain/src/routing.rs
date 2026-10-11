@@ -66,6 +66,7 @@ impl DispatchId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dispatch {
     delivery: DeliveryId,
+    origin: OriginId,
     event: Event,
     destination: Destination,
 }
@@ -73,9 +74,15 @@ pub struct Dispatch {
 impl Dispatch {
     /// What is to be sent, where, and on whose behalf.
     #[must_use]
-    pub fn new(delivery: DeliveryId, event: Event, destination: Destination) -> Self {
+    pub fn new(
+        delivery: DeliveryId,
+        origin: OriginId,
+        event: Event,
+        destination: Destination,
+    ) -> Self {
         Self {
             delivery,
+            origin,
             event,
             destination,
         }
@@ -85,6 +92,18 @@ impl Dispatch {
     #[must_use]
     pub fn delivery(&self) -> &DeliveryId {
         &self.delivery
+    }
+
+    /// Which Origin was verified as having sent it.
+    ///
+    /// Kept because a Dispatch is not enough to route one again without it.
+    /// `origin` is the one label the proxy sets rather than reads, and every
+    /// rule that names it relies on that — so sending this somewhere new later
+    /// has to use the Origin that was *established* at the boundary, never one
+    /// an operator typed when asking for a replay.
+    #[must_use]
+    pub fn origin(&self) -> &OriginId {
+        &self.origin
     }
 
     /// What happened.

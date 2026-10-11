@@ -212,6 +212,23 @@ rooms  (* marks a label only a sender can supply)
 3 sender(s), 3 room(s), 5 rule(s), 6 secret(s) present
 ```
 
+A past delivery can be sent again, by identity:
+
+```sh
+webhook-proxy replay <delivery-id>
+```
+
+It routes by the rules in force **now**, not the ones in force when the delivery
+arrived — which is usually the point, because a replay happens after somebody
+changed something. The Origin it routes by is the one that was verified at the
+time and stored beside the dispatch, never one typed on the command line.
+
+A replayed message says `(replayed)` in the room. A retry does not: nobody has
+seen a retry, so it is a first arrival that happens to be late, and marking it
+would put noise in the channel people rely on for alerts.
+
+Only a person can start one. Nothing on the request path can.
+
 **The operations repository's pipeline should run this on every change to the
 file**, and a reviewer should read its output on the pull request. It opens no
 socket and reaches no network, so it is safe in a pipeline with no cluster

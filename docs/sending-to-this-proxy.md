@@ -93,6 +93,11 @@ Every loss is logged with the delivery's identity, the room's identity and the
 reason, and counted. If you need to know whether something arrived, that log is
 the answer, not the `202`.
 
+A message you sent once can be sent to a room again, by an operator asking for
+it. It arrives marked `(replayed)`, so a reader can tell it from something
+happening a second time — which matters most for alerts, where a repeat is how
+somebody learns a situation got worse.
+
 A loss can also be something between this proxy and the room answering on its
 behalf — a firewall returning a success status over a refusal. That is reported
 as `Intercepted` rather than as the room refusing, because the room never saw the
