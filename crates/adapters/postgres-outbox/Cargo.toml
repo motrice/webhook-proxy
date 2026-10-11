@@ -1,0 +1,32 @@
+[package]
+name = "postgres-outbox"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain" }
+application = { path = "../../application" }
+async-trait = "0.1"
+# Chosen over a bare driver for one reason beyond queries: `migrate!` embeds the
+# schema at compile time and applies it behind an advisory lock, so two replicas
+# starting together cannot race each other into a half-created schema.
+#
+# No compile-time query checking: the `query!` macros need a live database at
+# build time, which would make `cargo build` depend on a server. The runtime
+# `query` functions do not.
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls-ring",
+  "postgres",
+  "migrate",
+] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
