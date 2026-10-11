@@ -15,6 +15,7 @@ members = [
     "crates/adapters/github-payload",
     "crates/adapters/github-signatures",
     "crates/adapters/grafana-payload",
+    "crates/adapters/memory-outbox",
     "crates/adapters/inbound-http",
     "crates/adapters/shared-values",
     "crates/adapters/system",

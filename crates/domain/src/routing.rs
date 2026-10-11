@@ -2,7 +2,7 @@
 
 use crate::event::present;
 use crate::label::{self, LabelName, LabelValue};
-use crate::{Blank, Event, Labels, OriginId};
+use crate::{Blank, DeliveryId, Event, Labels, OriginId};
 
 /// Identifies a [`Destination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,55 @@ pub enum DestinationKind {
     ChatRoom,
     /// Another forge, which consumes structure rather than prose.
     Forge,
+}
+
+/// One Event, bound for one Destination, from one Delivery.
+///
+/// The unit of work the delivery promise is about. `Relay` already produces
+/// these implicitly — a Delivery fans out to an Event per fact and a Destination
+/// per rule, and each of those is attempted and succeeds or fails on its own.
+/// Naming it is what lets a Dispatch be stored, retried and reported on
+/// separately, which is what the promise in gc-mbr requires: one Delivery can be
+/// half delivered, and saying which half is the whole value of recording it.
+///
+/// It carries the Destination rather than only its identity because a
+/// Destination is an identity and a kind and deliberately nothing else — no URL,
+/// no token — so keeping it whole costs nothing and loses no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatch {
+    delivery: DeliveryId,
+    event: Event,
+    destination: Destination,
+}
+
+impl Dispatch {
+    /// What is to be sent, where, and on whose behalf.
+    #[must_use]
+    pub fn new(delivery: DeliveryId, event: Event, destination: Destination) -> Self {
+        Self {
+            delivery,
+            event,
+            destination,
+        }
+    }
+
+    /// Which Delivery this came from.
+    #[must_use]
+    pub fn delivery(&self) -> &DeliveryId {
+        &self.delivery
+    }
+
+    /// What happened.
+    #[must_use]
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// Where it is going.
+    #[must_use]
+    pub fn destination(&self) -> &Destination {
+        &self.destination
+    }
 }
 
 /// An internal system that should be told about Events.
