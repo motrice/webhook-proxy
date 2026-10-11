@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
 use application::ports::{Dispatcher, Outbox, Proofs, Translator};
-use application::{Replay, Retries, Retry};
+use application::{Replay, Retries, Retry, Tally};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
 use element_notices::ElementNotices;
@@ -323,6 +323,53 @@ async fn replay(id: &str) -> Result<String, Unstartable> {
     Ok(said)
 }
 
+/// Comes back to whatever the request path could not deliver.
+///
+/// The second half of the promise, and a task rather than part of serving:
+/// nothing waits on it, because the relay has already sent what it could. A
+/// sweep rather than a queue, so a short interval would be mostly empty polls.
+fn sweeping(
+    dispatcher: Arc<dyn Dispatcher>,
+    outbox: Arc<dyn Outbox>,
+    tally: Arc<Tally>,
+    retry: Retry,
+    sweep: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let clock = SystemClock;
+        let retries = Retries::new(dispatcher.as_ref(), outbox.as_ref(), &clock, retry);
+        loop {
+            match retries.once(RETRY_BATCH).await {
+                Ok(attempted) if !attempted.idle() => {
+                    // Counted here rather than inside the worker, which holds no
+                    // state of its own: what it did is a value it returns, and
+                    // who keeps a running total is this crate's business.
+                    for room in &attempted.delivered {
+                        tally.delivered(room);
+                    }
+                    for room in &attempted.retrying {
+                        tally.retrying(room);
+                    }
+                    for room in &attempted.abandoned {
+                        tally.abandoned(room);
+                    }
+                    tracing::info!(
+                        delivered = attempted.delivered.len(),
+                        retrying = attempted.retrying.len(),
+                        abandoned = attempted.abandoned.len(),
+                        "retried what was due"
+                    );
+                }
+                Ok(_) => {}
+                // No address, no credential: StorageUnavailable carries none,
+                // and this line is written from it.
+                Err(why) => tracing::error!(%why, "cannot read the outbox"),
+            }
+            tokio::time::sleep(sweep).await;
+        }
+    })
+}
+
 /// Liveness and readiness for k3s probes.
 ///
 /// Deliberately answers from the process alone: a probe that depended on the
@@ -505,6 +552,10 @@ async fn run() -> Result<(), Unstartable> {
 
     let outbox = stored(&config).await?;
 
+    // One tally, shared: the request path sends immediately and the worker comes
+    // back to whatever failed, so a count held by either alone would be wrong.
+    let tally = Arc::new(Tally::new());
+
     let inbound = Inbound::new(
         senders,
         Arc::clone(&dispatcher),
@@ -513,36 +564,16 @@ async fn run() -> Result<(), Unstartable> {
         Arc::new(RandomIds),
         routing.subscriptions().to_vec(),
         config.retry,
+        Arc::clone(&tally),
     );
 
-    // The second half of the promise. The relay sends immediately; this is what
-    // comes back to whatever that could not deliver, so a Destination that was
-    // down for a minute is not a message nobody ever sees.
-    let retrying = tokio::spawn({
-        let dispatcher = Arc::clone(&dispatcher);
-        let outbox = Arc::clone(&outbox);
-        let retry = config.retry;
-        let sweep = config.sweep;
-        async move {
-            let clock = SystemClock;
-            let retries = Retries::new(dispatcher.as_ref(), outbox.as_ref(), &clock, retry);
-            loop {
-                match retries.once(RETRY_BATCH).await {
-                    Ok(attempted) if !attempted.idle() => tracing::info!(
-                        delivered = attempted.delivered,
-                        retrying = attempted.retrying,
-                        abandoned = attempted.abandoned,
-                        "retried what was due"
-                    ),
-                    Ok(_) => {}
-                    // No address, no credential: StorageUnavailable carries
-                    // none, and this line is written from it.
-                    Err(why) => tracing::error!(%why, "cannot read the outbox"),
-                }
-                tokio::time::sleep(sweep).await;
-            }
-        }
-    });
+    let retrying = sweeping(
+        Arc::clone(&dispatcher),
+        Arc::clone(&outbox),
+        tally,
+        config.retry,
+        config.sweep,
+    );
 
     let app = router(inbound, config.max_body).route("/health", get(health));
 

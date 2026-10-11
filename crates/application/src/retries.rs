@@ -6,21 +6,25 @@ use crate::ports::{Attempt, Clock, Dispatcher, Outbox, StorageUnavailable};
 use crate::relay::Retry;
 
 /// What one pass over the outbox did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Attempted {
-    /// Dispatches that arrived this time.
-    pub delivered: usize,
-    /// Dispatches that failed and are due again later.
-    pub retrying: usize,
-    /// Dispatches that failed for the last time. These are losses.
-    pub abandoned: usize,
+    /// Destinations that were told this time.
+    pub delivered: Vec<domain::DestinationId>,
+    /// Destinations that could not be told, and are due again later.
+    pub retrying: Vec<domain::DestinationId>,
+    /// Destinations that will not be told. These are losses.
+    ///
+    /// Named rather than counted, because the question anybody asks of these
+    /// numbers is *which room*, and a worker that reported only totals would
+    /// make a flooded or a failing room invisible.
+    pub abandoned: Vec<domain::DestinationId>,
 }
 
 impl Attempted {
     /// Whether anything at all was tried.
     #[must_use]
     pub fn idle(&self) -> bool {
-        self.delivered == 0 && self.retrying == 0 && self.abandoned == 0
+        self.delivered.is_empty() && self.retrying.is_empty() && self.abandoned.is_empty()
     }
 }
 
@@ -76,30 +80,30 @@ impl<'a> Retries<'a> {
         let mut attempted = Attempted::default();
         for record in &due {
             let dispatch = record.dispatch();
-            match self
+            let room = dispatch.destination().id().clone();
+            let sent = self
                 .dispatcher
                 .dispatch(
                     dispatch.delivery(),
                     dispatch.event(),
                     dispatch.destination(),
+                    // A retry is a first arrival that happens to be late:
+                    // nobody has seen it, so marking it would be noise in a
+                    // room. Only a replay says so (gc-6a5.3).
                     Attempt::First,
                 )
-                .await
-            {
-                Ok(()) => {
-                    self.settle_delivered(record.id()).await;
-                    attempted.delivered += 1;
-                }
-                Err(_) => {
-                    // The attempts already spent, plus this one. The store
-                    // counts them, so a worker restarting does not reset a
-                    // Dispatch's budget and retry it forever.
-                    if self.settle_failed(record.id(), record.attempts() + 1).await {
-                        attempted.retrying += 1;
-                    } else {
-                        attempted.abandoned += 1;
-                    }
-                }
+                .await;
+
+            if sent.is_ok() {
+                self.settle_delivered(record.id()).await;
+                attempted.delivered.push(room);
+            // The attempts already spent, plus this one. The store counts them,
+            // so a worker restarting does not reset a Dispatch's budget and
+            // retry it forever.
+            } else if self.settle_failed(record.id(), record.attempts() + 1).await {
+                attempted.retrying.push(room);
+            } else {
+                attempted.abandoned.push(room);
             }
         }
 
@@ -138,7 +142,7 @@ mod tests {
         Dispatch, Event, OriginId, Pusher, RepositoryName, Summary, Timestamp,
     };
 
-    use super::{Attempt, Attempted, Clock, DispatchId, Dispatcher, Outbox, Retries, Retry};
+    use super::{Attempt, Clock, DispatchId, Dispatcher, Outbox, Retries, Retry};
     use crate::ports::{DispatchFailed, Outcome, Recorded, StorageUnavailable};
 
     const NOW: i64 = 1_759_000_000_000;
@@ -313,14 +317,10 @@ mod tests {
 
         let attempted = retries.once(10).await.expect("the store answers");
 
-        assert_eq!(
-            attempted,
-            Attempted {
-                delivered: 1,
-                retrying: 0,
-                abandoned: 0
-            }
-        );
+        assert_eq!(attempted.delivered.len(), 1);
+        assert_eq!(attempted.delivered[0].as_str(), "a-room");
+        assert!(attempted.retrying.is_empty());
+        assert!(attempted.abandoned.is_empty());
         assert_eq!(outbox.settled(), vec![("s-1".to_owned(), "delivered")]);
     }
 
@@ -335,7 +335,8 @@ mod tests {
 
         let attempted = retries.once(10).await.expect("the store answers");
 
-        assert_eq!(attempted.retrying, 1);
+        assert_eq!(attempted.retrying.len(), 1);
+        assert_eq!(attempted.retrying[0].as_str(), "a-room");
         assert_eq!(outbox.settled(), vec![("s-1".to_owned(), "failed")]);
     }
 
@@ -355,7 +356,8 @@ mod tests {
 
         let attempted = retries.once(10).await.expect("the store answers");
 
-        assert_eq!(attempted.abandoned, 1);
+        assert_eq!(attempted.abandoned.len(), 1);
+        assert_eq!(attempted.abandoned[0].as_str(), "a-room");
         assert_eq!(outbox.settled(), vec![("s-1".to_owned(), "abandoned")]);
     }
 
@@ -375,7 +377,12 @@ mod tests {
         let retries = Retries::new(&dispatcher, &outbox, &FixedClock, generous());
 
         assert_eq!(
-            retries.once(2).await.expect("the store answers").delivered,
+            retries
+                .once(2)
+                .await
+                .expect("the store answers")
+                .delivered
+                .len(),
             2
         );
     }

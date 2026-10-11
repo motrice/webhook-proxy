@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use application::ports::{Clock, Dispatcher, Ids, Outbox, Proofs, Translator};
-use application::{Refused, Relay, Retry};
+use application::{Refused, Relay, Retry, Tally};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -95,7 +95,12 @@ pub struct Inbound {
     subscriptions: Arc<Vec<Subscription>>,
     outbox: Arc<dyn Outbox>,
     retry: Retry,
-    losses: Arc<AtomicU64>,
+    /// What each room has been sent, shared with the worker.
+    ///
+    /// Shared rather than owned, because a Dispatch is attempted in two places:
+    /// here, immediately, and in the worker that comes back to whatever failed.
+    /// A count living only here would miss every retry.
+    tally: Arc<Tally>,
     /// Senders refused because the store could not take their Delivery.
     ///
     /// Deliberately not counted as losses. A refusal is the promise working:
@@ -119,6 +124,12 @@ impl Inbound {
     /// `senders`, because each of them belongs to one sender rather than to the
     /// deployment.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the composition root names every collaborator once; grouping them into a \
+                  struct would move the list rather than shorten it, and hide which of them \
+                  are shared with the worker"
+    )]
     pub fn new(
         senders: HashMap<String, Sender>,
         dispatcher: Arc<dyn Dispatcher>,
@@ -127,6 +138,7 @@ impl Inbound {
         ids: Arc<dyn Ids>,
         subscriptions: Vec<Subscription>,
         retry: Retry,
+        tally: Arc<Tally>,
     ) -> Self {
         Self {
             senders: Arc::new(senders),
@@ -136,7 +148,7 @@ impl Inbound {
             clock,
             ids,
             subscriptions: Arc::new(subscriptions),
-            losses: Arc::new(AtomicU64::new(0)),
+            tally,
             refusals: Arc::new(AtomicU64::new(0)),
             storage_was_down: Arc::new(AtomicBool::new(false)),
         }
@@ -156,7 +168,13 @@ impl Inbound {
     /// count that makes the promise auditable.
     #[must_use]
     pub fn losses(&self) -> u64 {
-        self.losses.load(Ordering::Relaxed)
+        self.tally.losses()
+    }
+
+    /// What each room has been sent, and what became of it.
+    #[must_use]
+    pub fn tally(&self) -> &Tally {
+        &self.tally
     }
 }
 
@@ -243,7 +261,14 @@ async fn receive(
                 );
             }
 
+            // What each room actually saw, which is the number somebody asks
+            // for when a channel starts feeling noisy.
+            for destination in relayed.reached() {
+                inbound.tally.delivered(destination);
+            }
+
             for (destination, failure) in relayed.retrying() {
+                inbound.tally.retrying(destination);
                 // Not a loss and not counted as one: it is stored and due to be
                 // tried again. An operator told a Notice was lost goes looking
                 // for it; one told it will be retried waits.
@@ -256,7 +281,7 @@ async fn receive(
             }
 
             for (destination, failure) in relayed.abandoned() {
-                inbound.losses.fetch_add(1, Ordering::Relaxed);
+                inbound.tally.abandoned(destination);
                 // Identities and a reason. A Destination holds no address, so
                 // there is no credential here to spill.
                 tracing::warn!(
@@ -299,11 +324,11 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use application::Retry;
     use application::ports::{
         Attempt, Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs,
         Recorded, SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
     };
+    use application::{Retry, Tally};
     use async_trait::async_trait;
     use axum::Router;
     use axum::body::Body as AxumBody;
@@ -664,6 +689,7 @@ mod tests {
             ids.clone(),
             to_rooms(rooms),
             generous(),
+            Arc::new(Tally::new()),
         );
 
         Wired {
@@ -928,6 +954,7 @@ mod tests {
                 core::time::Duration::from_mins(1),
                 1,
             ),
+            Arc::new(Tally::new()),
         );
         let app = router(inbound.clone(), 64 * 1024);
 
@@ -999,5 +1026,89 @@ mod tests {
             "{:?}",
             response.headers()
         );
+    }
+
+    #[tokio::test]
+    async fn what_each_room_was_sent_is_counted_apart_from_what_it_was_not() {
+        // The question this answers is "which room is being flooded", and a
+        // flooded room is one that received a lot — not one that lost a lot.
+        // Before this, nothing in the product could answer it, and the first
+        // signal of alert fatigue was somebody muting the channel.
+        let wired = wire(
+            Sigs::matching(),
+            Ok(vec![a_push()]),
+            vec!["broken"],
+            &["working", "broken"],
+            64 * 1024,
+        );
+
+        let status = post(wired.app.clone(), "/webhook/github", Some("ok:abc"), BODY).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let tally = wired.inbound.tally();
+        assert_eq!(
+            tally
+                .counts(&DestinationId::new("working").expect("a non-blank id"))
+                .delivered,
+            1
+        );
+        // The one that failed is counted as retrying, and not as delivered:
+        // nobody in that room has seen anything.
+        let broken = tally.counts(&DestinationId::new("broken").expect("a non-blank id"));
+        assert_eq!(broken.delivered, 0);
+        assert_eq!(broken.retrying, 1);
+        assert_eq!(broken.abandoned, 0);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_given_up_on_is_counted_against_the_room_that_lost_it() {
+        // "Logged and counted" is what makes best-effort an engineering
+        // decision rather than an excuse, and it has to say WHICH room: a total
+        // tells an operator something was lost and leaves them to find out
+        // where.
+        let dispatcher = Recorder::new(vec!["broken"]);
+        let ids = Arc::new(CountingIds(Mutex::new(0)));
+        let (name, origin) = an_origin();
+        let sigs = Sigs::matching();
+        let tally = Arc::new(Tally::new());
+        let inbound = Inbound::new(
+            HashMap::from([(
+                name,
+                Sender {
+                    origin,
+                    proofs: sigs.clone(),
+                    translator: Arc::new(Says(Ok(vec![a_push()]))),
+                    presented: SIGNATURE_HEADER,
+                },
+            )]),
+            dispatcher.clone(),
+            Arc::new(Store { available: true }),
+            Arc::new(FixedClock),
+            ids,
+            to_rooms(&["working", "broken"]),
+            // One attempt, so the first failure is the last.
+            Retry::new(
+                core::time::Duration::from_secs(1),
+                core::time::Duration::from_mins(1),
+                1,
+            ),
+            Arc::clone(&tally),
+        );
+        let app = router(inbound.clone(), 64 * 1024);
+
+        post(app, "/webhook/github", Some("ok:abc"), BODY).await;
+
+        let broken = tally.counts(&DestinationId::new("broken").expect("a non-blank id"));
+        assert_eq!(broken.abandoned, 1);
+        assert_eq!(broken.delivered, 0);
+        // And the room that was reached is untouched by the other's failure.
+        assert_eq!(
+            tally
+                .counts(&DestinationId::new("working").expect("a non-blank id"))
+                .delivered,
+            1
+        );
+        // The old total still means what it meant: losses are the abandoned.
+        assert_eq!(inbound.losses(), 1);
     }
 }
