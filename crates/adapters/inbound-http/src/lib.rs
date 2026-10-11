@@ -10,14 +10,15 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use application::ports::{Clock, Dispatcher, Ids, Proofs, Translator};
-use application::{Refused, Relay};
+use application::ports::{Clock, Dispatcher, Ids, Outbox, Proofs, Translator};
+use application::{Refused, Relay, Retry};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::post;
 use domain::{Body, Origin, Subscription};
 
@@ -92,7 +93,22 @@ pub struct Inbound {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn Ids>,
     subscriptions: Arc<Vec<Subscription>>,
+    outbox: Arc<dyn Outbox>,
+    retry: Retry,
     losses: Arc<AtomicU64>,
+    /// Senders refused because the store could not take their Delivery.
+    ///
+    /// Deliberately not counted as losses. A refusal is the promise working:
+    /// the sender was told, and nothing was accepted that will not be tried.
+    /// Adding them to the loss count would make both numbers useless — one
+    /// measures what we dropped, the other what we declined to take.
+    refusals: Arc<AtomicU64>,
+    /// Whether the store was unavailable the last time anybody looked.
+    ///
+    /// Kept so the transition is logged rather than every request. During an
+    /// outage every request fails, and an error line per request floods the one
+    /// log somebody is reading to find out why. See gc-mbr.
+    storage_was_down: Arc<AtomicBool>,
 }
 
 impl Inbound {
@@ -106,18 +122,31 @@ impl Inbound {
     pub fn new(
         senders: HashMap<String, Sender>,
         dispatcher: Arc<dyn Dispatcher>,
+        outbox: Arc<dyn Outbox>,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn Ids>,
         subscriptions: Vec<Subscription>,
+        retry: Retry,
     ) -> Self {
         Self {
             senders: Arc::new(senders),
             dispatcher,
+            outbox,
+            retry,
             clock,
             ids,
             subscriptions: Arc::new(subscriptions),
             losses: Arc::new(AtomicU64::new(0)),
+            refusals: Arc::new(AtomicU64::new(0)),
+            storage_was_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// How many senders have been refused because the store would not take
+    /// their Delivery.
+    #[must_use]
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
     }
 
     /// How many Dispatches have been dropped since start.
@@ -165,11 +194,11 @@ async fn receive(
     Path(origin): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> (StatusCode, HeaderMap) {
     // A path naming a sender we do not serve cannot be authenticated, so it is
     // refused here rather than anywhere further in.
     let Some(sender) = inbound.senders.get(&origin) else {
-        return StatusCode::NOT_FOUND;
+        return (StatusCode::NOT_FOUND, HeaderMap::new());
     };
 
     // Where the credential is read from follows from what this sender declared,
@@ -181,19 +210,21 @@ async fn receive(
     // Nothing below this point runs without something to compare. There is no
     // flag, no environment variable and no build feature that skips it.
     let Some(presented) = headers.get(name).and_then(|value| value.to_str().ok()) else {
-        return StatusCode::UNAUTHORIZED;
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new());
     };
     let Ok(claimed) = sender.proofs.claimed(presented) else {
-        return StatusCode::UNAUTHORIZED;
+        return (StatusCode::UNAUTHORIZED, HeaderMap::new());
     };
 
     let relay = Relay::new(
         sender.proofs.as_ref(),
         sender.translator.as_ref(),
         inbound.dispatcher.as_ref(),
+        inbound.outbox.as_ref(),
         inbound.clock.as_ref(),
         inbound.ids.as_ref(),
         inbound.subscriptions.as_slice(),
+        inbound.retry,
     );
 
     // The body is handed over as the bytes that arrived. This crate never parses
@@ -203,7 +234,28 @@ async fn receive(
         .await
     {
         Ok(relayed) => {
-            for (destination, failure) in relayed.lost() {
+            // The store answered, so if it had been failing it is not any more.
+            // Logged once on the way back up, not once per request.
+            if inbound.storage_was_down.swap(false, Ordering::Relaxed) {
+                tracing::error!(
+                    refused = inbound.refusals(),
+                    "the delivery store is available again"
+                );
+            }
+
+            for (destination, failure) in relayed.retrying() {
+                // Not a loss and not counted as one: it is stored and due to be
+                // tried again. An operator told a Notice was lost goes looking
+                // for it; one told it will be retried waits.
+                tracing::info!(
+                    delivery = relayed.delivery().as_str(),
+                    destination = destination.as_str(),
+                    failure = ?failure,
+                    "dispatch failed, stored for another attempt"
+                );
+            }
+
+            for (destination, failure) in relayed.abandoned() {
                 inbound.losses.fetch_add(1, Ordering::Relaxed);
                 // Identities and a reason. A Destination holds no address, so
                 // there is no credential here to spill.
@@ -214,11 +266,30 @@ async fn receive(
                     "dispatch lost"
                 );
             }
-            StatusCode::ACCEPTED
+            (StatusCode::ACCEPTED, HeaderMap::new())
         }
-        Err(Refused::ProofMismatch) => StatusCode::UNAUTHORIZED,
-        Err(Refused::SecretUnavailable) => StatusCode::SERVICE_UNAVAILABLE,
-        Err(Refused::Untranslatable) => StatusCode::BAD_REQUEST,
+        Err(Refused::ProofMismatch) => (StatusCode::UNAUTHORIZED, HeaderMap::new()),
+        Err(Refused::SecretUnavailable) => (StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()),
+        Err(Refused::Untranslatable) => (StatusCode::BAD_REQUEST, HeaderMap::new()),
+        Err(Refused::StorageUnavailable) => {
+            inbound.refusals.fetch_add(1, Ordering::Relaxed);
+
+            // Once, on the way down. Every request fails during an outage, and
+            // an error line per request floods the log somebody is reading to
+            // find out why. The count is what says how many (gc-mbr).
+            if !inbound.storage_was_down.swap(true, Ordering::Relaxed) {
+                // No address, no credential, no driver message: this line is
+                // written from StorageUnavailable, which carries none.
+                tracing::error!("the delivery store is unavailable; refusing senders");
+            }
+
+            // The one thing a well-behaved sender can act on. It costs nothing
+            // and GitHub will ignore it — that sender does not retry at all, so
+            // a store outage needs a human to redeliver.
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
+            (StatusCode::SERVICE_UNAVAILABLE, headers)
+        }
     }
 }
 
@@ -228,17 +299,19 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    use application::Retry;
     use application::ports::{
-        Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Proofs, SecretUnavailable,
-        Translator, Untranslatable,
+        Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs, Recorded,
+        SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
     };
+    use async_trait::async_trait;
     use axum::Router;
     use axum::body::Body as AxumBody;
     use axum::http::{Request, StatusCode};
     use domain::{
-        Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Event, Filter,
-        Origin, OriginId, Proof, Pusher, RepositoryName, SecretId, Subscription, Timestamp,
-        Verification, VerifiedDelivery,
+        Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, DispatchId,
+        Event, Filter, Origin, OriginId, Proof, Pusher, RepositoryName, SecretId, Subscription,
+        Timestamp, Verification, VerifiedDelivery,
     };
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
@@ -461,12 +534,115 @@ mod tests {
         ids: Arc<CountingIds>,
     }
 
+    /// An outbox for these tests, which can be told to refuse.
+    ///
+    /// Its storing behaviour is proved against the real in-memory adapter in
+    /// its own crate; adapters may not depend on each other, and what these
+    /// tests need from it is only that it works, or that it does not.
+    struct Store {
+        available: bool,
+    }
+
+    #[async_trait]
+    impl Outbox for Store {
+        async fn accept(
+            &self,
+            dispatches: &[domain::Dispatch],
+            at: Timestamp,
+        ) -> Result<Vec<Recorded>, StorageUnavailable> {
+            if !self.available {
+                return Err(StorageUnavailable);
+            }
+            Ok(dispatches
+                .iter()
+                .enumerate()
+                .map(|(offset, dispatch)| {
+                    Recorded::new(
+                        DispatchId::new(&format!("s-{}", offset + 1)).expect("non-blank"),
+                        dispatch.clone(),
+                        0,
+                        Outcome::Waiting { again_at: at },
+                    )
+                })
+                .collect())
+        }
+
+        async fn accepted(
+            &self,
+            _delivery: &DeliveryId,
+        ) -> Result<Vec<Recorded>, StorageUnavailable> {
+            Ok(Vec::new())
+        }
+
+        async fn due(
+            &self,
+            _now: Timestamp,
+            _limit: usize,
+        ) -> Result<Vec<Recorded>, StorageUnavailable> {
+            Ok(Vec::new())
+        }
+
+        async fn delivered(
+            &self,
+            _id: &DispatchId,
+            _at: Timestamp,
+        ) -> Result<(), StorageUnavailable> {
+            Ok(())
+        }
+
+        async fn failed(
+            &self,
+            _id: &DispatchId,
+            _at: Timestamp,
+            _again_at: Timestamp,
+        ) -> Result<(), StorageUnavailable> {
+            Ok(())
+        }
+
+        async fn abandoned(
+            &self,
+            _id: &DispatchId,
+            _at: Timestamp,
+        ) -> Result<(), StorageUnavailable> {
+            Ok(())
+        }
+    }
+
+    /// Always try again, so a test about routing is not also a test about a
+    /// retry budget.
+    fn generous() -> Retry {
+        Retry::new(
+            core::time::Duration::from_secs(1),
+            core::time::Duration::from_mins(1),
+            5,
+        )
+    }
+
     fn wire(
         sigs: Arc<Sigs>,
         says: Result<Vec<Event>, Untranslatable>,
         failing: Vec<&'static str>,
         rooms: &[&str],
         max_body: usize,
+    ) -> Wired {
+        wire_with(
+            sigs,
+            says,
+            failing,
+            rooms,
+            max_body,
+            Store { available: true },
+        )
+    }
+
+    /// The same, with an outbox the test chooses.
+    fn wire_with(
+        sigs: Arc<Sigs>,
+        says: Result<Vec<Event>, Untranslatable>,
+        failing: Vec<&'static str>,
+        rooms: &[&str],
+        max_body: usize,
+        store: Store,
     ) -> Wired {
         let dispatcher = Recorder::new(failing);
         let ids = Arc::new(CountingIds(Mutex::new(0)));
@@ -482,9 +658,11 @@ mod tests {
                 },
             )]),
             dispatcher.clone(),
+            Arc::new(store),
             Arc::new(FixedClock),
             ids.clone(),
             to_rooms(rooms),
+            generous(),
         );
 
         Wired {
@@ -663,7 +841,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_dispatch_still_accepts_and_counts_the_loss() {
+    async fn a_failed_dispatch_still_accepts_and_is_not_yet_a_loss() {
+        // It used to be counted here. With an outbox it is stored and due to be
+        // tried again, so counting it would mean the loss number rises every
+        // time a room blinks — and a number that rises for things that then
+        // arrive is a number nobody can act on.
         let wired = wire(
             Sigs::matching(),
             Ok(vec![a_push()]),
@@ -676,7 +858,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(wired.dispatcher.sent(), vec!["working"]);
-        assert_eq!(wired.inbound.losses(), 1);
+        assert_eq!(wired.inbound.losses(), 0);
     }
 
     #[tokio::test]
@@ -712,5 +894,109 @@ mod tests {
                 "`{forbidden}` reached the log: {written}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_with_no_attempts_left_is_counted_as_the_loss_it_is() {
+        // The other half. "Logged and counted" is what makes best-effort an
+        // engineering decision rather than an excuse, and that has to keep
+        // meaning something once failures are retried: what is counted is what
+        // nobody will ever see.
+        let dispatcher = Recorder::new(vec!["broken"]);
+        let ids = Arc::new(CountingIds(Mutex::new(0)));
+        let (name, origin) = an_origin();
+        let sigs = Sigs::matching();
+        let inbound = Inbound::new(
+            HashMap::from([(
+                name,
+                Sender {
+                    origin,
+                    proofs: sigs.clone(),
+                    translator: Arc::new(Says(Ok(vec![a_push()]))),
+                    presented: SIGNATURE_HEADER,
+                },
+            )]),
+            dispatcher.clone(),
+            Arc::new(Store { available: true }),
+            Arc::new(FixedClock),
+            ids,
+            to_rooms(&["working", "broken"]),
+            // One attempt, so the first failure is the last.
+            Retry::new(
+                core::time::Duration::from_secs(1),
+                core::time::Duration::from_mins(1),
+                1,
+            ),
+        );
+        let app = router(inbound.clone(), 64 * 1024);
+
+        let status = post(app, "/webhook/github", Some("ok:abc"), BODY).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(inbound.losses(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_take_it_refuses_the_sender_and_sends_nothing() {
+        // The promise, at the front door. A 202 means stored (gc-mbr), so when
+        // nothing could be stored the sender is told so — and nothing is sent,
+        // because sending without storing is the second meaning of 202 that
+        // decision exists to forbid.
+        let wired = wire_with(
+            Sigs::matching(),
+            Ok(vec![a_push()]),
+            vec![],
+            &["working"],
+            64 * 1024,
+            Store { available: false },
+        );
+
+        let status = post(wired.app.clone(), "/webhook/github", Some("ok:abc"), BODY).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            wired.dispatcher.sent().is_empty(),
+            "a Notice was sent that nothing had promised to retry"
+        );
+        // Counted as a refusal and deliberately not as a loss: the sender was
+        // told, which is the promise working rather than failing.
+        assert_eq!(wired.inbound.refusals(), 1);
+        assert_eq!(wired.inbound.losses(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_tells_the_sender_when_to_come_back() {
+        // The one thing a well-behaved sender can act on. GitHub will ignore it
+        // -- it does not retry at all -- which is why the sender contract says a
+        // store outage needs a human to redeliver.
+        let wired = wire_with(
+            Sigs::matching(),
+            Ok(vec![a_push()]),
+            vec![],
+            &["working"],
+            64 * 1024,
+            Store { available: false },
+        );
+
+        let response = wired
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhook/github")
+                    .header("X-Hub-Signature-256", "ok:abc")
+                    .body(axum::body::Body::from(BODY.to_vec()))
+                    .expect("a request"),
+            )
+            .await
+            .expect("the router answers");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().contains_key("retry-after"),
+            "{:?}",
+            response.headers()
+        );
     }
 }

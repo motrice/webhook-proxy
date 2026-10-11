@@ -25,19 +25,34 @@ deciding whether this was the right thing to build.
 
 ## What it promises
 
-**A webhook is acknowledged once it is verified, then delivered to
-each matching destination on a bounded number of attempts; nothing is persisted,
-so a dispatch that exhausts its attempts or outlives the process is lost — and
-every loss is logged and counted.**
+**A webhook is acknowledged once it is verified and stored, then delivered to
+each matching destination and retried on a bounded number of attempts; a
+dispatch that exhausts them is abandoned — and every abandoned dispatch is
+logged and counted.**
 
-That is best-effort, stated plainly, and the rest follows from it:
+That is at-least-once until the attempts run out, stated plainly, and the rest
+follows from it:
 
+- **A `202` means stored, not delivered.** The sender gets it once verification
+  succeeds *and* the delivery is written down. That is what makes the retry a
+  promise rather than a hope.
+- **When it cannot be stored, the sender is refused.** A `503` with
+  `Retry-After`, and nothing is sent. Accepting into memory instead would make a
+  `202` mean two different things depending on state the sender cannot see, and
+  a promise that is conditional on something invisible is not a promise.
+  Senders differ in what that costs them: Alertmanager retries, and **GitHub
+  does not auto-retry at all**, so a store outage needs somebody to redeliver
+  from the repository's settings.
 - **Acknowledgement means accepted, not delivered.** The sender gets a 2xx once
   verification succeeds. A destination failing afterwards must not turn into
   a 5xx, because the sender would retry and re-deliver to the destinations that
   already succeeded.
-- **Losses are visible.** A dropped dispatch is logged with the delivery's
-  identity, the destination's identity and the reason, and counted. A
+- **Losses are visible, and a retry is not a loss.** A dispatch that failed and
+  is due to be tried again is logged as that; only an abandoned one is counted
+  as lost. Counting both would make the number rise for messages that then
+  arrive, which is a number nobody can act on. An abandoned dispatch is logged
+  with the delivery's identity, the destination's identity and the reason, and
+  counted. A
   best-effort system whose losses are invisible is indistinguishable from a
   broken one; the log is what makes "best-effort" an engineering decision rather
   than an excuse. Which is why a success *status* is not taken as proof of

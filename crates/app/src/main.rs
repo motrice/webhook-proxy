@@ -12,7 +12,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
-use application::ports::{Dispatcher, Proofs, Translator};
+use application::ports::{Dispatcher, Outbox, Proofs, Translator};
+use application::{Retries, Retry};
 use axum::routing::get;
 use domain::Verification;
 use element_notices::ElementNotices;
@@ -20,6 +21,7 @@ use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
 use grafana_payload::GrafanaPayload;
 use inbound_http::{AUTHORIZATION_HEADER, Inbound, SIGNATURE_HEADER, Sender, router};
+use memory_outbox::MemoryOutbox;
 use shared_values::SharedValues;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,6 +69,8 @@ struct Config {
     file: PathBuf,
     secrets: PathBuf,
     startup_wait: Duration,
+    retry: Retry,
+    sweep: Duration,
 }
 
 impl Config {
@@ -107,6 +111,23 @@ impl Config {
                     .parse()
                     .unwrap_or(30_000),
             ),
+            // Five attempts over about half a minute of waiting, doubling from
+            // one second and capped at thirty. Long enough to ride out a chat
+            // server restart; short enough that an alert nobody will ever get is
+            // reported as lost while somebody still cares.
+            retry: Retry::new(
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                optional("WEBHOOK_PROXY_ATTEMPTS", "5").parse().unwrap_or(5),
+            ),
+            // How often to look for work. Nothing waits on this — the relay has
+            // already sent what it could — so it is a sweep rather than a queue,
+            // and a short one would be mostly empty polls.
+            sweep: Duration::from_millis(
+                optional("WEBHOOK_PROXY_SWEEP_MS", "5000")
+                    .parse()
+                    .unwrap_or(5_000),
+            ),
         }
     }
 }
@@ -117,6 +138,12 @@ fn optional(name: &str, fallback: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback.to_owned())
 }
+
+/// How many Dispatches one sweep of the outbox takes at a time.
+///
+/// Bounded so a pass cannot hold a replica for an unbounded time, and so two
+/// replicas share the work rather than one taking all of it.
+const RETRY_BATCH: usize = 32;
 
 /// How often to look again while waiting for configuration.
 ///
@@ -331,13 +358,50 @@ async fn run() -> Result<(), Unstartable> {
         })
         .collect();
 
+    // In memory for now, which means a restart loses what has not been sent.
+    // The promise a sender is given is that a Delivery is stored before it is
+    // acknowledged; making that survive the process is gc-b0n, and the port is
+    // the same either way.
+    let outbox: Arc<dyn Outbox> = Arc::new(MemoryOutbox::new());
+
     let inbound = Inbound::new(
         senders,
-        dispatcher,
+        Arc::clone(&dispatcher),
+        Arc::clone(&outbox),
         Arc::new(SystemClock),
         Arc::new(RandomIds),
         routing.subscriptions().to_vec(),
+        config.retry,
     );
+
+    // The second half of the promise. The relay sends immediately; this is what
+    // comes back to whatever that could not deliver, so a Destination that was
+    // down for a minute is not a message nobody ever sees.
+    let retrying = tokio::spawn({
+        let dispatcher = Arc::clone(&dispatcher);
+        let outbox = Arc::clone(&outbox);
+        let retry = config.retry;
+        let sweep = config.sweep;
+        async move {
+            let clock = SystemClock;
+            let retries = Retries::new(dispatcher.as_ref(), outbox.as_ref(), &clock, retry);
+            loop {
+                match retries.once(RETRY_BATCH).await {
+                    Ok(attempted) if !attempted.idle() => tracing::info!(
+                        delivered = attempted.delivered,
+                        retrying = attempted.retrying,
+                        abandoned = attempted.abandoned,
+                        "retried what was due"
+                    ),
+                    Ok(_) => {}
+                    // No address, no credential: StorageUnavailable carries
+                    // none, and this line is written from it.
+                    Err(why) => tracing::error!(%why, "cannot read the outbox"),
+                }
+                tokio::time::sleep(sweep).await;
+            }
+        }
+    });
 
     let app = router(inbound, config.max_body).route("/health", get(health));
 
@@ -361,6 +425,10 @@ async fn run() -> Result<(), Unstartable> {
         .with_graceful_shutdown(asked_to_stop())
         .await
         .map_err(|why| Unstartable::Serving(why.to_string()))?;
+
+    // Stopped with the listener. Anything it was mid-way through is still in
+    // the outbox, which is the point of the outbox.
+    retrying.abort();
 
     Ok(())
 }

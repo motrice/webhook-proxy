@@ -76,8 +76,14 @@ So: do not treat `202` as proof a human saw anything, and do not retry on it.
 ## What is lost, in your terms
 
 - **No retry beyond a bounded number of attempts.** A room that stays
-  unreachable loses that message. Nothing is queued for later.
-- **Nothing is persisted.** A message in flight when the proxy restarts is gone.
+  unreachable long enough loses that message. What is queued is retried until
+  the attempts run out, and then abandoned.
+- **A `503` means we did not take it.** The delivery was not stored, so nothing
+  was promised and nothing was sent. Send it again. If your sender does not
+  retry — **GitHub does not** — somebody has to redeliver it by hand.
+- **Storage is in memory today.** A message not yet delivered when the proxy
+  restarts is gone. The `202` still means it was written down; it does not yet
+  mean it survives the process.
 - **Repeats are possible.** Within the attempt budget a room can see the same
   message twice — when a request succeeded but its response was lost. Do not
   build anything that assumes exactly-once.
