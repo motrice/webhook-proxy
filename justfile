@@ -476,6 +476,39 @@ approve id:
     just _push "$branch"
     printf 'wait for CI to pass, then: just land %s\n' "{{ id }}"
 
+# Run the tests that need a real PostgreSQL.
+#
+# They are `#[ignore]`d rather than skipped when no database is around, so an
+# ordinary `just check` reports them as ignored out loud instead of printing a
+# pass for work it did not do. This starts one, runs them, and leaves it up —
+# `just test-db-stop` removes it.
+[doc("Run the tests that need a database")]
+[group('test')]
+test-db:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker inspect webhook-proxy-test-db >/dev/null 2>&1; then
+        docker run -d --name webhook-proxy-test-db \
+            -e POSTGRES_PASSWORD=test -e POSTGRES_DB=outbox \
+            -p 55432:5432 postgres:17-alpine >/dev/null
+    fi
+    docker start webhook-proxy-test-db >/dev/null 2>&1 || true
+    for _ in $(seq 60); do
+        if docker exec webhook-proxy-test-db pg_isready -U postgres >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    # One at a time: each test truncates the table, so they would otherwise
+    # delete each other's rows.
+    cargo test -p postgres-outbox -- --ignored --test-threads=1
+
+# ▪ Remove the test database.
+[doc("Remove the test database")]
+[group('test')]
+test-db-stop:
+    docker rm -f webhook-proxy-test-db
+
 # ▪ MAINTAINER ONLY. Land an approved bead on main, preserving its signature.
 #
 # Refuses unless *every* commit it would add carries a good signature from a key

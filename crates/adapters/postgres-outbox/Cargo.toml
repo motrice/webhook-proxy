@@ -22,11 +22,17 @@ sqlx = { version = "0.8", default-features = false, features = [
   "tls-rustls-ring",
   "postgres",
   "migrate",
+  # For `migrate!` only. The `query!` macros live here too and are deliberately
+  # not used: they need a live database at build time, which would make `cargo
+  # build` depend on a server being up.
+  "macros",
 ] }
 serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+# Only to run eight claims at once, which is the point of the concurrency test.
+futures = "0.3"
 
 [lints]
 workspace = true
