@@ -139,6 +139,25 @@ test fixture — because the network perimeter is one line of defence and leakin
 the URL would let anything already inside it post freely. The routing file is
 reviewable precisely because it holds names and no values.
 
+**Everything above stops at the chat server's door.** This proxy verifies the
+sender and routes by policy; past that door the room's own configuration
+governs, and it is not ours to set. A hookshot generic webhook can run a
+JavaScript transformation function over what it receives before the room sees
+it — documented by hookshot, and offered as a checkbox to whoever adds the
+webhook, so it is a choice made in the room rather than here. The webhook this
+proxy posts to must be created with that off, which is a requirement on whoever
+creates it and not something this proxy can check. The web application firewall
+named above can also refuse a Notice for its contents, with a policy nobody
+tells us about, so what a room displays is not even guaranteed to be what we
+sent.
+
+So the guarantees in this section describe what leaves this proxy, not what
+appears in a room. That is a boundary rather than a weakness, and naming it is
+what makes the guarantees on this side mean something: whoever can configure a
+room's webhook is already inside the trust boundary of everything that room
+displays, and no amount of escaping here protects a room from its own
+configuration.
+
 Rotation and expiry live on the hookshot instance and are not ours to set.
 Accepted deliberately: the rooms in scope carry notifications, so the worst case
 is nuisance or a convincing fake message, and whoever runs that instance owns the

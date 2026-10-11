@@ -243,5 +243,11 @@ address as its visible text, so a reader can see where it goes before clicking.
 
 So: do not rely on formatting, and do not assume your markup is inert elsewhere.
 
+What we promise about your payload ends at the chat server's door. A room's
+webhook can be configured to transform what it receives before anybody reads it,
+and a firewall on the path can refuse your notice for its contents — neither is
+something this proxy sets, and neither tells us it happened. The escaping above
+is a promise about what we send, not about what a reader finally sees.
+
 Long values are cut: a summary at 200 characters, a label name or value at 60,
 and at most 8 labels shown with any remainder counted rather than hidden.
