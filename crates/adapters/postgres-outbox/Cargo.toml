@@ -30,9 +30,17 @@ sqlx = { version = "0.8", default-features = false, features = [
 serde_json = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 # Only to run eight claims at once, which is the point of the concurrency test.
 futures = "0.3"
+# The tests bring their own PostgreSQL rather than expecting one to be running
+# (bead gc-e5x). Before this, the ten tests below were `#[ignore]`d and ran only
+# when somebody typed a recipe, which meant the store every Dispatch waits in
+# was covered by tests no pipeline had ever executed. Dev-dependencies are
+# intentionally unrestricted by the architecture rules, so this does not widen
+# the hexagon — see crates/architecture/tests/boundaries.rs.
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = ["postgres"] }
 
 [lints]
 workspace = true

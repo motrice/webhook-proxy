@@ -254,6 +254,15 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# The whole suite, the database-backed tests included.
+#
+# Those ten used to be `#[ignore]`d and run by a recipe of their own, which meant
+# the store every Dispatch waits in was covered by tests no pipeline had ever
+# executed (bead gc-e5x). They now start their own PostgreSQL through
+# testcontainers, so this needs a reachable Docker and there is nothing left to
+# remember. A machine without one fails here rather than reporting a pass for
+# work it did not do, which is what the `#[ignore]` was reaching for and could
+# not enforce.
 [group('rust')]
 test:
     cargo test --workspace --all-targets
@@ -478,39 +487,6 @@ approve id:
     git log --format='  %h %G? %s' "$base..$branch"
     just _push "$branch"
     printf 'wait for CI to pass, then: just land %s\n' "{{ id }}"
-
-# Run the tests that need a real PostgreSQL.
-#
-# They are `#[ignore]`d rather than skipped when no database is around, so an
-# ordinary `just check` reports them as ignored out loud instead of printing a
-# pass for work it did not do. This starts one, runs them, and leaves it up —
-# `just test-db-stop` removes it.
-[doc("Run the tests that need a database")]
-[group('test')]
-test-db:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! docker inspect webhook-proxy-test-db >/dev/null 2>&1; then
-        docker run -d --name webhook-proxy-test-db \
-            -e POSTGRES_PASSWORD=test -e POSTGRES_DB=outbox \
-            -p 55432:5432 postgres:17-alpine >/dev/null
-    fi
-    docker start webhook-proxy-test-db >/dev/null 2>&1 || true
-    for _ in $(seq 60); do
-        if docker exec webhook-proxy-test-db pg_isready -U postgres >/dev/null 2>&1; then
-            break
-        fi
-        sleep 1
-    done
-    # One at a time: each test truncates the table, so they would otherwise
-    # delete each other's rows.
-    cargo test -p postgres-outbox -- --ignored --test-threads=1
-
-# ▪ Remove the test database.
-[doc("Remove the test database")]
-[group('test')]
-test-db-stop:
-    docker rm -f webhook-proxy-test-db
 
 # ▪ MAINTAINER ONLY. Land an approved bead on main, preserving its signature.
 #
