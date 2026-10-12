@@ -1,0 +1,219 @@
+# The inbound interface, as the code actually implements it.
+#
+# crates/app/tests/openapi.rs checks this document against the source: the paths
+# against the router, the statuses against the handler, and the security schemes
+# against the mechanisms the routing file names. A path renamed or a status added
+# fails a test rather than leaving this prose quietly false.
+#
+# Not described here, because it is not this interface: what the proxy sends
+# onward to a chat room. See docs/sending-to-this-proxy.md for the sender's view
+# in prose, which this makes machine-readable rather than replaces.
+openapi: 3.1.0
+
+info:
+  title: webhook-proxy
+  summary: Relays a verified webhook into an internal chat room.
+  description: |
+    An authentication boundary in front of chat rooms that have none. The
+    destination is a hookshot generic webhook, which supports no inbound
+    authentication at all, so this proxy is what decides whether a request is
+    genuine.
+
+    **A `202` means accepted, not delivered.** The request was verified and the
+    delivery written down; the rooms it fans out to are reached afterwards and
+    independently. Do not treat a `202` as proof a human saw anything, and do
+    not retry on it.
+
+    **Each sender defines how it proves itself, and this interface accommodates
+    both.** GitHub signs the body; Alertmanager and Grafana send a token. The
+    mechanism is read from configuration per Origin and never chosen by looking
+    at the request, so a request arriving at a signing Origin bearing a token is
+    refused rather than retried as a token.
+
+    Conformance to the national REST API-profil is claimed for the areas named
+    in bead `gc-4oo.2` and not for the profile as a whole. Two SKALL rules are
+    refused there with reasons: `SAK.01` and `UFN.02`, both because TLS
+    terminates at the gateway in front of this process rather than in it.
+  version: 0.0.0
+  license:
+    name: EUPL-1.2
+    url: https://github.com/motrice/webhook-proxy/blob/main/LICENSES/EUPL-1.2.txt
+  contact:
+    name: Motrice AB
+    url: https://github.com/motrice/webhook-proxy
+
+  # DOK.08 wants a service level stated rather than implied. These are the
+  # numbers the code actually enforces, not aspirations: five attempts over
+  # roughly half a minute, and a refusal rather than a silent downgrade when the
+  # store is unreachable.
+  x-sla:
+    availability: |
+      Best-effort. Two replicas behind a gateway, and no availability target is
+      promised to a sender. The proxy refuses with 503 rather than accepting
+      what it cannot promise to keep, so an outage of its store is visible as a
+      refusal and never as a quiet loss.
+    responseTime: |
+      A 202 is answered as soon as the request is verified and the delivery
+      written down, before any room is reached. Reaching a room is not on the
+      request path, so a slow or unreachable room does not slow a sender.
+    support: |
+      Operated by the team that owns the rooms it posts into. Losses are logged
+      with the delivery's identity, the room's identity and the reason, and
+      counted at /metrics — that log is the answer to "did it arrive", never the
+      202.
+
+  # DOK.09 wants known limitations named. These are the same ones
+  # docs/sending-to-this-proxy.md states in prose, under "What is lost, in your
+  # terms"; a sender should not have to read both to learn the same problem.
+  x-limitations: |
+    At-least-once, with limits worth knowing before relying on this:
+
+    - Delivery is attempted a bounded number of times. A room unreachable for
+      long enough loses that message, and the loss is logged and counted.
+    - Repeats are possible. A room can see the same message twice, when a
+      request succeeded but its response was lost. Nothing downstream should
+      assume exactly-once.
+    - Order is not promised. Two notifications can reach one room out of order.
+    - A success status from the path is not proof of delivery: a firewall in
+      front of the destination answers 200 with an HTML page over a refusal, so
+      a dispatch counts as delivered only when the destination itself says so.
+    - Long values are cut: a summary at 200 characters, a label name or value at
+      60, at most 8 labels and at most 8 alerts shown in a grouped message, with
+      any remainder counted rather than hidden.
+
+externalDocs:
+  description: What a sender has to know, in prose
+  url: https://github.com/motrice/webhook-proxy/blob/main/docs/sending-to-this-proxy.md
+
+servers:
+  - url: https://{host}
+    description: |
+      TLS terminates at the gateway in front of this process, which listens on
+      plain HTTP inside the cluster. A caller always reaches it over HTTPS; the
+      process is never the thing that offers it.
+    variables:
+      host:
+        default: webhook-proxy.example
+        description: The public hostname this deployment is published under.
+
+paths:
+  /webhook/{origin}:
+    post:
+      summary: Receive a webhook from a configured sender.
+      description: |
+        The path segment is the sender's identity as its own configuration spells
+        it, which is why it is not a plural noun and carries no version segment:
+        renaming it would break every webhook already registered.
+
+        Verification happens before the body is parsed, and nothing can switch it
+        off. An Origin this proxy holds no secret for is refused; there is no
+        permissive default.
+      operationId: receiveWebhook
+      security:
+        - githubSignature: []
+        - bearerToken: []
+      parameters:
+        - name: origin
+          in: path
+          required: true
+          description: The configured sender's identity.
+          schema:
+            type: string
+            pattern: ^[a-z0-9-]+$
+          examples:
+            github:
+              value: github
+            alertmanager:
+              value: alertmanager
+      requestBody:
+        required: true
+        description: |
+          The sender's own notification format, unchanged. This proxy translates
+          it; it does not define it.
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Whatever the sender sends. Translated per Origin.
+            examples:
+              push:
+                summary: A GitHub push
+                externalValue: https://github.com/motrice/webhook-proxy/blob/main/crates/adapters/github-payload/fixtures/push.json
+      responses:
+        "202":
+          description: |
+            Accepted and written down. Not delivered: the rooms are reached
+            afterwards, and a loss after this point is logged and counted rather
+            than reported here.
+        "400":
+          description: |
+            The body is not a payload this sender's translator understands.
+            Retrying identical content will not help.
+        "401":
+          description: |
+            The credential is absent, malformed, or wrong. Indistinguishable on
+            purpose: saying which would tell an unauthenticated caller half the
+            answer.
+        "404":
+          description: No sender is configured at this path.
+        "413":
+          description: |
+            The body is larger than this deployment's configured limit, refused
+            before anything is verified or parsed. One mebibyte by default.
+        "503":
+          description: |
+            A secret this proxy needs could not be read, or the store it keeps
+            deliveries in could not be reached. Nothing was promised and nothing
+            was sent; send it again.
+
+  /health:
+    get:
+      summary: Whether the process is serving.
+      description: |
+        Says nothing about whether a room is reachable or a secret is readable —
+        a proxy that cannot deliver still answers this. It is what the
+        orchestrator reads to decide whether to route traffic here.
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Serving.
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: ok
+
+  /metrics:
+    get:
+      summary: What each room was sent, for a scraper.
+      description: |
+        Prometheus text format. Carries counts per destination identity and
+        nothing else: no address, no secret, no part of any payload.
+      operationId: metrics
+      security: []
+      responses:
+        "200":
+          description: The counters.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    githubSignature:
+      type: apiKey
+      in: header
+      name: x-hub-signature-256
+      description: |
+        An HMAC-SHA256 over the raw body, as GitHub computes it. Configured per
+        Origin as `hmac_sha256`. The signature covers the bytes received, so it
+        cannot be replayed against a different body.
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        A value shared in advance, for a sender that cannot sign a body.
+        Configured per Origin as `bearer`. Alertmanager and Grafana authenticate
+        this way because neither offers a signature.
