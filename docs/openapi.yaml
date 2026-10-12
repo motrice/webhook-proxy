@@ -184,6 +184,58 @@ paths:
                 type: string
                 const: ok
 
+  /api-info:
+    get:
+      summary: What is answering, and where its documentation is.
+      description: |
+        VER.06 of the national REST API-profil. At the root rather than under a
+        version segment, because `VER.05` is departed: the path a sender posts to
+        is its own configuration, not ours to version.
+
+        Reachable without a credential, which decides what it may say. It names
+        the product, its version, its status and its documentation. It says
+        nothing about which senders are configured, which rooms exist, or what
+        this deployment relays — anyone who can reach the port can read this.
+      operationId: apiInfo
+      security: []
+      responses:
+        "200":
+          description: What is answering.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [apiName, apiVersion, apiReleased, apiDocumentation, apiStatus]
+                additionalProperties: false
+                properties:
+                  apiName:
+                    type: string
+                    description: Read from the binary name, never written out.
+                  apiVersion:
+                    type: string
+                    description: |
+                      Read from the crate version, so a release that forgets to
+                      update it is impossible rather than discouraged.
+                  apiReleased:
+                    type: string
+                    format: date
+                    description: |
+                      When this version of the interface was published, RFC 3339.
+                  apiDocumentation:
+                    type: string
+                    format: uri
+                  apiStatus:
+                    type: string
+                    description: |
+                      `beta` while the inbound contract is still moving.
+                    enum: [beta, stable, deprecated]
+              example:
+                apiName: webhook-proxy
+                apiVersion: 0.0.0
+                apiReleased: "2026-10-12"
+                apiDocumentation: https://github.com/motrice/webhook-proxy/blob/main/docs/sending-to-this-proxy.md
+                apiStatus: beta
+
   /metrics:
     get:
       summary: What each room was sent, for a scraper.

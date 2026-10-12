@@ -448,6 +448,58 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// When this version of the interface was published.
+///
+/// A literal, and the one value here that cannot be derived: there is no release
+/// process yet (bead gc-lw3), so nothing stamps a date. It is the day
+/// `docs/openapi.yaml` first described this interface, which is what "released"
+/// means for an API — the interface became available to a reader, whatever the
+/// deployment history.
+///
+/// `api_info_moves_its_release_date_when_a_version_is_actually_released` fails if
+/// the crate version ever leaves `0.0.0` while this is unchanged, so the first
+/// real release cannot quietly serve a two-year-old date.
+const RELEASED: &str = "2026-10-12";
+
+/// Where a reader goes next. Reachable without a credential, like this resource.
+const DOCUMENTATION: &str =
+    "https://github.com/motrice/webhook-proxy/blob/main/docs/sending-to-this-proxy.md";
+
+/// What is answering, for an operator looking at a running pod.
+///
+/// VER.06 of the national REST API-profil, accepted rather than refused in bead
+/// gc-4oo.2 because it is cheap and genuinely useful: nothing else here says
+/// which version replied. It lives at the root rather than under a version
+/// segment because VER.05 is departed — the path is the sender's configuration,
+/// not ours to version.
+///
+/// Unauthenticated by its own definition, so what it must NOT say is the
+/// interesting part: no Origin, no Destination, no room, no secret, nothing
+/// about what this deployment is configured to relay. Naming the product and its
+/// documentation is the whole of it. The acceptance test asserts the absence by
+/// searching the body for the test deployment's own rooms and tokens.
+///
+/// `apiVersion` is read from the crate rather than written here, so a release
+/// that forgets to update it is impossible rather than merely discouraged.
+async fn api_info() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            // The BIN name, not the package name: the crate is `app` and the
+            // product is `webhook-proxy`. Still derived rather than written, so
+            // a rename cannot leave this answering the old one.
+            "apiName": env!("CARGO_BIN_NAME"),
+            "apiVersion": env!("CARGO_PKG_VERSION"),
+            "apiReleased": RELEASED,
+            "apiDocumentation": DOCUMENTATION,
+            // Beta until the inbound contract stops moving: gc-4oo still has
+            // open children that change what this interface answers.
+            "apiStatus": "beta",
+        })
+        .to_string(),
+    )
+}
+
 /// Resolves when the orchestrator asks the process to stop.
 ///
 /// Unix only, which is the whole target: the container is Linux and development
@@ -647,6 +699,7 @@ async fn run() -> Result<(), Unstartable> {
     let scraped = Arc::clone(&tally);
     let app = router(inbound, config.max_body)
         .route("/health", get(health))
+        .route("/api-info", get(api_info))
         .route(
             "/metrics",
             get(move || {

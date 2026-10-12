@@ -1150,3 +1150,112 @@ async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped()
     assert!(scraped.contains("# TYPE webhook_proxy_dispatches_delivered_total counter"));
     assert!(!scraped.contains("destination="), "{scraped}");
 }
+
+#[tokio::test]
+async fn api_info_says_what_is_answering_without_being_asked_for_a_credential() {
+    // VER.06 of the national REST API-profil, accepted rather than refused in
+    // bead gc-4oo.2: an operator looking at a running pod should be able to tell
+    // which version answered. Unauthenticated by its own definition, which is
+    // why it may name the API and its documentation and NOTHING about Origins,
+    // Destinations, rooms or secrets — see the assertions at the end.
+    let (base, _seen) = hookshot().await;
+    let (_dir, env) = configured(&base);
+    let proxy = start(env).await.expect("the proxy starts");
+
+    let answered = reqwest::Client::new()
+        .get(format!("http://{}/api-info", proxy.address))
+        .send()
+        .await
+        .expect("api-info answers");
+
+    assert_eq!(answered.status(), StatusCode::OK);
+    assert_eq!(
+        answered
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "AME.01: the representation is JSON"
+    );
+
+    let body: serde_json::Value = answered.json().await.expect("a JSON body");
+
+    // The field names the profile's own api-info uses. RAP-LP's VER.06 only
+    // checks that the resource exists, so nothing but this test holds the shape.
+    assert_eq!(body["apiName"], "webhook-proxy");
+    assert_eq!(
+        body["apiVersion"], "0.0.0",
+        "read from the crate version, so a release that forgets it is impossible"
+    );
+    assert_eq!(body["apiStatus"], "beta");
+    assert!(
+        body["apiDocumentation"]
+            .as_str()
+            .expect("apiDocumentation is a string")
+            .starts_with("https://"),
+        "a reader has to be able to follow it: {:?}",
+        body["apiDocumentation"]
+    );
+
+    // DOT.02: RFC 3339. Checked by shape rather than by parsing, because a date
+    // crate here would be a dependency added to assert ten characters.
+    let released = body["apiReleased"]
+        .as_str()
+        .expect("apiReleased is a string");
+    assert_eq!(released.len(), 10, "a date, not a timestamp: {released:?}");
+    let parts: Vec<&str> = released.split('-').collect();
+    assert_eq!(parts.len(), 3, "YYYY-MM-DD: {released:?}");
+    assert!(
+        parts[0].len() == 4 && parts[1].len() == 2 && parts[2].len() == 2,
+        "YYYY-MM-DD: {released:?}"
+    );
+    assert!(
+        released.chars().all(|c| c.is_ascii_digit() || c == '-'),
+        "YYYY-MM-DD: {released:?}"
+    );
+
+    // What it must never carry. The routing file this test configures names
+    // three rooms and three secrets; api-info is reachable by anyone who can
+    // reach the port, so a leak here is a leak to everyone.
+    let whole = body.to_string();
+    for forbidden in [ROOM, PLATFORM, TOKEN, GRAFANA_TOKEN, SECRET.trim(), &base] {
+        assert!(
+            !whole.contains(forbidden),
+            "api-info carries {forbidden:?}, which a caller it does not authenticate must not see: {whole}"
+        );
+    }
+
+    // Field names are camelCase and nothing else (AME.04, AME.05).
+    for name in body.as_object().expect("an object").keys() {
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric()) && name.starts_with(char::is_lowercase),
+            "not camelCase: {name:?}"
+        );
+    }
+}
+
+#[test]
+fn api_info_moves_its_release_date_when_a_version_is_actually_released() {
+    // apiReleased is the one value in api-info that cannot be derived: nothing
+    // stamps a release date yet (bead gc-lw3). A literal is therefore a thing
+    // somebody has to remember, and the moment it matters is exactly the moment
+    // nobody is thinking about it — the first real release.
+    //
+    // So this ties the two together. While the version is 0.0.0 the date is the
+    // day the interface was first described, which is true. The instant the
+    // version moves, this fails unless the date moved with it.
+    let version = env!("CARGO_PKG_VERSION");
+    let described = "2026-10-12";
+
+    if version == "0.0.0" {
+        return;
+    }
+
+    let served = include_str!("../src/main.rs");
+    assert!(
+        !served.contains(&format!("const RELEASED: &str = \"{described}\"")),
+        "the crate version is {version}, so this is a released API, and \
+         apiReleased still says {described} — the day the interface was first \
+         written down. Set it to this version's release date."
+    );
+}

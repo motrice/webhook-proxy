@@ -35,6 +35,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# One resource answers JSON: /api-info, which says what version replied
+# (bead gc-4oo.6). Hand-writing five fields would be shorter and is the kind of
+# shortcut that puts an unescaped character in a response one day.
+serde_json = "1"
+
 [dev-dependencies]
 # Each acceptance test writes its own routing file and secrets directory.
 tempfile = "3"
