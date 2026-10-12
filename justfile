@@ -254,6 +254,44 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# What `check` proves, minus anything that needs a Docker daemon.
+#
+# For the Forgejo fast gate and nothing else. That runner gives its job
+# containers no access to the Docker daemon — its dind sidecar serves the runner,
+# not the job — so the database tests cannot start a container there and the gate
+# failed on every push regardless of the change (bead gc-9sp). A gate that always
+# fails teaches people to ignore it, which is the same defect as one that cannot
+# fail.
+#
+# This is deliberately a SECOND definition of green, which that workflow's own
+# comment warns against, and it is the lesser evil only because it is written
+# down: GitHub runs `just check` whole and is where landing is gated. Use `just
+# check` everywhere a daemon exists.
+[group('verify')]
+check-without-docker: fmt-check arch clippy test-without-docker deps
+
+# The suite minus the tests that start a container.
+#
+# `stored::tests` is the codec and needs nothing; `outbox::tests` is the ten that
+# talk to a real PostgreSQL. Skipping by name is fragile in one specific way — a
+# rename or a move makes the filter match nothing, and the gate would then run
+# tests it believes it is skipping and fail for a reason nobody would look for.
+# So this asserts the filter still matched, which turns that silent drift into a
+# named failure.
+[group('rust')]
+test-without-docker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log=$(mktemp)
+    trap 'rm -f "$log"' EXIT
+    cargo test --workspace --all-targets -- --skip outbox::tests 2>&1 | tee "$log"
+    skipped=$(grep -oE '[0-9]+ filtered out' "$log" | awk '{ s += $1 } END { print s + 0 }')
+    if [ "$skipped" -lt 10 ]; then
+        printf 'this skipped %s tests; outbox::tests holds 10.\n' "$skipped" >&2
+        printf 'the name being skipped has moved, so this gate is not running what it thinks.\n' >&2
+        exit 1
+    fi
+
 # The whole suite, the database-backed tests included.
 #
 # Those ten used to be `#[ignore]`d and run by a recipe of their own, which meant

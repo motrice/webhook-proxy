@@ -55,7 +55,30 @@ jobs:
           key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: check-${{ runner.os }}-
 
-      # Identical to what an agent runs locally. If this passes and GitHub
-      # fails, the difference is policy, never correctness.
-      - name: just check
-        run: just check
+      # NOT identical to what an agent runs locally, since bead gc-9sp, and this
+      # is the one place that difference is recorded.
+      #
+      # `just check` now starts a PostgreSQL container for the ten tests in
+      # outbox::tests (gc-e5x). This runner cannot: the privileged dind sidecar
+      # in deploy/forgejo-runner serves the RUNNER, and a job container gets no
+      # socket, no DOCKER_HOST, and no route to the daemon — established by
+      # running the CI image on that daemon and looking, not by reading the
+      # manifest. So `just check` here failed on every push regardless of the
+      # change, and a gate that always fails is read exactly as often as one
+      # that cannot fail.
+      #
+      # What this gate therefore proves: formatting, the architecture rules,
+      # clippy, unused dependencies, and every test that does not need a
+      # daemon — including stored::tests, the codec half of the same crate.
+      # What it does NOT prove: outbox::tests, the ten that exercise the real
+      # claim, lease and ordering against PostgreSQL. GitHub runs those, in the
+      # `check` job that gc-rdz makes a required status check, so nothing lands
+      # on them being unproven.
+      #
+      # Two definitions of green is how the two drift apart — the comment at the
+      # top of this file is right, and this is a knowing exception, not a
+      # correction to it. gc-9sp carries the way out: give job containers a
+      # daemon, which is runner and networking work, after which this step goes
+      # back to `just check` and this comment goes away.
+      - name: just check-without-docker
+        run: just check-without-docker
