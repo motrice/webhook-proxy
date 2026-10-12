@@ -39,8 +39,16 @@ futures = "0.3"
 # was covered by tests no pipeline had ever executed. Dev-dependencies are
 # intentionally unrestricted by the architecture rules, so this does not widen
 # the hexagon — see crates/architecture/tests/boundaries.rs.
-testcontainers = "0.24"
-testcontainers-modules = { version = "0.12", features = ["postgres"] }
+#
+# THESE VERSIONS ARE A FLOOR, not a preference (bead gc-3iv). testcontainers 0.24
+# depends on the unmaintained `tokio-tar`, whose PAX Header Desynchronization
+# advisory (CVE-2025-62518, high) has no patched release and never will: the fix
+# lives in the maintained fork, `astral-tokio-tar`. 0.27 depends on that fork at
+# a version past every advisory against it, so the upgrade is the remedy rather
+# than a suppression. Do not go below these, and pair them — modules 0.15
+# requires testcontainers ^0.27, and 0.28 does not satisfy it.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [lints]
 workspace = true
