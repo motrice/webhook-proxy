@@ -3,8 +3,8 @@
 use core::time::Duration;
 
 use domain::{
-    Body, Delivery, DeliveryId, Destination, DestinationId, Dispatch, Event, Origin, Proof,
-    Subscription, destinations_for,
+    Body, Correlation, Delivery, DeliveryId, Destination, DestinationId, Dispatch, Event, Origin,
+    Proof, Subscription, destinations_for,
 };
 
 use crate::ports::{Attempt, Clock, DispatchFailed, Dispatcher, Ids, Outbox, Proofs, Translator};
@@ -91,6 +91,7 @@ impl Retry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relayed {
     delivery: DeliveryId,
+    correlation: Correlation,
     reached: Vec<DestinationId>,
     retrying: Vec<(DestinationId, DispatchFailed, usize)>,
     abandoned: Vec<(DestinationId, DispatchFailed, usize)>,
@@ -101,6 +102,17 @@ impl Relayed {
     #[must_use]
     pub fn delivery(&self) -> &DeliveryId {
         &self.delivery
+    }
+
+    /// The chain it belongs to.
+    ///
+    /// Reported back because the caller may not know it: a sender that sent no
+    /// correlation had one made for it here, and the only way it can put that in
+    /// its own log is if the answer carries it. It is also what makes a loss
+    /// line correlatable with whatever the sender was doing at the time.
+    #[must_use]
+    pub fn correlation(&self) -> &Correlation {
+        &self.correlation
     }
 
     /// Destinations that were told.
@@ -192,12 +204,20 @@ impl<'a> Relay<'a> {
     /// # Errors
     ///
     /// [`Refused`] only when nothing could be sent at all.
+    /// `carried` is whatever correlation the caller sent, if it was usable. A
+    /// caller that sent none, or sent something malformed, gets a fresh one
+    /// rather than a refusal: the policy lives here rather than in the adapter
+    /// because it is a decision about what a delivery is worth, not about how a
+    /// header is spelled.
     pub async fn relay(
         &self,
         origin: &Origin,
         body: Body,
         claimed: &Proof,
+        carried: Option<Correlation>,
     ) -> Result<Relayed, Refused> {
+        let correlation = carried.unwrap_or_else(|| self.ids.next_correlation());
+
         let delivery = Delivery::new(
             self.ids.next_delivery_id(),
             origin.id().clone(),
@@ -266,6 +286,7 @@ impl<'a> Relay<'a> {
                     verified.origin().clone(),
                     theirs,
                     destination,
+                    correlation.clone(),
                 )
             })
             .collect();
@@ -296,6 +317,7 @@ impl<'a> Relay<'a> {
                     dispatch.events(),
                     dispatch.destination(),
                     Attempt::First,
+                    dispatch.correlation(),
                 )
                 .await
             {
@@ -318,6 +340,7 @@ impl<'a> Relay<'a> {
 
         Ok(Relayed {
             delivery: verified.id().clone(),
+            correlation,
             reached,
             retrying,
             abandoned,
@@ -356,9 +379,10 @@ mod tests {
     use core::time::Duration;
 
     use domain::{
-        Blank, Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, Dispatch,
-        DispatchId, Event, Filter, LabelName, LabelValue, Labels, Origin, OriginId, Proof, Pusher,
-        RepositoryName, SecretId, Subscription, Timestamp, Verification, VerifiedDelivery,
+        Blank, Body, BranchName, Correlation, DeliveryId, Destination, DestinationId,
+        DestinationKind, Dispatch, DispatchId, Event, Filter, LabelName, LabelValue, Labels,
+        Origin, OriginId, Proof, Pusher, RepositoryName, SecretId, Subscription, Timestamp,
+        Verification, VerifiedDelivery,
     };
 
     use super::{Refused, Relay, Retry};
@@ -401,6 +425,20 @@ mod tests {
         fn next_delivery_id(&self) -> DeliveryId {
             DeliveryId::new("d-1").expect("a non-blank identity")
         }
+
+        /// Fixed, so a test can assert on the trace it expects to see.
+        fn next_correlation(&self) -> Correlation {
+            Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+                .expect("a well formed correlation")
+        }
+
+        /// A different hop, so a test can tell the onward call from the inbound
+        /// one without reaching for randomness.
+        fn next_hop_in(&self, chain: &Correlation) -> Correlation {
+            chain
+                .continued_as("b7ad6b7169203331")
+                .expect("a well formed span")
+        }
     }
 
     /// Records what it was asked to send, and fails for the Destinations named.
@@ -430,6 +468,7 @@ mod tests {
             _events: &[Event],
             destination: &Destination,
             _attempt: Attempt,
+            _correlation: &Correlation,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
             if self.failing.contains(&id.as_str()) {
@@ -625,6 +664,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("a matching signature is accepted");
@@ -659,6 +699,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("a dispatch failure never refuses the delivery");
@@ -704,6 +745,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect_err("a mismatch is refused");
@@ -738,6 +780,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect_err("no secret means no judgement");
@@ -769,6 +812,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect_err("an unreadable payload is refused");
@@ -809,6 +853,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("nobody caring is not a failure");
@@ -842,6 +887,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("we are not the sender's error reporter");
@@ -879,6 +925,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await;
 
@@ -912,6 +959,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("the store is available");
@@ -955,6 +1003,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("a dispatch failure never refuses the delivery");
@@ -990,6 +1039,7 @@ mod tests {
                 &an_origin(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
+                None,
             )
             .await
             .expect("a dispatch failure never refuses the delivery");

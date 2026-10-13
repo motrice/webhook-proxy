@@ -295,6 +295,7 @@ async fn replay(id: &str) -> Result<String, Unstartable> {
         &dispatcher,
         outbox.as_ref(),
         &clock,
+        &RandomIds,
         routing.subscriptions(),
     );
 

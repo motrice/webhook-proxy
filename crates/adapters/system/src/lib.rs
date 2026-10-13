@@ -8,7 +8,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use application::ports::{Clock, Ids};
-use domain::{DeliveryId, Timestamp};
+use domain::{Correlation, DeliveryId, Timestamp};
 
 /// The machine's clock.
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,11 +44,71 @@ impl Ids for RandomIds {
     fn next_delivery_id(&self) -> DeliveryId {
         DeliveryId::new(&uuid::Uuid::new_v4().to_string()).expect("a uuid is never blank")
     }
+
+    fn next_correlation(&self) -> Correlation {
+        Correlation::new(&fresh_trace(), &fresh_span(), None)
+            .expect("a version 4 uuid is lowercase hexadecimal and never all zeroes")
+    }
+
+    fn next_hop_in(&self, chain: &Correlation) -> Correlation {
+        chain
+            .continued_as(&fresh_span())
+            .expect("a version 4 uuid is lowercase hexadecimal and never all zeroes")
+    }
+}
+
+/// Thirty-two lowercase hexadecimal characters, never all zeroes.
+///
+/// A version 4 uuid in its simple form is exactly that length, and its version
+/// nibble is always `4`, so the all-zeroes value the standard reserves cannot
+/// come out of here. That is why the callers above may `expect`.
+fn fresh_trace() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Sixteen of them, with the same guarantee.
+///
+/// The SECOND half of a fresh uuid, not the first. The variant bits live at the
+/// start of that half, so it is never all zeroes either; the first half is
+/// unconstrained random and could in principle be. One in sixteen to the
+/// sixteenth is not a risk worth taking when the alternative is choosing a
+/// different substring.
+fn fresh_span() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[16..].to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use application::ports::{Clock, Ids};
+
+    #[test]
+    fn a_generated_correlation_is_well_formed_and_starts_a_chain() {
+        let started = RandomIds.next_correlation();
+
+        assert_eq!(started.trace().len(), 32);
+        assert_eq!(started.span().len(), 16);
+        assert_eq!(started.state(), None, "we invent no state for anyone");
+    }
+
+    #[test]
+    fn two_generated_correlations_share_nothing() {
+        // The point of generating rather than refusing: two senders that both
+        // sent no correlation must not end up looking like one call chain.
+        let one = RandomIds.next_correlation();
+        let other = RandomIds.next_correlation();
+
+        assert_ne!(one.trace(), other.trace());
+        assert_ne!(one.span(), other.span());
+    }
+
+    #[test]
+    fn a_new_hop_keeps_the_chain_and_changes_only_the_hop() {
+        let received = RandomIds.next_correlation();
+        let onward = RandomIds.next_hop_in(&received);
+
+        assert_eq!(onward.trace(), received.trace(), "same chain");
+        assert_ne!(onward.span(), received.span(), "different call");
+    }
 
     use super::{RandomIds, SystemClock};
 

@@ -113,6 +113,31 @@ paths:
         - githubSignature: []
         - bearerToken: []
       parameters:
+        - name: traceparent
+          in: header
+          required: false
+          description: |
+            W3C Trace Context. Accepted and carried onward to the room, so a
+            message there can be traced back to the push or alert that caused
+            it, including when a retry sends it minutes later.
+
+            Never required, and never a cause of refusal: a malformed value is
+            replaced with a freshly generated chain rather than rejected, and the
+            malformed value is not propagated. The answer carries the chain the
+            delivery was filed under, which is how a sender that sent none
+            learns it.
+          schema:
+            type: string
+            pattern: ^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$
+          example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+        - name: tracestate
+          in: header
+          required: false
+          description: |
+            Opaque, and passed on unexamined. It belongs to whoever set it.
+          schema:
+            type: string
+          example: congo=t61rcWkgMzE
         - name: origin
           in: path
           required: true
@@ -145,6 +170,17 @@ paths:
             Accepted and written down. Not delivered: the rooms are reached
             afterwards, and a loss after this point is logged and counted rather
             than reported here.
+          headers:
+            traceparent:
+              description: |
+                The chain this delivery was filed under — the one sent, or the
+                one generated for a caller that sent none.
+              schema:
+                type: string
+            tracestate:
+              description: Returned unchanged when one was sent.
+              schema:
+                type: string
         "400":
           description: |
             The body is not a payload this sender's translator understands.

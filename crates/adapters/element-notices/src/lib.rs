@@ -38,7 +38,9 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use application::ports::{Attempt, DispatchFailed, Dispatcher};
-use domain::{AlertStatus, Commit, DeliveryId, Destination, Event, Labels, Permalink, Severity};
+use domain::{
+    AlertStatus, Commit, Correlation, DeliveryId, Destination, Event, Labels, Permalink, Severity,
+};
 
 /// How much of a summary a reader sees before it is cut.
 ///
@@ -587,6 +589,40 @@ fn classify(error: &reqwest::Error) -> DispatchFailed {
     }
 }
 
+/// The headers that carry a chain onward, in W3C Trace Context spelling.
+///
+/// A new hop rather than the caller's: this proxy made its own call to the room,
+/// and a trace in which both appear as one hop cannot show that one caused the
+/// other. The hop comes from the Dispatch's own span rather than from a
+/// generator, so this adapter needs no randomness and the same stored Dispatch
+/// retried twice carries the same hop -- which is right, because it is the same
+/// call being attempted again.
+///
+/// Returns whatever it could build. A correlation that is not a legal header
+/// value is left out rather than failing the dispatch: telemetry is not worth a
+/// notice.
+fn tracing_headers(correlation: &Correlation) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+
+    let parent = format!("00-{}-{}-01", correlation.trace(), correlation.span());
+    if let Ok(value) = HeaderValue::from_str(&parent)
+        && let Ok(name) = "traceparent".parse::<HeaderName>()
+    {
+        headers.insert(name, value);
+    }
+
+    if let Some(state) = correlation.state()
+        && let Ok(value) = HeaderValue::from_str(state)
+        && let Ok(name) = "tracestate".parse::<HeaderName>()
+    {
+        headers.insert(name, value);
+    }
+
+    headers
+}
+
 #[async_trait::async_trait]
 impl Dispatcher for ElementNotices {
     async fn dispatch(
@@ -595,6 +631,7 @@ impl Dispatcher for ElementNotices {
         events: &[Event],
         destination: &Destination,
         attempt: Attempt,
+        correlation: &Correlation,
     ) -> Result<(), DispatchFailed> {
         // A Destination we hold no URL for cannot be reached. This is a
         // configuration gap rather than a refusal, and it is reported as a loss
@@ -616,6 +653,15 @@ impl Dispatcher for ElementNotices {
             // the string raw and `ascii_only` is the point. The content type has
             // to be set by hand for the same reason.
             .header("content-type", "application/json")
+            // The chain this call belongs to, so the room message can be traced
+            // back to the push or the alert that caused it. A new hop in the
+            // caller's trace, not the caller's own hop: this is our call, and
+            // the two are different calls (bead gc-4oo.5).
+            //
+            // Best effort by design. A correlation that cannot be spelled as a
+            // header value is dropped rather than failing the dispatch, because
+            // losing a notice over telemetry would be the wrong trade.
+            .headers(tracing_headers(correlation))
             .body(ascii_only(
                 &serde_json::json!({
                     "text": marked(attempt, &notice(events)),
@@ -675,9 +721,9 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
     use domain::{
-        AlertId, AlertStatus, BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId,
-        DestinationKind, Event, LabelName, LabelValue, Labels, Permalink, Pusher, RepositoryName,
-        Severity, Summary, Timestamp,
+        AlertId, AlertStatus, BranchName, Commit, CommitId, Correlation, DeliveryId, Destination,
+        DestinationId, DestinationKind, Event, LabelName, LabelValue, Labels, Permalink, Pusher,
+        RepositoryName, Severity, Summary, Timestamp,
     };
 
     use super::{
@@ -743,6 +789,12 @@ mod tests {
             DestinationId::new(id).expect("a non-blank id"),
             DestinationKind::ChatRoom,
         )
+    }
+
+    /// One chain, so a test can assert what a room was told about it.
+    fn a_correlation() -> Correlation {
+        Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+            .expect("a well formed correlation")
     }
 
     fn a_delivery() -> DeliveryId {
@@ -1076,7 +1128,13 @@ mod tests {
             None,
         );
         notices
-            .dispatch(&a_delivery(), &[event], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[event],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await
             .expect("the stub accepts");
 
@@ -1297,6 +1355,85 @@ mod tests {
     }
 
     /// A stub hookshot on a loopback port. Returns its URL and what it received.
+    /// A room that records the tracing headers it was sent, and nothing else.
+    ///
+    /// Separate from `hookshot` deliberately: that stub records a content type
+    /// and a body, and widening its tuple would have touched every assertion in
+    /// this file to serve one test.
+    async fn hookshot_watching_headers() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+
+        let app = Router::new().route(
+            "/hook/{id}",
+            post(move |headers: HeaderMap| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    recorder
+                        .lock()
+                        .expect("not poisoned")
+                        .push((header("traceparent"), header("tracestate")));
+                    (StatusCode::OK, r#"{"ok":true}"#)
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let bound = listener.local_addr().expect("an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{bound}/hook/{HOOK_ID}"), seen)
+    }
+
+    #[tokio::test]
+    async fn the_room_is_told_which_chain_this_belongs_to() {
+        // SPA.02's onward half: the call this proxy makes carries the caller's
+        // chain, so the message in the room can be traced back to the push or
+        // the alert that caused it.
+        let (url, seen) = hookshot_watching_headers().await;
+        let notices = notices_to(&url, Duration::from_secs(5));
+
+        notices
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &Correlation::new(
+                    "4bf92f3577b34da6a3ce929d0e0e4736",
+                    "00f067aa0ba902b7",
+                    Some("congo=t61rcWkgMzE"),
+                )
+                .expect("a well formed correlation"),
+            )
+            .await
+            .expect("the stub accepts");
+
+        let sent = seen.lock().expect("not poisoned").clone();
+        assert_eq!(sent.len(), 1);
+        let (parent, state) = &sent[0];
+
+        assert_eq!(
+            parent, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "the room was not told the chain"
+        );
+        assert_eq!(
+            state, "congo=t61rcWkgMzE",
+            "state belongs to whoever set it"
+        );
+    }
+
     async fn hookshot(
         status: StatusCode,
         reply: &'static str,
@@ -1336,7 +1473,13 @@ mod tests {
         let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await
             .expect("the stub accepts");
 
@@ -1375,7 +1518,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":false}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1386,7 +1535,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::NOT_FOUND, "no such hook", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1397,7 +1552,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::INTERNAL_SERVER_ERROR, "broken", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Unreachable));
@@ -1408,7 +1569,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::from_millis(500)).await;
 
         let outcome = notices_to(&url, Duration::from_millis(50))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::TimedOut));
@@ -1424,6 +1591,7 @@ mod tests {
                 &[a_push()],
                 &room("some-other-room"),
                 Attempt::First,
+                &a_correlation(),
             )
             .await;
 
@@ -1629,7 +1797,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, REJECTED_BY_SOMETHING_ELSE, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         // Intercepted, not Rejected: the Destination never saw this, and an
@@ -1646,7 +1820,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::ACCEPTED, r#"{"ok":true}"#, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Ok(()));
@@ -1665,7 +1845,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::OK, "", Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Intercepted));
@@ -1692,7 +1878,13 @@ mod tests {
         let (url, _) = hookshot(StatusCode::NOT_FOUND, REMOVED, Duration::ZERO).await;
 
         let outcome = notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await;
 
         assert_eq!(outcome, Err(DispatchFailed::Rejected));
@@ -1723,6 +1915,7 @@ mod tests {
                 )],
                 &room("room"),
                 Attempt::First,
+                &a_correlation(),
             )
             .await
             .expect("the stub accepts");
@@ -1753,7 +1946,13 @@ mod tests {
         )];
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &only, &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &only,
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await
             .expect("the stub accepts");
 
@@ -1799,11 +1998,23 @@ mod tests {
         let notices = notices_to(&url, Duration::from_secs(5));
 
         notices
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await
             .expect("the stub accepts");
         notices
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::Replay)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::Replay,
+                &a_correlation(),
+            )
             .await
             .expect("the stub accepts");
 
@@ -1838,7 +2049,13 @@ mod tests {
         let (url, seen) = hookshot(StatusCode::OK, r#"{"ok":true}"#, Duration::ZERO).await;
 
         notices_to(&url, Duration::from_secs(5))
-            .dispatch(&a_delivery(), &[a_push()], &room("room"), Attempt::First)
+            .dispatch(
+                &a_delivery(),
+                &[a_push()],
+                &room("room"),
+                Attempt::First,
+                &a_correlation(),
+            )
             .await
             .expect("the stub accepts");
 

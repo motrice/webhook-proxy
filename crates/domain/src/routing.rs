@@ -2,7 +2,7 @@
 
 use crate::event::present;
 use crate::label::{self, LabelName, LabelValue};
-use crate::{Blank, DeliveryId, Event, Labels, OriginId};
+use crate::{Blank, Correlation, DeliveryId, Event, Labels, OriginId};
 
 /// Identifies a [`Destination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +74,7 @@ pub struct Dispatch {
     origin: OriginId,
     events: Vec<Event>,
     destination: Destination,
+    correlation: Correlation,
 }
 
 impl Dispatch {
@@ -89,6 +90,7 @@ impl Dispatch {
         origin: OriginId,
         events: Vec<Event>,
         destination: Destination,
+        correlation: Correlation,
     ) -> Option<Self> {
         if events.is_empty() {
             return None;
@@ -98,6 +100,7 @@ impl Dispatch {
             origin,
             events,
             destination,
+            correlation,
         })
     }
 
@@ -105,6 +108,18 @@ impl Dispatch {
     #[must_use]
     pub fn delivery(&self) -> &DeliveryId {
         &self.delivery
+    }
+
+    /// The call chain this belongs to, which is the caller's and not ours.
+    ///
+    /// Carried on the Dispatch rather than alongside it because a Dispatch
+    /// outlives the request that made it: the sweep sends one again minutes
+    /// later, and that onward call belongs to the same chain as the original.
+    /// Keeping the two together is what makes a retry traceable back to the push
+    /// or the alert that caused it.
+    #[must_use]
+    pub fn correlation(&self) -> &Correlation {
+        &self.correlation
     }
 
     /// Which Origin was verified as having sent it.
@@ -321,7 +336,7 @@ pub fn destinations_for<'s>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Destination, DestinationId, DestinationKind, Dispatch, Filter, Subscription,
+        Correlation, Destination, DestinationId, DestinationKind, Dispatch, Filter, Subscription,
         destinations_for, routing_labels,
     };
     use crate::{
@@ -674,6 +689,8 @@ mod tests {
                     DestinationId::new("a-room").expect("a non-blank id"),
                     DestinationKind::ChatRoom,
                 ),
+                Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+                    .expect("a well formed correlation"),
             )
             .is_none()
         );

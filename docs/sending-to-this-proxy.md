@@ -82,6 +82,30 @@ store is unreachable — a loud refusal instead of a quiet downgrade.
 
 So: do not treat `202` as proof a human saw anything, and do not retry on it.
 
+## If you trace your calls
+
+Send a `traceparent` and it is carried through to the room, so a message there
+can be traced back to the call that caused it — including when a retry delivers
+it minutes later. `tracestate` rides along unchanged; it belongs to you.
+
+Three things worth knowing:
+
+- **It is never required.** No `traceparent` is fine. One this proxy cannot
+  parse is also fine: it is replaced with a freshly generated chain rather than
+  refused, because losing an alert over a trace header would be the wrong trade.
+  A value we could not read is never passed on.
+- **The answer tells you the chain.** A `202` carries a `traceparent`, so a
+  sender that sent none still learns which chain its delivery was filed under
+  and can put that in its own log.
+- **The hop you see in the room is ours, not yours.** Same trace, different span:
+  the call this proxy made to the room is a different call from the one you made
+  to this proxy, and a trace that showed them as one could not show that one
+  caused the other.
+
+A loss is logged with the trace alongside the delivery and the room, so the two
+questions a loss raises — *which message* and *what else was happening* — have
+different answers in the same line.
+
 ## What is lost, in your terms
 
 - **No retry beyond a bounded number of attempts.** A room that stays

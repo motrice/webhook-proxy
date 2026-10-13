@@ -14,8 +14,8 @@
 
 use async_trait::async_trait;
 use domain::{
-    Body, DeliveryId, Destination, Dispatch, DispatchId, Event, Origin, Proof, Timestamp,
-    VerifiedDelivery,
+    Body, Correlation, DeliveryId, Destination, Dispatch, DispatchId, Event, Origin, Proof,
+    Timestamp, VerifiedDelivery,
 };
 
 /// The signature an Origin's secret produces over a body.
@@ -120,12 +120,17 @@ pub trait Dispatcher: Send + Sync {
     /// translate its transport's failures into these before returning: a status
     /// code or a client-library error reaching the use case would mean the
     /// adapter had leaked.
+    /// `correlation` is the chain the inbound call belongs to. An implementation
+    /// passes it on as whatever its transport uses, having asked for a new hop:
+    /// the call it makes is its own, and claiming the caller's hop would make
+    /// two different calls look like one.
     async fn dispatch(
         &self,
         delivery: &DeliveryId,
         events: &[Event],
         destination: &Destination,
         attempt: Attempt,
+        correlation: &Correlation,
     ) -> Result<(), DispatchFailed>;
 }
 
@@ -379,4 +384,24 @@ pub trait Ids: Send + Sync {
     /// identity has no sensible fallback, and a blank one is rejected by
     /// `DeliveryId` anyway.
     fn next_delivery_id(&self) -> DeliveryId;
+
+    /// A correlation for a call that arrived without one.
+    ///
+    /// A fresh chain and a first hop in it. Used when a sender sends no
+    /// correlation, or sends one this code cannot make sense of: the delivery is
+    /// worth more than the caller's header, so it is given a correlation rather
+    /// than refused.
+    ///
+    /// Infallible by contract, like the identity above: there is no useful
+    /// fallback for a generator that cannot generate.
+    fn next_correlation(&self) -> Correlation;
+
+    /// A new hop in a chain that already exists.
+    ///
+    /// What an onward call carries. Separate from [`Ids::next_correlation`]
+    /// because the two mean different things to whoever reads the trace: one
+    /// starts a chain, the other joins an existing one, and conflating them
+    /// would make this proxy look like the origin of every call that passes
+    /// through it.
+    fn next_hop_in(&self, chain: &Correlation) -> Correlation;
 }

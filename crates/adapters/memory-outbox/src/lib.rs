@@ -195,8 +195,8 @@ impl Outbox for MemoryOutbox {
 #[cfg(test)]
 mod tests {
     use domain::{
-        BranchName, Commit, CommitId, Destination, DestinationId, DestinationKind, Event, OriginId,
-        Pusher, RepositoryName, Summary,
+        BranchName, Commit, CommitId, Correlation, Destination, DestinationId, DestinationKind,
+        Event, OriginId, Pusher, RepositoryName, Summary,
     };
 
     use super::{
@@ -239,6 +239,8 @@ mod tests {
             OriginId::new("github").expect("a non-blank id"),
             vec![a_push(summary)],
             room(to),
+            Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+                .expect("a well formed correlation"),
         )
         .expect("at least one event")
     }

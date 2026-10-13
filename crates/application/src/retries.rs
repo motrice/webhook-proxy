@@ -91,6 +91,12 @@ impl<'a> Retries<'a> {
                     // nobody has seen it, so marking it would be noise in a
                     // room. Only a replay says so (gc-6a5.3).
                     Attempt::First,
+                    // The chain the original call belonged to, read back from
+                    // the store. This is why a correlation is kept on a
+                    // Dispatch rather than held for the length of a request:
+                    // without it a retry would start a chain of its own and the
+                    // room message could not be traced to what caused it.
+                    dispatch.correlation(),
                 )
                 .await;
 
@@ -138,8 +144,8 @@ mod tests {
 
     use async_trait::async_trait;
     use domain::{
-        BranchName, Commit, CommitId, DeliveryId, Destination, DestinationId, DestinationKind,
-        Dispatch, Event, OriginId, Pusher, RepositoryName, Summary, Timestamp,
+        BranchName, Commit, CommitId, Correlation, DeliveryId, Destination, DestinationId,
+        DestinationKind, Dispatch, Event, OriginId, Pusher, RepositoryName, Summary, Timestamp,
     };
 
     use super::{Attempt, Clock, DispatchId, Dispatcher, Outbox, Retries, Retry};
@@ -168,6 +174,7 @@ mod tests {
             _events: &[Event],
             destination: &Destination,
             _attempt: Attempt,
+            _correlation: &Correlation,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
             if self.failing.contains(&id.as_str()) {
@@ -290,6 +297,8 @@ mod tests {
                     DestinationId::new(room).expect("a non-blank id"),
                     DestinationKind::ChatRoom,
                 ),
+                Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+                    .expect("a well formed correlation"),
             )
             .expect("at least one event"),
             attempts,

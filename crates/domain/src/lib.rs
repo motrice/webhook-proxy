@@ -11,6 +11,7 @@
 //! no I/O and no async, which is what makes the TDD loop fast.
 
 mod alert;
+mod correlation;
 mod delivery;
 mod event;
 mod label;
@@ -20,6 +21,7 @@ mod routing;
 mod time;
 
 pub use alert::{AlertId, AlertStatus, Severity};
+pub use correlation::{Correlation, NotCorrelated};
 pub use delivery::{Body, Delivery, DeliveryId, VerifiedDelivery};
 pub use event::{
     Blank, BranchName, Commit, CommitId, Event, Permalink, Pusher, RepositoryName, Summary,

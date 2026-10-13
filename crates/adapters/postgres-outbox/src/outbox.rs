@@ -3,8 +3,8 @@
 use application::ports::{Outbox, Outcome, Recorded, StorageUnavailable};
 use async_trait::async_trait;
 use domain::{
-    DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, DispatchId, OriginId,
-    Timestamp,
+    Correlation, DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, DispatchId,
+    OriginId, Timestamp,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -118,6 +118,10 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
         _ => return Err(StorageUnavailable),
     };
 
+    let trace: String = row.try_get("trace").map_err(|_| StorageUnavailable)?;
+    let span: String = row.try_get("span").map_err(|_| StorageUnavailable)?;
+    let state: Option<String> = row.try_get("state").map_err(|_| StorageUnavailable)?;
+
     let dispatch = Dispatch::new(
         DeliveryId::new(&delivery).map_err(|_| StorageUnavailable)?,
         OriginId::new(&origin).map_err(|_| StorageUnavailable)?,
@@ -134,6 +138,11 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
                 _ => DestinationKind::ChatRoom,
             },
         ),
+        // A row whose correlation this code cannot parse is a row this code did
+        // not write, like an outcome outside the three it knows. Refused rather
+        // than repaired: a trace invented here would claim a chain that never
+        // existed.
+        Correlation::new(&trace, &span, state.as_deref()).map_err(|_| StorageUnavailable)?,
     )
     // A row with no events is one this code could not have written: a Dispatch
     // with nothing to say cannot be built. Refused rather than turned into an
@@ -164,6 +173,7 @@ fn row_id(id: &DispatchId) -> Result<i64, StorageUnavailable> {
 /// Columns every read needs, with the moments already in milliseconds so the
 /// mapping back to `Timestamp` is one shape rather than three.
 const COLUMNS: &str = "id, delivery, origin, destination, kind, events, outcome, attempts, \
+     trace, span, state, \
      (EXTRACT(EPOCH FROM again_at) * 1000)::BIGINT AS again_at_ms, \
      (EXTRACT(EPOCH FROM settled_at) * 1000)::BIGINT AS settled_at_ms";
 
@@ -185,9 +195,9 @@ impl Outbox for PostgresOutbox {
             let row = sqlx::query(&format!(
                 "INSERT INTO dispatch \
                      (delivery, origin, destination, kind, events, outcome, attempts, again_at, \
-                      accepted_at) \
+                      accepted_at, trace, span, state) \
                  VALUES ($1, $6, $2, $3, $4, 'waiting', 0, to_timestamp($5::BIGINT / 1000.0), \
-                         to_timestamp($5::BIGINT / 1000.0)) \
+                         to_timestamp($5::BIGINT / 1000.0), $7, $8, $9) \
                  RETURNING {COLUMNS}"
             ))
             .bind(dispatch.delivery().as_str())
@@ -198,6 +208,9 @@ impl Outbox for PostgresOutbox {
             ))
             .bind(at.millis_since_epoch())
             .bind(dispatch.origin().as_str())
+            .bind(dispatch.correlation().trace())
+            .bind(dispatch.correlation().span())
+            .bind(dispatch.correlation().state())
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| StorageUnavailable)?;
@@ -319,8 +332,8 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     use super::{
-        DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, OriginId, Outbox,
-        PostgresOutbox, Timestamp,
+        Correlation, DeliveryId, Destination, DestinationId, DestinationKind, Dispatch, OriginId,
+        Outbox, PostgresOutbox, Timestamp,
     };
 
     /// A `PostgreSQL` of this test's own, and the outbox on it.
@@ -505,6 +518,16 @@ mod tests {
         }
     }
 
+    /// One chain, so a test can assert what survived a round trip.
+    fn a_correlation() -> Correlation {
+        Correlation::new(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "00f067aa0ba902b7",
+            Some("congo=t61rcWkgMzE"),
+        )
+        .expect("a well formed correlation")
+    }
+
     fn dispatch(delivery: &str, summary: &str, room: &str) -> Dispatch {
         Dispatch::new(
             DeliveryId::new(delivery).expect("a non-blank id"),
@@ -523,8 +546,37 @@ mod tests {
                 DestinationId::new(room).expect("a non-blank id"),
                 DestinationKind::ChatRoom,
             ),
+            a_correlation(),
         )
         .expect("at least one event")
+    }
+
+    #[tokio::test]
+    async fn the_chain_survives_storage_so_a_retry_stays_in_it() {
+        // The reason these columns exist. A Dispatch outlives the request that
+        // made it: the sweep sends it again minutes later, and that onward call
+        // belongs to the same chain as the original push. Held only for the
+        // length of a request, a retry would start a chain of its own and the
+        // room message could not be traced back to what caused it.
+        let outbox = outbox().await;
+        let stored = dispatch("d-chain", "a change", "devsecops-room");
+
+        outbox
+            .accept(std::slice::from_ref(&stored), at(0))
+            .await
+            .expect("available");
+
+        let due = outbox.due(at(1), 10).await.expect("available");
+        assert_eq!(due.len(), 1);
+
+        let carried = due[0].dispatch().correlation();
+        assert_eq!(carried.trace(), stored.correlation().trace());
+        assert_eq!(carried.span(), stored.correlation().span());
+        assert_eq!(
+            carried.state(),
+            stored.correlation().state(),
+            "state belongs to whoever set it, including across a restart"
+        );
     }
 
     #[tokio::test]
@@ -562,6 +614,7 @@ mod tests {
                 DestinationId::new("a-room").expect("a non-blank id"),
                 DestinationKind::ChatRoom,
             ),
+            a_correlation(),
         )
         .expect("at least one event");
 

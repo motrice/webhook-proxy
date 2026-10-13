@@ -2,7 +2,7 @@
 
 use domain::{DeliveryId, Dispatch, Subscription, destinations_for};
 
-use crate::ports::{Attempt, Clock, Dispatcher, Outbox};
+use crate::ports::{Attempt, Clock, Dispatcher, Ids, Outbox};
 
 /// What a replay did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -50,6 +50,7 @@ pub struct Replay<'a> {
     dispatcher: &'a dyn Dispatcher,
     outbox: &'a dyn Outbox,
     clock: &'a dyn Clock,
+    ids: &'a dyn Ids,
     subscriptions: &'a [Subscription],
 }
 
@@ -60,12 +61,14 @@ impl<'a> Replay<'a> {
         dispatcher: &'a dyn Dispatcher,
         outbox: &'a dyn Outbox,
         clock: &'a dyn Clock,
+        ids: &'a dyn Ids,
         subscriptions: &'a [Subscription],
     ) -> Self {
         Self {
             dispatcher,
             outbox,
             clock,
+            ids,
             subscriptions,
         }
     }
@@ -114,6 +117,14 @@ impl<'a> Replay<'a> {
         // because `origin` is the label every trustworthy rule is built on.
         let origin = stored[0].dispatch().origin().clone();
 
+        // A new hop in the ORIGINAL chain, not a chain of its own. A replay
+        // exists to send that delivery again, so an operator who follows the
+        // trace from the room back ought to arrive at the push or the alert that
+        // caused it -- months later, through a dispatch nobody kept a request
+        // for. A fresh trace would make the replay look like something that
+        // happened on its own.
+        let correlation = self.ids.next_hop_in(stored[0].dispatch().correlation());
+
         // Grouped per Destination, exactly as the request path does, so a replay
         // arrives as one message per room rather than as the fan-out this
         // product stopped doing (gc-lhh).
@@ -133,7 +144,13 @@ impl<'a> Replay<'a> {
         let planned: Vec<Dispatch> = grouped
             .into_iter()
             .filter_map(|(destination, theirs)| {
-                Dispatch::new(delivery.clone(), origin.clone(), theirs, destination)
+                Dispatch::new(
+                    delivery.clone(),
+                    origin.clone(),
+                    theirs,
+                    destination,
+                    correlation.clone(),
+                )
             })
             .collect();
 
@@ -158,6 +175,7 @@ impl<'a> Replay<'a> {
                     dispatch.events(),
                     dispatch.destination(),
                     Attempt::Replay,
+                    dispatch.correlation(),
                 )
                 .await
             {
@@ -179,16 +197,35 @@ mod tests {
 
     use async_trait::async_trait;
     use domain::{
-        BranchName, Commit, CommitId, Destination, DestinationId, DestinationKind, DispatchId,
-        Event, Filter, OriginId, Pusher, RepositoryName, Summary, Timestamp,
+        BranchName, Commit, CommitId, Correlation, Destination, DestinationId, DestinationKind,
+        DispatchId, Event, Filter, OriginId, Pusher, RepositoryName, Summary, Timestamp,
     };
 
-    use super::{DeliveryId, Dispatch, Replay, Subscription, Unreplayable};
+    use super::{DeliveryId, Dispatch, Ids, Replay, Subscription, Unreplayable};
     use crate::ports::{
         Attempt, Clock, DispatchFailed, Dispatcher, Outbox, Outcome, Recorded, StorageUnavailable,
     };
 
     const NOW: i64 = 1_759_000_000_000;
+
+    /// Mints the hop a replay makes, fixed so a test can name it.
+    struct OneId;
+    impl Ids for OneId {
+        fn next_delivery_id(&self) -> DeliveryId {
+            DeliveryId::new("d-replayed").expect("a non-blank identity")
+        }
+
+        fn next_correlation(&self) -> Correlation {
+            Correlation::new("1111111111111111111111111111111b", "1111111111111111", None)
+                .expect("a well formed correlation")
+        }
+
+        fn next_hop_in(&self, chain: &Correlation) -> Correlation {
+            chain
+                .continued_as("b7ad6b7169203331")
+                .expect("a well formed span")
+        }
+    }
 
     struct FixedClock;
     impl Clock for FixedClock {
@@ -211,6 +248,7 @@ mod tests {
             _events: &[Event],
             destination: &Destination,
             attempt: Attempt,
+            _correlation: &Correlation,
         ) -> Result<(), DispatchFailed> {
             self.sent
                 .lock()
@@ -333,6 +371,12 @@ mod tests {
                         OriginId::new("github").expect("a non-blank id"),
                         vec![a_push()],
                         room(to),
+                        Correlation::new(
+                            "4bf92f3577b34da6a3ce929d0e0e4736",
+                            "00f067aa0ba902b7",
+                            None,
+                        )
+                        .expect("a well formed correlation"),
                     )
                     .expect("at least one event"),
                     1,
@@ -357,7 +401,7 @@ mod tests {
         let dispatcher = Recorder::default();
         let outbox = Held::holding(stored_to(&["devsecops-room"]));
         let subscriptions = everything_to(&["devsecops-room"]);
-        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &subscriptions);
+        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &OneId, &subscriptions);
 
         let replayed = replay
             .delivery(&DeliveryId::new("d-1").expect("a non-blank id"))
@@ -382,7 +426,7 @@ mod tests {
         let outbox = Held::holding(stored_to(&["devsecops-room"]));
         // The rules say two rooms now, and no longer the first.
         let subscriptions = everything_to(&["platform-room", "audit-room"]);
-        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &subscriptions);
+        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &OneId, &subscriptions);
 
         replay
             .delivery(&DeliveryId::new("d-1").expect("a non-blank id"))
@@ -407,7 +451,7 @@ mod tests {
         let dispatcher = Recorder::default();
         let outbox = Held::holding(stored_to(&["a-room", "b-room", "c-room"]));
         let subscriptions = everything_to(&["only-room"]);
-        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &subscriptions);
+        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &OneId, &subscriptions);
 
         replay
             .delivery(&DeliveryId::new("d-1").expect("a non-blank id"))
@@ -422,7 +466,7 @@ mod tests {
         let dispatcher = Recorder::default();
         let outbox = Held::holding(stored_to(&["devsecops-room"]));
         let subscriptions = everything_to(&["devsecops-room"]);
-        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &subscriptions);
+        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &OneId, &subscriptions);
 
         replay
             .delivery(&DeliveryId::new("d-1").expect("a non-blank id"))
@@ -441,7 +485,7 @@ mod tests {
         let dispatcher = Recorder::default();
         let outbox = Held::holding(Vec::new());
         let subscriptions = everything_to(&["devsecops-room"]);
-        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &subscriptions);
+        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &OneId, &subscriptions);
 
         let outcome = replay
             .delivery(&DeliveryId::new("never").expect("a non-blank id"))
@@ -457,7 +501,7 @@ mod tests {
         // operator sees that it reached nowhere, which is the truth.
         let dispatcher = Recorder::default();
         let outbox = Held::holding(stored_to(&["devsecops-room"]));
-        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &[]);
+        let replay = Replay::new(&dispatcher, &outbox, &FixedClock, &OneId, &[]);
 
         let replayed = replay
             .delivery(&DeliveryId::new("d-1").expect("a non-blank id"))

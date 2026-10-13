@@ -20,7 +20,7 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::post;
-use domain::{Body, Origin, Subscription};
+use domain::{Body, Correlation, Origin, Subscription};
 
 /// Where a sender's credential arrives.
 ///
@@ -207,6 +207,69 @@ pub fn router(inbound: Inbound, max_body: usize) -> Router {
 /// A failed Dispatch does **not** change the answer. Returning an error would
 /// make the sender retry and re-deliver to the Destinations that had already
 /// succeeded.
+/// Reads a correlation out of what the caller sent, if it sent a usable one.
+///
+/// The wire format is W3C Trace Context: `version-trace-span-flags`, four
+/// hyphen-separated fields, version `00`. This is the only place that spelling
+/// appears — the rest of the code holds a [`Correlation`], which knows nothing
+/// about hyphens.
+///
+/// `None` for anything it cannot read, and the caller then generates one. That
+/// is deliberate and worth being explicit about: a malformed trace header is a
+/// bad reason to lose an alert, so the header is never required and never a
+/// cause of refusal. Nothing malformed is ever propagated, because nothing
+/// malformed ever becomes a `Correlation`.
+///
+/// `tracestate` rides along unexamined. It belongs to whoever set it.
+fn carried(headers: &HeaderMap) -> Option<Correlation> {
+    let parent = headers.get("traceparent")?.to_str().ok()?;
+
+    let mut fields = parent.split('-');
+    let version = fields.next()?;
+    let trace = fields.next()?;
+    let span = fields.next()?;
+    let flags = fields.next()?;
+    // Exactly four. A fifth field means a version this code does not know, and
+    // guessing at it would propagate something it cannot vouch for.
+    if fields.next().is_some() || version != "00" || flags.len() != 2 {
+        return None;
+    }
+
+    let state = headers
+        .get("tracestate")
+        .and_then(|value| value.to_str().ok());
+
+    Correlation::new(trace, span, state).ok()
+}
+
+/// How a correlation is spelled on the way out.
+///
+/// Version `00` and flags `01`: sampled. This proxy makes no sampling decision
+/// of its own -- it has no exporter and no spans -- so claiming the call is
+/// worth recording is the honest default for something whose whole purpose is
+/// to be followed later.
+fn spelled(correlation: &Correlation) -> String {
+    format!("00-{}-{}-01", correlation.trace(), correlation.span())
+}
+
+/// The headers a response carries.
+///
+/// SPA.04 of the national REST API-profil: the answer names the chain, so a
+/// caller that generated nothing still learns which trace its delivery was
+/// filed under and can put that in its own log.
+fn answering(correlation: &Correlation) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&spelled(correlation)) {
+        headers.insert("traceparent", value);
+    }
+    if let Some(state) = correlation.state()
+        && let Ok(value) = HeaderValue::from_str(state)
+    {
+        headers.insert("tracestate", value);
+    }
+    headers
+}
+
 async fn receive(
     State(inbound): State<Inbound>,
     Path(origin): Path<String>,
@@ -245,10 +308,20 @@ async fn receive(
         inbound.retry,
     );
 
+    // Read before anything is relayed, so the same correlation goes outward and
+    // back. A caller that sent none gets one from the use case, which is why
+    // this is an Option rather than a decision made here.
+    let carried = carried(&headers);
+
     // The body is handed over as the bytes that arrived. This crate never parses
     // it: translation is a port, reached only after verification.
     match relay
-        .relay(&sender.origin, Body::from_bytes(body.to_vec()), &claimed)
+        .relay(
+            &sender.origin,
+            Body::from_bytes(body.to_vec()),
+            &claimed,
+            carried.clone(),
+        )
         .await
     {
         Ok(relayed) => {
@@ -295,13 +368,18 @@ async fn receive(
                 // address, so there is no credential here to spill.
                 tracing::warn!(
                     delivery = relayed.delivery().as_str(),
+                    // The caller's chain, so this line can be put beside
+                    // whatever the sender and the room were doing at the time.
+                    // A DeliveryId says which message; a trace says what else
+                    // was going on (bead gc-4oo.5).
+                    trace = relayed.correlation().trace(),
                     destination = destination.as_str(),
                     events = alerts,
                     failure = ?failure,
                     "dispatch lost"
                 );
             }
-            (StatusCode::ACCEPTED, HeaderMap::new())
+            (StatusCode::ACCEPTED, answering(relayed.correlation()))
         }
         Err(Refused::ProofMismatch) => (StatusCode::UNAUTHORIZED, HeaderMap::new()),
         Err(Refused::SecretUnavailable) => (StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()),
@@ -344,9 +422,9 @@ mod tests {
     use axum::body::Body as AxumBody;
     use axum::http::{Request, StatusCode};
     use domain::{
-        Body, BranchName, DeliveryId, Destination, DestinationId, DestinationKind, DispatchId,
-        Event, Filter, Origin, OriginId, Proof, Pusher, RepositoryName, SecretId, Subscription,
-        Timestamp, Verification, VerifiedDelivery,
+        Body, BranchName, Correlation, DeliveryId, Destination, DestinationId, DestinationKind,
+        DispatchId, Event, Filter, Origin, OriginId, Proof, Pusher, RepositoryName, SecretId,
+        Subscription, Timestamp, Verification, VerifiedDelivery,
     };
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
@@ -435,7 +513,22 @@ mod tests {
             *minted += 1;
             DeliveryId::new(&format!("d-{minted}")).expect("a non-blank identity")
         }
+
+        /// Fixed, so a test can name the chain it expects a response to carry.
+        fn next_correlation(&self) -> Correlation {
+            Correlation::new(GENERATED_TRACE, "00f067aa0ba902b7", None)
+                .expect("a well formed correlation")
+        }
+
+        fn next_hop_in(&self, chain: &Correlation) -> Correlation {
+            chain
+                .continued_as("b7ad6b7169203331")
+                .expect("a well formed span")
+        }
     }
+
+    /// The chain a generated correlation uses, so a test can recognise it.
+    const GENERATED_TRACE: &str = "99999999999999999999999999999999";
 
     /// Fails for the Destinations named, and records the rest.
     struct Recorder {
@@ -464,6 +557,7 @@ mod tests {
             _events: &[Event],
             destination: &Destination,
             _attempt: Attempt,
+            _correlation: &Correlation,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
             if self.failing.contains(&id.as_str()) {
@@ -737,6 +831,125 @@ mod tests {
     }
 
     const BODY: &[u8] = br#"{ "ref" : "refs/heads/main" }"#;
+
+    /// A real traceparent from the W3C Trace Context specification's examples.
+    const CALLERS: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const CALLERS_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    /// Posts with whatever tracing headers a test wants, and returns the
+    /// response whole so the answer's own headers can be read.
+    async fn post_traced(
+        app: Router,
+        parent: Option<&str>,
+        state: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/webhook/github")
+            .header("X-Hub-Signature-256", "ok:abc");
+        if let Some(value) = parent {
+            request = request.header("traceparent", value);
+        }
+        if let Some(value) = state {
+            request = request.header("tracestate", value);
+        }
+
+        app.oneshot(
+            request
+                .body(AxumBody::from(BODY.to_vec()))
+                .expect("a well-formed request"),
+        )
+        .await
+        .expect("the router answers")
+    }
+
+    fn traceparent_of(response: &axum::response::Response) -> &str {
+        response
+            .headers()
+            .get("traceparent")
+            .expect("the answer names the chain")
+            .to_str()
+            .expect("a header this code wrote is text")
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_sent_a_chain_is_answered_in_the_same_chain() {
+        // SPA.02 and SPA.04: the chain is accepted and reported back, so a
+        // sender can put the same trace in its own log and the two ends join up.
+        let wired = a_push_to(&["room"]);
+        let answered = post_traced(wired.app, Some(CALLERS), None).await;
+
+        assert_eq!(answered.status(), StatusCode::ACCEPTED);
+        let parent = traceparent_of(&answered);
+        assert!(
+            parent.contains(CALLERS_TRACE),
+            "the answer left the caller's chain: {parent}"
+        );
+        assert!(parent.starts_with("00-"), "version 00: {parent}");
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_sent_no_chain_is_given_one_rather_than_refused() {
+        // The header is never required. A sender with no tracing at all is a
+        // sender, not a problem.
+        let wired = a_push_to(&["room"]);
+        let answered = post_traced(wired.app, None, None).await;
+
+        assert_eq!(answered.status(), StatusCode::ACCEPTED);
+        assert!(
+            traceparent_of(&answered).contains(GENERATED_TRACE),
+            "a chain was not generated: {}",
+            traceparent_of(&answered)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_chain_is_replaced_and_never_carried() {
+        // Losing an alert because a header was wrong would trade something that
+        // matters for something that does not. The malformed value must not
+        // appear in the answer either, or it has been propagated after all.
+        for nonsense in [
+            "garbage",
+            "00-tooshort-00f067aa0ba902b7-01",
+            "99-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        ] {
+            let wired = a_push_to(&["room"]);
+            let answered = post_traced(wired.app, Some(nonsense), None).await;
+
+            assert_eq!(
+                answered.status(),
+                StatusCode::ACCEPTED,
+                "refused over a trace header: {nonsense}"
+            );
+            let parent = traceparent_of(&answered);
+            assert!(
+                parent.contains(GENERATED_TRACE),
+                "not replaced for {nonsense}: {parent}"
+            );
+            assert!(
+                !parent.contains("tooshort") && !parent.starts_with("99-"),
+                "a malformed value was carried: {parent}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn state_a_caller_sent_comes_back_unchanged() {
+        // Opaque, and belonging to whoever set it. Reading or rewriting it would
+        // make this proxy a participant in somebody else's convention.
+        let wired = a_push_to(&["room"]);
+        let answered = post_traced(wired.app, Some(CALLERS), Some("congo=t61rcWkgMzE")).await;
+
+        assert_eq!(
+            answered
+                .headers()
+                .get("tracestate")
+                .and_then(|value| value.to_str().ok()),
+            Some("congo=t61rcWkgMzE")
+        );
+    }
 
     #[tokio::test]
     async fn a_valid_signed_push_is_accepted() {

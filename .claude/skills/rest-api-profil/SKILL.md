@@ -106,7 +106,9 @@ the checks change under you.
 
 ## The rules RAP-LP checks
 
-54 rules across 13 areas. **FOR is the tool's own area, not the profile's**: its
+**50 rules across 12 areas**, counted from the tool's own diagnostic output
+(`-d`, which writes a verdict for every rule it evaluates) rather than from this
+file. **FOR is the tool's own area, not the profile's**: its
 rules are established good practice that the profile does not require, so a FOR
 failure is advice, not non-conformance.
 
@@ -196,7 +198,15 @@ area headings are translated for navigation only.
 
 ### SPA — Traceability and correlation
 
-*Spårbarhet och korrelation*, 3 rules checked.
+**NOT CHECKED BY RAP-LP.** `grep -c SPA` over the tool's own `GUIDELINES.md`
+returns 0, and a `-d` run evaluates 50 rules across AME, ARQ, DOK, DOT, FEL, FNS,
+FOR, MOG, RES, SAK, UFN and VER — no SPA. This section said "3 rules checked" and
+that was wrong (bead `gc-4oo.5`).
+
+So these are profile text, in the same category as WEB, HYP, CAC and ARS: they
+may bind whoever adopts the profile, but nothing in the gate can tell whether
+they are met. Anything built for them is built because it is worth building, not
+because a check will notice. *Spårbarhet och korrelation*:
 
 - **SPA.02** · SKALL · API-producenter SKALL (SPA.02) acceptera HTTP-headern traceparent i inkommande anrop och propagera spårningsinformationen vidare enligt W3C Trace Context vid vidare anrop till andra system..
 - **SPA.04** · BÖR · API-producenten BÖR (SPA.04) inkludera HTTP-headern traceparent i ett API-svar.
