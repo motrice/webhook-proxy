@@ -207,6 +207,28 @@ pub fn router(inbound: Inbound, max_body: usize) -> Router {
 /// A failed Dispatch does **not** change the answer. Returning an error would
 /// make the sender retry and re-deliver to the Destinations that had already
 /// succeeded.
+/// Whether the body says it is JSON.
+///
+/// One content type, because this service translates one format. A missing
+/// header is refused like an unexpected one: the rule names both, and a request
+/// that does not say what it is cannot be taken at its word.
+///
+/// Parameters are allowed and ignored -- `application/json; charset=utf-8` is
+/// the same media type, and refusing it would reject senders that are behaving
+/// correctly. The comparison is case-insensitive because the standard says the
+/// type is.
+fn json(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+        })
+}
+
 /// Reads a correlation out of what the caller sent, if it sent a usable one.
 ///
 /// The wire format is W3C Trace Context: `version-trace-span-flags`, four
@@ -296,6 +318,29 @@ async fn receive(
     let Ok(claimed) = sender.proofs.claimed(presented) else {
         return (StatusCode::UNAUTHORIZED, HeaderMap::new());
     };
+
+    // Checked here, and the position is the point of bead gc-4oo.8.
+    //
+    // After the credential, so a caller with none learns nothing about what this
+    // service accepts: it gets the same 401 whatever it sent, and the check
+    // cannot be used to probe. Before the relay, because that is where
+    // translation happens and an unsupported type is not a translation failure
+    // -- a hook configured with form encoding used to come back Untranslatable,
+    // which reads like a bad payload rather than a wrong setting.
+    //
+    // Said plainly, because the bead asked for "after verification" and this is
+    // not quite that: the proof is PARSED above and COMPARED inside the relay,
+    // so a caller holding a well-formed but wrong credential reaches this line
+    // and can learn its content type was unsupported. It already knows the path
+    // exists -- 404 and 401 tell it that -- so what leaks is that its own header
+    // was wrong, which it set. Verifying earlier would mean comparing the proof
+    // in this adapter, and verification belongs to the use case.
+    //
+    // SAK.29 is a BOR rather than a SKALL, so this is done because an accurate
+    // refusal is worth having, not because a gate requires it.
+    if !json(&headers) {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, HeaderMap::new());
+    }
 
     let relay = Relay::new(
         sender.proofs.as_ref(),
@@ -816,9 +861,25 @@ mod tests {
     }
 
     async fn post(app: Router, path: &str, signature: Option<&str>, body: &[u8]) -> StatusCode {
+        // application/json, because that is what every configured sender
+        // actually sends and what this service translates. Stated here rather
+        // than left off, so a test that cares about the content type says so.
+        post_typed(app, path, signature, Some("application/json"), body).await
+    }
+
+    async fn post_typed(
+        app: Router,
+        path: &str,
+        signature: Option<&str>,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> StatusCode {
         let mut request = Request::builder().method("POST").uri(path);
         if let Some(value) = signature {
             request = request.header("X-Hub-Signature-256", value);
+        }
+        if let Some(value) = content_type {
+            request = request.header("content-type", value);
         }
         let request = request
             .body(AxumBody::from(body.to_vec()))
@@ -831,6 +892,85 @@ mod tests {
     }
 
     const BODY: &[u8] = br#"{ "ref" : "refs/heads/main" }"#;
+
+    #[tokio::test]
+    async fn a_signed_request_in_the_wrong_content_type_says_so() {
+        // SAK.29, and more usefully an accurate refusal: a hook configured with
+        // form encoding used to fail as Untranslatable, which reads like a
+        // payload problem rather than a setup problem.
+        let wired = a_push_to(&["room"]);
+        let status = post_typed(
+            wired.app,
+            "/webhook/github",
+            Some("ok:abc"),
+            Some("text/plain"),
+            BODY,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn a_signed_request_with_no_content_type_is_refused_too() {
+        // The rule names a missing header alongside an unexpected one, and the
+        // reason is the same: this service translates one format, and a request
+        // that does not say what it is cannot be taken at its word.
+        let wired = a_push_to(&["room"]);
+        let status = post_typed(wired.app, "/webhook/github", Some("ok:abc"), None, BODY).await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn githubs_other_content_type_says_what_is_wrong_rather_than_blaming_the_payload() {
+        // The case this bead exists for. GitHub offers exactly two content types
+        // in its webhook settings, and somebody will pick the other one. 415
+        // tells them to change the setting; 400 told them their payload was bad,
+        // which it was not.
+        let wired = a_push_to(&["room"]);
+        let status = post_typed(
+            wired.app,
+            "/webhook/github",
+            Some("ok:abc"),
+            Some("application/x-www-form-urlencoded"),
+            BODY,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_ne!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_credential_is_refused_before_its_content_type_is_considered() {
+        // The ordering is the point of this bead. A caller with no credential
+        // learns nothing about what this service accepts: it gets the same 401
+        // whatever content type it sent, so the check cannot be used to probe.
+        let wired = a_push_to(&["room"]);
+        let status = post_typed(wired.app, "/webhook/github", None, Some("text/plain"), BODY).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_body_too_large_is_refused_before_its_content_type_is_considered() {
+        // The other half of the ordering: the limit is enforced by a layer before
+        // anything is read, so an oversized body in the wrong content type is
+        // still 413. Pinned because the two refusals are easy to reorder by
+        // accident when either one moves.
+        let wired = wire(Sigs::matching(), Ok(vec![a_push()]), vec![], &["room"], 8);
+        let status = post_typed(
+            wired.app,
+            "/webhook/github",
+            Some("ok:abc"),
+            Some("text/plain"),
+            b"a body longer than eight bytes",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     /// A real traceparent from the W3C Trace Context specification's examples.
     const CALLERS: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -846,7 +986,9 @@ mod tests {
         let mut request = Request::builder()
             .method("POST")
             .uri("/webhook/github")
-            .header("X-Hub-Signature-256", "ok:abc");
+            .header("X-Hub-Signature-256", "ok:abc")
+            // What a configured sender sends, and now required (gc-4oo.8).
+            .header("content-type", "application/json");
         if let Some(value) = parent {
             request = request.header("traceparent", value);
         }
@@ -1237,6 +1379,7 @@ mod tests {
                     .method("POST")
                     .uri("/webhook/github")
                     .header("X-Hub-Signature-256", "ok:abc")
+                    .header("content-type", "application/json")
                     .body(axum::body::Body::from(BODY.to_vec()))
                     .expect("a request"),
             )

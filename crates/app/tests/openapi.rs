@@ -100,6 +100,7 @@ fn returned_statuses() -> std::collections::BTreeSet<u16> {
                 "UNAUTHORIZED" => 401,
                 "NOT_FOUND" => 404,
                 "PAYLOAD_TOO_LARGE" => 413,
+                "UNSUPPORTED_MEDIA_TYPE" => 415,
                 "SERVICE_UNAVAILABLE" => 503,
                 // A status this test does not know is a status nobody documented
                 // on purpose. Loud, because the quiet alternative is a response

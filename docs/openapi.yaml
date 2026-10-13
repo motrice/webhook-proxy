@@ -196,6 +196,15 @@ paths:
           description: |
             The body is larger than this deployment's configured limit, refused
             before anything is verified or parsed. One mebibyte by default.
+        "415":
+          description: |
+            The body does not say it is `application/json`, or does not say what
+            it is at all. One format is translated here, so a hook configured
+            with form encoding is a setting to change rather than a payload to
+            fix — which is what this status says and a `400` did not.
+
+            Refused after the credential, so a caller without one learns nothing
+            about what is accepted: it gets `401` whatever it sent.
         "503":
           description: |
             A secret this proxy needs could not be read, or the store it keeps

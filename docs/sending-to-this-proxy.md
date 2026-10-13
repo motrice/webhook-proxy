@@ -63,6 +63,7 @@ body as bytes and the translator decides whether it is JSON it understands.
 | `401` | The credential is absent, malformed, or wrong | Fix the credential. Indistinguishable on purpose — the proxy will not tell you which. |
 | `404` | No sender is configured at that path | Check the path against the routing file. |
 | `413` | The body is larger than the configured limit | Send less. Refused before anything is verified or parsed. |
+| `415` | The body does not say it is `application/json` | Change the setting, not the payload. GitHub offers two content types in its webhook settings; this service translates the one. |
 | `503` | A secret the proxy needs could not be read, or the store it keeps deliveries in is unreachable | Not yours to fix. Tell whoever runs the proxy; retrying later is reasonable. |
 
 **`202` means accepted, not delivered**, and the distinction is deliberate. The
@@ -70,6 +71,12 @@ proxy answers as soon as the request is verified, then dispatches to each
 matching room independently. A room being unreachable afterwards does not turn
 into a `5xx`, because a sender seeing `5xx` would retry and re-deliver to the
 rooms that already succeeded.
+
+**Send `application/json`.** It is the one format translated here, and a request
+that says anything else — or says nothing — is refused with `415` rather than
+`400`: a hook configured with form encoding is a setting to change, not a
+payload to fix. A charset parameter is fine; `application/json; charset=utf-8`
+is the same media type.
 
 What `202` does promise is that the delivery is written down and will be
 attempted until it succeeds or is abandoned — and written down means in a
