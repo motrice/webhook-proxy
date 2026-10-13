@@ -401,16 +401,62 @@ mod tests {
         }
     }
 
+    /// The image tag, in one place.
+    ///
+    /// Pinned to the major version this proxy is deployed against. The module's
+    /// own default is postgres 11, which would have tested the adapter on a
+    /// server five majors from the one it runs on -- and `SELECT ... FOR UPDATE
+    /// SKIP LOCKED`, which the claim depends on, is exactly the kind of
+    /// behaviour worth testing on the right one.
+    const TAG: &str = "17-alpine";
+
+    /// Fetches the image once per test binary, before any container starts.
+    ///
+    /// Ten tests each start a container, and a container start on a missing
+    /// image issues its own pull: `docker events` shows ten `pull postgres` in
+    /// one cold run. Concurrent pulls of the same layers are what failed in CI
+    /// on 2026-10-13 with `PullImage { err: "bytes remaining on stream" }` --
+    /// one test of twenty, on a cold runner, which is why it is invisible from a
+    /// warm laptop. Bead gc-f62.
+    ///
+    /// `OnceLock::get_or_init` blocks the other nine threads until the first
+    /// finishes, which serialises the PULL and nothing else: the containers
+    /// still start in parallel, which is the isolation they exist for.
+    ///
+    /// Deliberately shells out rather than using the testcontainers client. That
+    /// client belongs to whichever test runtime created it, and reaching across
+    /// runtimes is exactly what made the shared-container design fail (gc-e5x).
+    /// `std::process::Command` has no runtime to belong to.
+    ///
+    /// A machine with neither CLI falls through to the old behaviour rather than
+    /// failing: the pull is an optimisation against a race, not a requirement.
+    fn pulled_once() {
+        static PULLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+        PULLED.get_or_init(|| {
+            for cli in ["docker", "podman"] {
+                let fetched = std::process::Command::new(cli)
+                    .args(["pull", &format!("postgres:{TAG}")])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                if matches!(fetched, Ok(code) if code.success()) {
+                    return;
+                }
+            }
+            // Nothing to report: testcontainers will pull it, which is what
+            // happened before this existed.
+        });
+    }
+
     async fn outbox() -> TestOutbox {
         use testcontainers::{ImageExt as _, runners::AsyncRunner as _};
 
-        // Pinned to the major version this proxy is deployed against. The
-        // module's own default is postgres 11, which would have tested the
-        // adapter on a server five majors from the one it runs on -- and
-        // `SELECT ... FOR UPDATE SKIP LOCKED`, which the claim depends on,
-        // is exactly the kind of behaviour worth testing on the right one.
+        pulled_once();
+
         let container = testcontainers_modules::postgres::Postgres::default()
-            .with_tag("17-alpine")
+            .with_tag(TAG)
             .start()
             .await
             .expect(
