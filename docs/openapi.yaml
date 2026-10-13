@@ -31,9 +31,23 @@ info:
     refused rather than retried as a token.
 
     Conformance to the national REST API-profil is claimed for the areas named
-    in bead `gc-4oo.2` and not for the profile as a whole. Two SKALL rules are
-    refused there with reasons: `SAK.01` and `UFN.02`, both because TLS
-    terminates at the gateway in front of this process rather than in it.
+    in bead `gc-4oo.2` and not for the profile as a whole. Three SKALL rules are
+    excepted there, with reasons:
+
+    - `SAK.01` and `UFN.02`, HTTPS with TLS 1.2 on port 443. Met at the edge
+      rather than in the process: TLS terminates at the gateway in front of
+      this, so every caller reaches it over HTTPS and the process itself never
+      offers it.
+    - `DOK.03`, which wants terms of service and a contact email in this
+      document. Neither exists and neither is a fact to invent: there is no
+      terms of service for an internal receiver on a limited network segment,
+      and an undeliverable support address committed here would be worse than a
+      named gap.
+
+    No tool checks this paragraph. `just lint-api` compares this document with
+    the profile; nothing compares it with the decision, so a claim here that
+    drifts from `gc-4oo.2` reads as conformant to anybody who does not open the
+    bead.
   version: 0.0.0
   license:
     name: EUPL-1.2
