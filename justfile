@@ -35,7 +35,7 @@ verify: check lint-all
 
 # ▪ Correctness. What the CI `check` job runs; no mise, no devbase-check.
 [group('verify')]
-check: fmt-check arch clippy test deps
+check: fmt-check arch clippy test deps lint-api
 
 # ▪ Inner loop while writing code: boundaries plus the suite.
 [group('verify')]
@@ -291,6 +291,103 @@ test-without-docker:
         printf 'the name being skipped has moved, so this gate is not running what it thinks.\n' >&2
         exit 1
     fi
+
+# The API specification against the national REST API-profil, via RAP-LP.
+#
+# In `check` rather than `lint-all` for a structural reason, not a taxonomic one:
+# devbase-check's verify.sh holds its check list hardcoded, so the hygiene half
+# cannot take a new check without editing somebody else's repository. `check` is
+# the half this project controls.
+#
+# Deliberately NOT in `check-without-docker`: this needs a container, and the
+# Forgejo runner gives its jobs no Docker (gc-9sp). So the fast gate skips this
+# the same way it skips the database tests, and GitHub — where landing is gated —
+# runs it.
+#
+# The tool is pinned by version, not by a floating tag: its rule set ships inside
+# it, so an unpinned tag means the checks change under you.
+[group('lint')]
+lint-api:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    runner=""
+    for candidate in docker podman; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            runner="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$runner" ]]; then
+        printf 'neither docker nor podman is on PATH, and RAP-LP ships as a container.\n' >&2
+        printf 'the npm package needs a GitHub Packages token, which is friction for no benefit.\n' >&2
+        exit 1
+    fi
+
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    # World-writable, and this is the difference between CI and a Mac. mktemp
+    # makes a 0700 directory owned by the invoking user; the image runs as its
+    # own user, so on Linux it cannot write there and RAP-LP dies before it can
+    # even write the error log that would have said so. Docker Desktop flattens
+    # ownership, so the same command passes locally — which is exactly how this
+    # reached CI. The directory holds a lint report for a few seconds and is
+    # removed by the trap above.
+    chmod 0777 "$out"
+
+    # -d writes a verdict for EVERY rule as JSON, which is what makes the
+    # obsolete-waiver direction checkable. The human-readable output on stdout
+    # only names what failed.
+    # -l captures the tool's OWN error log. Without it a failure to initialise
+    # prints "Undersök felloggen" — consult the error log — and there is no error
+    # log, which is how this recipe first failed in CI while passing locally.
+    "$runner" run --rm \
+        -v "$PWD:/data:ro" -v "$out:/out" \
+        "ghcr.io/diggsweden/rest-api-profil-lint-processor:v2.0.0" \
+        -f /data/docs/openapi.yaml -d /out/diagnostic.json -l /out/error.log \
+        >"$out/report.txt" 2>&1 || true
+
+    if [[ ! -s "$out/diagnostic.json" ]]; then
+        printf 'RAP-LP wrote no diagnostics.\n\nits own output:\n' >&2
+        cat "$out/report.txt" >&2
+        if [[ -s "$out/error.log" ]]; then
+            printf '\nits error log:\n' >&2
+            cat "$out/error.log" >&2
+        else
+            printf '\nit wrote no error log either.\n' >&2
+        fi
+        exit 1
+    fi
+
+    # jq rather than a python heredoc: a recipe body is indented, and a quoted
+    # heredoc delimiter cannot be, so the terminator leaked into the script and
+    # the comparison ran twice. jq is already required by `just pr`.
+    # ' \t' and not '[:space:]': the latter deletes newlines too, which folded
+    # six waivers into one line and reported "1 waived" against 6 found.
+    known=$(sed 's/#.*//' docs/openapi-known-findings.txt | tr -d ' \t' | grep -v '^$' | sort -u)
+    reported=$(tail -n +2 "$out/diagnostic.json" |
+        jq -r '.[] | select((.note // "") | test("Ej Godkända")) | .rules[].id' | sort -u)
+
+    fresh=$(comm -23 <(printf '%s\n' "$reported") <(printf '%s\n' "$known") || true)
+    stale=$(comm -13 <(printf '%s\n' "$reported") <(printf '%s\n' "$known") || true)
+
+    if [[ -n "$fresh" || -n "$stale" ]]; then
+        while read -r rule; do
+            [[ -n "$rule" ]] && printf 'NEW      %s is reported by RAP-LP and is not waived.\n' "$rule" >&2
+        done <<< "$fresh"
+        while read -r rule; do
+            [[ -n "$rule" ]] && printf 'OBSOLETE %s is waived and now passes. Delete its line.\n' "$rule" >&2
+        done <<< "$stale"
+        printf '\n%s reported, %s waived, in docs/openapi-known-findings.txt\n' \
+            "$(printf '%s\n' "$reported" | grep -c .)" \
+            "$(printf '%s\n' "$known" | grep -c .)" >&2
+        printf 'every waiver needs a verdict in bead gc-4oo.2; an unexplained one\n' >&2
+        printf 'cannot be told from an oversight.\n' >&2
+        exit 1
+    fi
+
+    printf 'RAP-LP: %s known findings, exactly as waived.\n' \
+        "$(printf '%s\n' "$reported" | grep -c .)"
 
 # The whole suite, the database-backed tests included.
 #

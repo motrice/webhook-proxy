@@ -80,7 +80,19 @@ Do not turn that paragraph into conformance claims. It is a reading list.
 
 ## Running RAP-LP locally
 
-Prefer the container: the npm package lives in GitHub Packages and needs a
+**`just lint-api`** is the way, and it is part of `just check` (bead `gc-4oo.4`).
+It runs the pinned container, then compares what RAP-LP reports against
+`docs/openapi-known-findings.txt` and fails on any difference in either
+direction — a new finding, or a waiver that has started passing and should be
+deleted. Requiring *exactly* the known set rather than zero findings is what
+stops a new failure hiding among the accepted ones.
+
+It is deliberately absent from `check-without-docker`, which the Forgejo fast
+gate runs: that runner gives its jobs no Docker (`gc-9sp`), so this is checked on
+GitHub, where landing is gated.
+
+To run the tool by hand — reading a rule's own output while fixing it, say —
+prefer the container: the npm package lives in GitHub Packages and needs a
 personal access token, which is friction for no benefit.
 
 ```bash

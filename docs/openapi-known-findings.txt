@@ -1,0 +1,50 @@
+# Rules the API specification is known not to pass, with the reason each is here.
+#
+# `just lint-api` compares this list with what RAP-LP actually reports and fails
+# on ANY difference, in either direction:
+#
+#   a rule reported but not listed here  -> a new finding, hiding among known ones
+#   a rule listed here but not reported  -> this waiver is obsolete, delete the line
+#
+# The second direction is the one that matters over time. A waiver that silently
+# tolerates its own obsolescence is how a gate stops meaning anything: the list
+# grows, nobody prunes it, and eventually it waives a rule that would have
+# caught something. So a rule starting to pass is a build failure, which is
+# annoying for exactly as long as it takes to delete one line.
+#
+# The verdicts come from bead gc-4oo.2, which decided area by area what this
+# proxy follows. Do not add a line here without a verdict there — an unexplained
+# waiver is indistinguishable from an oversight, which is the whole thing that
+# decision exists to prevent.
+#
+# One id per line. Everything after '#' is a comment.
+
+# SKALL, and the only one deliberately unmet. info.termsOfService and a contact
+# email. The maintainer decided both are gaps to record rather than facts to
+# invent: there is no terms of service for an internal receiver on a limited
+# network segment, and an undeliverable support address committed into a
+# specification that goes public with the repository is worse than a named gap.
+DOK.03
+
+# BÖR. Documentation in both Swedish and English. Undecided rather than refused:
+# nobody has decided whether this product's documentation is bilingual, and
+# translating docs/sending-to-this-proxy.md is not a thing to do by accident.
+DOK.06
+
+# BÖR. Richardson maturity level 3. Does not apply: level 3 is hypermedia over a
+# resource model, and there is one verb on one path here. Contorting a webhook
+# receiver into resources would be conformance theatre.
+MOG.02
+
+# BÖR. The profile's URL shape, with api and version segments. Departed: the path
+# a sender posts to is its own configuration — it is spelled in GitHub's webhook
+# settings — so renaming it breaks every registered hook for no gain.
+UFN.01
+
+# BÖR. A version segment in the URL. Departed for the same reason as UFN.01.
+VER.05
+
+# BÖR. Every representation described as JSON. /health answers the string "ok"
+# and /metrics answers Prometheus text, and neither should be JSON: a liveness
+# probe wants no payload contract, and a scraper wants the format it parses.
+AME.01
