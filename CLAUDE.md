@@ -77,7 +77,12 @@ bd ready -> claim -> worktree -> red/green/refactor -> just verify -> PR -> huma
    workable; `just next` claims the top of it atomically. If the user asks for
    something not in the ledger, groom it into beads first (`bead-grooming`).
 2. **One bead, one worktree, one branch, one PR.** `just start <id>` does all
-   three, so parallel agents never share a checkout.
+   three, so parallel agents never share a checkout. Begin a bead that way
+   rather than by hand: this rule and that recipe both already existed when a
+   commit landed on `main` for the third time (`gc-mo3`), so the gap was never
+   knowledge. A `pre-commit` guard now refuses a commit on `main`, and `just pr`
+   refuses in under a second if the checkout is not on `bead/<id>` — before
+   spending four minutes on `verify` and failing inside `git push`.
 3. **Code arrives only as the answer to a failing test** (`red-green-refactor`).
 4. **`just verify` is the definition of done.** It is `check` (correctness:
    formatting, boundaries, clippy, tests, unused deps) plus `lint-all` (hygiene:

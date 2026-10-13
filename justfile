@@ -351,6 +351,13 @@ next:
 start id:
     bd update {{ id }} --claim
     bd worktree create {{ id }} --branch "bead/{{ id }}"
+    # A fresh worktree is a path mise has not seen, so its .mise.toml is
+    # untrusted and the first `just verify` in there dies on "Config files ...
+    # are not trusted" — which looks like a broken checkout rather than a
+    # one-time prompt. Trusting it here keeps the sanctioned way to begin a bead
+    # frictionless, which is the only thing that makes it the way people use
+    # (bead gc-mo3).
+    cd {{ id }} && mise trust --quiet
     bd worktree list
 
 # Record progress without closing — keeps the lease alive on long work.
@@ -376,11 +383,35 @@ abandon id reason:
 # whose base is gone and a closed PR with no base cannot be reopened.
 [doc("Open the PR for a bead. Pass a base to stack on an unmerged PR")]
 [group('ship')]
-pr id base="main": verify
+pr id base="main":
     #!/usr/bin/env bash
     set -euo pipefail
     id="{{ id }}"
     base="{{ base }}"
+
+    # Checked BEFORE verify, which is the whole point: `verify` used to be a
+    # prerequisite, so a branch somebody had forgotten cost four minutes and then
+    # failed inside git's own push with "src refspec bead/<id> does not match
+    # any" — an error naming neither the bead nor the cause. Bead gc-mo3, after
+    # gc-4oo.6 was committed onto main and nothing noticed until the push.
+    on=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || printf '(detached)')
+    if [[ "$on" != "bead/$id" ]]; then
+        printf 'this checkout is on %s, not bead/%s.\n\n' "$on" "$id" >&2
+        if [[ "$on" == "main" || "$on" == "master" ]]; then
+            printf 'work on a bead goes on its own branch:\n' >&2
+            printf '    just start %s\n\n' "$id" >&2
+            printf 'if the work is already committed here, move it:\n' >&2
+            printf '    git branch bead/%s && git reset --hard origin/%s\n' "$id" "$on" >&2
+            printf '    git switch bead/%s\n' "$id" >&2
+        else
+            printf 'either open the PR for %s instead, or switch to bead/%s.\n' \
+                "${on#bead/}" "$id" >&2
+        fi
+        exit 1
+    fi
+
+    just verify
+
     bead=$(bd show "$id" --json)
     # bd show --json may return the issue or a single-element array.
     norm='if type=="array" then .[0] else . end'

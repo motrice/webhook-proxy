@@ -57,3 +57,29 @@ if command -v bd >/dev/null 2>&1; then
   if [ "$_bd_exit" -ne 0 ]; then exit "$_bd_exit"; fi
 fi
 # --- END BEADS INTEGRATION v1.3.0 ---
+
+# --- BEGIN WEBHOOK-PROXY GUARD (bead gc-mo3) ---
+# Deliberately OUTSIDE the beads markers above: beads rewrites its own section
+# when it updates, and anything inside those markers would be replaced.
+#
+# Refuses a commit on main. Nothing in the sanctioned workflow commits there:
+# `just start` puts work on bead/<id>, `just approve` amends on that branch, and
+# `just land` fast-forwards main without creating a commit. So a commit on main
+# is always a branch somebody forgot — which has happened three times here, most
+# recently gc-4oo.6, caught only when `just pr` failed to push minutes later.
+#
+# A rebase leaves HEAD detached and runs no pre-commit, so the 2026-10-11
+# re-signing of 42 commits would be unaffected by this.
+_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || printf '')
+case "$_branch" in
+main | master)
+	printf 'refusing to commit on %s.\n\n' "$_branch" >&2
+	printf 'work on a bead goes on its own branch. to begin one:\n' >&2
+	printf '    just start <bead-id>\n\n' >&2
+	printf 'if this commit is already written, move it rather than retyping it:\n' >&2
+	printf '    git branch bead/<bead-id> && git reset --hard origin/%s\n' "$_branch" >&2
+	printf '    git switch bead/<bead-id>\n' >&2
+	exit 1
+	;;
+esac
+# --- END WEBHOOK-PROXY GUARD (bead gc-mo3) ---
