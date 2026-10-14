@@ -14,8 +14,8 @@
 
 use async_trait::async_trait;
 use domain::{
-    Body, Correlation, DeliveryId, Destination, Dispatch, DispatchId, Event, Origin, Proof,
-    Timestamp, VerifiedDelivery,
+    Body, Correlation, DeliveryId, Destination, DestinationId, Dispatch, DispatchId, Event, Origin,
+    Proof, Timestamp, VerifiedDelivery,
 };
 
 /// The signature an Origin's secret produces over a body.
@@ -232,18 +232,37 @@ pub struct Recorded {
     dispatch: Dispatch,
     attempts: u32,
     outcome: Outcome,
+    accepted_at: Timestamp,
 }
 
 impl Recorded {
     /// Assembles what the store knows about one Dispatch.
     #[must_use]
-    pub fn new(id: DispatchId, dispatch: Dispatch, attempts: u32, outcome: Outcome) -> Self {
+    pub fn new(
+        id: DispatchId,
+        dispatch: Dispatch,
+        attempts: u32,
+        outcome: Outcome,
+        accepted_at: Timestamp,
+    ) -> Self {
         Self {
             id,
             dispatch,
             attempts,
             outcome,
+            accepted_at,
         }
+    }
+
+    /// When the store took it, which is when the sender was answered.
+    ///
+    /// Distinct from the moments in [`Outcome`], and the distinction is what a
+    /// time query needs: those say when this proxy last did something about a
+    /// Dispatch, this says when the sender sent it. A reader asking what arrived
+    /// yesterday means the latter.
+    #[must_use]
+    pub fn accepted_at(&self) -> Timestamp {
+        self.accepted_at
     }
 
     /// How the store refers to it.
@@ -374,6 +393,100 @@ pub trait Outbox: Send + Sync {
 pub trait Clock: Send + Sync {
     /// The current moment.
     fn now(&self) -> Timestamp;
+}
+
+/// Which moments a query is interested in.
+///
+/// Both ends optional, so one shape serves "the most recent" and "between these
+/// times" without a second method. Unbounded is the common case: the first
+/// useful question about an outbox is what just happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Window {
+    /// Nothing accepted before this moment.
+    pub from: Option<Timestamp>,
+    /// Nothing accepted after it.
+    pub to: Option<Timestamp>,
+}
+
+/// How much of an answer to return, and where to carry on from.
+///
+/// Part of the port rather than bolted on later, because an outbox grows
+/// without bound: a query with no limit is a query that works in testing and
+/// takes a process down in a year. `after` is the last identity a caller
+/// already has, not an offset — an offset shifts under a concurrent write and
+/// silently skips a row, which for an audit answer is worse than a repeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// At most this many.
+    pub limit: usize,
+    /// Carry on after this one, if a caller has been here before.
+    pub after: Option<DispatchId>,
+}
+
+/// What arrived, and where it went.
+///
+/// The read side of the store, declared in the domain's vocabulary rather than
+/// in a transport's: the questions worth asking are the same whether they come
+/// over HTTP, from a command, or from a test, and declaring them here is what
+/// stops the answers being shaped by what was convenient to serialise.
+///
+/// EVERY QUERY IS SCOPED BY ROOM, and that is not a convenience. Bead gc-mnn
+/// decided a reader may see what the rooms named for it received, so the rooms
+/// arrive as an argument and an implementation returns nothing outside them. A
+/// port that returned everything and left filtering to its caller would put an
+/// authorisation decision in an adapter, where forgetting it is a leak with no
+/// test to catch it. An empty slice therefore answers empty: a reader with no
+/// rooms is a reader who sees nothing, not a reader who sees all of it.
+///
+/// Nothing here can return a payload, an address or a credential, and that is
+/// structural rather than careful: a [`Recorded`] carries a Dispatch, a
+/// Dispatch carries a Destination, and a Destination is a name with no address.
+/// The request body is never stored at all.
+#[async_trait]
+pub trait Archive: Send + Sync {
+    /// What arrived, most recent first.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked.
+    async fn arrived(
+        &self,
+        rooms: &[DestinationId],
+        window: Window,
+        page: &Page,
+    ) -> Result<Vec<Recorded>, StorageUnavailable>;
+
+    /// Where one Delivery went, and what became of it in each room.
+    ///
+    /// Empty when nothing is stored under that identity, which is deliberately
+    /// indistinguishable from never having been accepted. Retention is one month
+    /// (gc-mnn), so "it was here last quarter" and "it was never here" are the
+    /// same answer, and a reader must not be able to tell a room it may not see
+    /// from a delivery that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked.
+    async fn went(
+        &self,
+        delivery: &DeliveryId,
+        rooms: &[DestinationId],
+    ) -> Result<Vec<Recorded>, StorageUnavailable>;
+
+    /// What has not been delivered yet, most recent first.
+    ///
+    /// Everything still [`Outcome::Waiting`] — owed, not lost. An abandoned
+    /// Dispatch is a loss and is reported by the counters and the log, not here:
+    /// a reader asking what is outstanding wants the queue, not the history.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked.
+    async fn waiting(
+        &self,
+        rooms: &[DestinationId],
+        page: &Page,
+    ) -> Result<Vec<Recorded>, StorageUnavailable>;
 }
 
 /// Fresh identities.

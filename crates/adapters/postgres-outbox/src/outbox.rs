@@ -98,6 +98,11 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
     let events: serde_json::Value = row.try_get("events").map_err(|_| StorageUnavailable)?;
     let outcome: String = row.try_get("outcome").map_err(|_| StorageUnavailable)?;
     let attempts: i32 = row.try_get("attempts").map_err(|_| StorageUnavailable)?;
+    // The table has carried this since the first migration and nothing read it
+    // until there was a question that needed it (bead gc-h6c).
+    let accepted_at: i64 = row
+        .try_get("accepted_at_ms")
+        .map_err(|_| StorageUnavailable)?;
     let again_at: Option<i64> = row.try_get("again_at_ms").map_err(|_| StorageUnavailable)?;
     let settled_at: Option<i64> = row
         .try_get("settled_at_ms")
@@ -154,6 +159,7 @@ fn recorded(row: &sqlx::postgres::PgRow) -> Result<Recorded, StorageUnavailable>
         dispatch,
         attempts.try_into().unwrap_or(u32::MAX),
         outcome,
+        Timestamp::from_millis_since_epoch(accepted_at),
     ))
 }
 
@@ -174,6 +180,7 @@ fn row_id(id: &DispatchId) -> Result<i64, StorageUnavailable> {
 /// mapping back to `Timestamp` is one shape rather than three.
 const COLUMNS: &str = "id, delivery, origin, destination, kind, events, outcome, attempts, \
      trace, span, state, \
+     (EXTRACT(EPOCH FROM accepted_at) * 1000)::BIGINT AS accepted_at_ms, \
      (EXTRACT(EPOCH FROM again_at) * 1000)::BIGINT AS again_at_ms, \
      (EXTRACT(EPOCH FROM settled_at) * 1000)::BIGINT AS settled_at_ms";
 

@@ -737,6 +737,7 @@ mod tests {
                         dispatch.clone(),
                         0,
                         Outcome::Waiting { again_at: at },
+                        at,
                     )
                 })
                 .collect())

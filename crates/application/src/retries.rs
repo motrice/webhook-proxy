@@ -305,6 +305,7 @@ mod tests {
             Outcome::Waiting {
                 again_at: Timestamp::from_millis_since_epoch(NOW),
             },
+            Timestamp::from_millis_since_epoch(NOW),
         )
     }
 

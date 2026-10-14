@@ -293,6 +293,7 @@ mod tests {
                         dispatch.clone(),
                         0,
                         Outcome::Waiting { again_at: at },
+                        at,
                     )
                 })
                 .collect())
@@ -383,6 +384,7 @@ mod tests {
                     Outcome::Delivered {
                         at: Timestamp::from_millis_since_epoch(NOW),
                     },
+                    Timestamp::from_millis_since_epoch(NOW),
                 )
             })
             .collect()

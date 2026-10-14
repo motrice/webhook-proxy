@@ -16,9 +16,9 @@
 
 use std::sync::Mutex;
 
-use application::ports::{Outbox, Outcome, Recorded, StorageUnavailable};
+use application::ports::{Archive, Outbox, Outcome, Page, Recorded, StorageUnavailable, Window};
 use async_trait::async_trait;
-use domain::{DeliveryId, Dispatch, DispatchId, Timestamp};
+use domain::{DeliveryId, DestinationId, Dispatch, DispatchId, Timestamp};
 
 /// Dispatches held in memory, in the order they were accepted.
 ///
@@ -83,7 +83,15 @@ impl Held {
         self.claimed.retain(|claimed| claimed != id);
         for record in &mut self.records {
             if record.id() == id {
-                *record = Recorded::new(id.clone(), record.dispatch().clone(), attempts, outcome);
+                // The acceptance moment is carried over rather than refreshed:
+                // settling says what became of a Dispatch, not when it arrived.
+                *record = Recorded::new(
+                    id.clone(),
+                    record.dispatch().clone(),
+                    attempts,
+                    outcome,
+                    record.accepted_at(),
+                );
                 return;
             }
         }
@@ -124,6 +132,7 @@ impl Outbox for MemoryOutbox {
                 dispatch.clone(),
                 0,
                 Outcome::Waiting { again_at: at },
+                at,
             ));
         }
         held.records.extend(arriving.iter().cloned());
@@ -190,6 +199,107 @@ impl Outbox for MemoryOutbox {
         held.settle(id, attempts, Outcome::Abandoned { at });
         Ok(())
     }
+}
+
+/// Reads what the store holds, scoped to the rooms a caller may see.
+///
+/// The filtering lives here rather than in a caller because the port says so
+/// (bead gc-mnn): an adapter that returned everything would make every caller
+/// responsible for an authorisation decision, and one that forgot would leak
+/// with no test to catch it.
+#[async_trait]
+impl Archive for MemoryOutbox {
+    async fn arrived(
+        &self,
+        rooms: &[DestinationId],
+        window: Window,
+        page: &Page,
+    ) -> Result<Vec<Recorded>, StorageUnavailable> {
+        let held = self.held.lock().map_err(|_| StorageUnavailable)?;
+
+        Ok(paged(
+            held.records
+                .iter()
+                .filter(|record| visible(record, rooms))
+                .filter(|record| within(record, window))
+                .rev(),
+            page,
+        ))
+    }
+
+    async fn went(
+        &self,
+        delivery: &DeliveryId,
+        rooms: &[DestinationId],
+    ) -> Result<Vec<Recorded>, StorageUnavailable> {
+        let held = self.held.lock().map_err(|_| StorageUnavailable)?;
+
+        Ok(held
+            .records
+            .iter()
+            .filter(|record| record.dispatch().delivery() == delivery)
+            .filter(|record| visible(record, rooms))
+            .cloned()
+            .collect())
+    }
+
+    async fn waiting(
+        &self,
+        rooms: &[DestinationId],
+        page: &Page,
+    ) -> Result<Vec<Recorded>, StorageUnavailable> {
+        let held = self.held.lock().map_err(|_| StorageUnavailable)?;
+
+        Ok(paged(
+            held.records
+                .iter()
+                .filter(|record| matches!(record.outcome(), Outcome::Waiting { .. }))
+                .filter(|record| visible(record, rooms))
+                .rev(),
+            page,
+        ))
+    }
+}
+
+/// Whether a caller holding these rooms may see this record.
+///
+/// Identity text rather than the value, because a `DestinationId` is neither
+/// `Hash` nor `Ord` by design — the same reason `Tally` keys on text.
+fn visible(record: &Recorded, rooms: &[DestinationId]) -> bool {
+    rooms
+        .iter()
+        .any(|room| room.as_str() == record.dispatch().destination().id().as_str())
+}
+
+/// Whether a record was accepted inside the window.
+///
+/// Accepted, not settled: a reader asking what arrived yesterday means what a
+/// sender sent yesterday, not what this proxy finished with yesterday.
+fn within(record: &Recorded, window: Window) -> bool {
+    let at = record.accepted_at();
+
+    window.from.is_none_or(|from| at >= from) && window.to.is_none_or(|to| at <= to)
+}
+
+/// Takes one page, starting after whatever the caller already has.
+fn paged<'a>(records: impl Iterator<Item = &'a Recorded>, page: &Page) -> Vec<Recorded> {
+    let mut seen_the_cursor = page.after.is_none();
+
+    records
+        .filter(|record| {
+            if seen_the_cursor {
+                return true;
+            }
+            // The cursor itself is not returned again; the page starts after it.
+            seen_the_cursor = page
+                .after
+                .as_ref()
+                .is_some_and(|after| after.as_str() == record.id().as_str());
+            false
+        })
+        .take(page.limit)
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -529,5 +639,275 @@ mod tests {
             format!("{StorageUnavailable}"),
             "the delivery store is unavailable"
         );
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use application::ports::{Archive, Outbox, Outcome, Page, Window};
+    use domain::{
+        BranchName, Commit, CommitId, Correlation, DeliveryId, Destination, DestinationId,
+        DestinationKind, Dispatch, Event, OriginId, Pusher, RepositoryName, Summary, Timestamp,
+    };
+
+    use super::MemoryOutbox;
+
+    fn at(millis: i64) -> Timestamp {
+        Timestamp::from_millis_since_epoch(1_759_000_000_000 + millis)
+    }
+
+    fn rooms(ids: &[&str]) -> Vec<DestinationId> {
+        ids.iter()
+            .map(|id| DestinationId::new(id).expect("a non-blank identity"))
+            .collect()
+    }
+
+    fn page(limit: usize) -> Page {
+        Page { limit, after: None }
+    }
+
+    fn dispatch(delivery: &str, summary: &str, to: &str) -> Dispatch {
+        Dispatch::new(
+            DeliveryId::new(delivery).expect("a non-blank id"),
+            OriginId::new("github").expect("a non-blank id"),
+            vec![Event::PushedCommits {
+                repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
+                branch: BranchName::new("main").expect("a name"),
+                pusher: Pusher::new("bjornmolin").expect("a name"),
+                commits: vec![Commit::new(
+                    CommitId::new("6113728f27ae").expect("an id"),
+                    Summary::new(summary).expect("a summary"),
+                )],
+                permalink: None,
+            }],
+            Destination::new(
+                DestinationId::new(to).expect("a non-blank id"),
+                DestinationKind::ChatRoom,
+            ),
+            Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+                .expect("a well formed correlation"),
+        )
+        .expect("at least one event")
+    }
+
+    #[tokio::test]
+    async fn a_reader_sees_only_the_rooms_it_was_given() {
+        // Bead gc-mnn: a reader may see what the rooms named for it received.
+        // The filtering is the port's, so this is the test that would catch an
+        // implementation returning everything.
+        let outbox = MemoryOutbox::new();
+        outbox
+            .accept(
+                &[
+                    dispatch("d-1", "for devsecops", "devsecops-room"),
+                    dispatch("d-2", "for platform", "platform-room"),
+                ],
+                at(0),
+            )
+            .await
+            .expect("available");
+
+        let seen = outbox
+            .arrived(&rooms(&["devsecops-room"]), Window::default(), &page(10))
+            .await
+            .expect("available");
+
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].dispatch().destination().id().as_str(),
+            "devsecops-room"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_with_no_rooms_sees_nothing_rather_than_everything() {
+        // The direction that matters. An empty list is a reader with no entry in
+        // the deployment's reader file, and the dangerous reading of "no filter"
+        // is "no restriction".
+        let outbox = MemoryOutbox::new();
+        outbox
+            .accept(&[dispatch("d-1", "a change", "devsecops-room")], at(0))
+            .await
+            .expect("available");
+
+        assert!(
+            outbox
+                .arrived(&[], Window::default(), &page(10))
+                .await
+                .expect("available")
+                .is_empty()
+        );
+        assert!(
+            outbox
+                .went(&DeliveryId::new("d-1").expect("a non-blank id"), &[])
+                .await
+                .expect("available")
+                .is_empty()
+        );
+        assert!(
+            outbox
+                .waiting(&[], &page(10))
+                .await
+                .expect("available")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn what_arrived_comes_back_most_recent_first_and_one_page_at_a_time() {
+        let outbox = MemoryOutbox::new();
+        for (offset, summary) in ["first", "second", "third"].iter().enumerate() {
+            outbox
+                .accept(
+                    &[dispatch(&format!("d-{offset}"), summary, "a-room")],
+                    at(i64::try_from(offset).expect("small") * 1000),
+                )
+                .await
+                .expect("available");
+        }
+
+        let first = outbox
+            .arrived(&rooms(&["a-room"]), Window::default(), &page(2))
+            .await
+            .expect("available");
+        assert_eq!(first.len(), 2, "a page is a page");
+
+        let next = outbox
+            .arrived(
+                &rooms(&["a-room"]),
+                Window::default(),
+                &Page {
+                    limit: 2,
+                    after: Some(first[1].id().clone()),
+                },
+            )
+            .await
+            .expect("available");
+
+        assert_eq!(next.len(), 1, "the rest of it");
+        assert_ne!(
+            next[0].id().as_str(),
+            first[1].id().as_str(),
+            "a page starts after the cursor, it does not repeat it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_asks_about_when_the_sender_sent_not_when_we_finished() {
+        let outbox = MemoryOutbox::new();
+        outbox
+            .accept(&[dispatch("d-early", "early", "a-room")], at(0))
+            .await
+            .expect("available");
+        outbox
+            .accept(&[dispatch("d-late", "late", "a-room")], at(10_000))
+            .await
+            .expect("available");
+
+        let early = outbox
+            .arrived(
+                &rooms(&["a-room"]),
+                Window {
+                    from: None,
+                    to: Some(at(5_000)),
+                },
+                &page(10),
+            )
+            .await
+            .expect("available");
+
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].dispatch().delivery().as_str(), "d-early");
+    }
+
+    #[tokio::test]
+    async fn what_is_still_owed_excludes_what_was_delivered() {
+        let outbox = MemoryOutbox::new();
+        let accepted = outbox
+            .accept(
+                &[
+                    dispatch("d-1", "delivered", "a-room"),
+                    dispatch("d-2", "still owed", "a-room"),
+                ],
+                at(0),
+            )
+            .await
+            .expect("available");
+        outbox
+            .delivered(accepted[0].id(), at(1))
+            .await
+            .expect("available");
+
+        let owed = outbox
+            .waiting(&rooms(&["a-room"]), &page(10))
+            .await
+            .expect("available");
+
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].dispatch().delivery().as_str(), "d-2");
+        assert!(matches!(owed[0].outcome(), Outcome::Waiting { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_delivery_answers_empty_rather_than_erring() {
+        // Retention is one month (gc-mnn), so "it was here last quarter" and "it
+        // was never here" are the same answer. A reader must not be able to tell
+        // a room it may not see from a delivery that does not exist.
+        let outbox = MemoryOutbox::new();
+
+        assert!(
+            outbox
+                .went(
+                    &DeliveryId::new("never-accepted").expect("a non-blank id"),
+                    &rooms(&["a-room"])
+                )
+                .await
+                .expect("available")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_a_query_returns_can_carry_an_address_or_a_credential() {
+        // Asserted rather than left to a reviewer, which is this bead's own
+        // criterion. The absence is structural -- a Destination is a name with no
+        // address and the request body is never stored -- so this is the test
+        // that fails if somebody makes it otherwise.
+        let outbox = MemoryOutbox::new();
+        outbox
+            .accept(&[dispatch("d-1", "a change", "devsecops-room")], at(0))
+            .await
+            .expect("available");
+
+        let seen = outbox
+            .arrived(&rooms(&["devsecops-room"]), Window::default(), &page(10))
+            .await
+            .expect("available");
+        let printed = format!("{seen:?}");
+
+        // A positive oracle first, because the assertions below are absences and
+        // an empty answer would satisfy every one of them. This is the mistake
+        // gc-ast.13's secrets-dir test made: it passed with the variable
+        // misspelled, because nothing and the wrong thing looked the same.
+        assert_eq!(seen.len(), 1, "nothing to inspect, so nothing is proved");
+        assert!(
+            printed.contains("devsecops-room"),
+            "the room's NAME is expected and present; it is its address that must not be"
+        );
+
+        // The shapes a leak would take: the room's webhook URL, the secret NAME
+        // the routing file uses for it, a bearer token, a connection string.
+        for forbidden in [
+            "http://",
+            "https://",
+            "devsecops-room-url",
+            "Bearer",
+            "postgres://",
+        ] {
+            assert!(
+                !printed.contains(forbidden),
+                "a query answer carries {forbidden:?}: {printed}"
+            );
+        }
     }
 }
