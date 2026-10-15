@@ -17,8 +17,8 @@
 use std::sync::Mutex;
 
 use application::ports::{
-    Archive, Claimed, Discharged, Handover, Offered, Outbox, Outcome, Page, Recorded, Report,
-    StorageUnavailable, TenantId, Window,
+    Archive, Behind, Claimed, Discharged, Handover, Offered, Outbox, Outcome, Page, Recorded,
+    Report, StorageUnavailable, Swept, TenantId, Uncollected, Window,
 };
 use async_trait::async_trait;
 use domain::{DeliveryId, DestinationId, Dispatch, DispatchId, Timestamp};
@@ -1049,6 +1049,71 @@ impl Handover for MemoryHandover {
         } else {
             Ok(Discharged::Settled)
         }
+    }
+
+    async fn sweep(&self, accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {
+        let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
+
+        // EVERY ROW HERE IS UNCOLLECTED, because `report` removes a discharged
+        // one rather than keeping it with its report beside it — see the note
+        // there. So this store's `settled` is always zero, and that is honest
+        // rather than a gap: a process that forgets everything at exit has no
+        // month of settled rows to retain. The durable store is where the
+        // distinction means something, and it has its own tests for it.
+        let (old, current): (Vec<Owed>, Vec<Owed>) = held
+            .drain(..)
+            .partition(|owed| owed.offered.accepted_at() < accepted_before);
+        *held = current;
+
+        Ok(Swept {
+            settled: 0,
+            uncollected: old.iter().map(|owed| lost(&owed.offered)).collect(),
+        })
+    }
+
+    async fn behind(&self, accepted_before: Timestamp) -> Result<Vec<Behind>, StorageUnavailable> {
+        let held = self.offered.lock().map_err(|_| StorageUnavailable)?;
+
+        // A map keyed by the tenant's text, because what comes back is a report
+        // and not a set of domain values — the port says why.
+        let mut piling: std::collections::BTreeMap<String, (usize, Timestamp)> =
+            std::collections::BTreeMap::new();
+        for owed in held
+            .iter()
+            .filter(|owed| owed.offered.accepted_at() < accepted_before)
+        {
+            let entry = piling
+                .entry(owed.offered.tenant().as_str().to_owned())
+                .or_insert((0, owed.offered.accepted_at()));
+            entry.0 += 1;
+            if owed.offered.accepted_at() < entry.1 {
+                entry.1 = owed.offered.accepted_at();
+            }
+        }
+
+        Ok(piling
+            .into_iter()
+            .map(|(tenant, (outstanding, oldest))| Behind {
+                tenant,
+                outstanding,
+                oldest,
+            })
+            .collect())
+    }
+}
+
+/// What a loss report says about one Delivery nobody collected.
+///
+/// Built here rather than in the port so that both stores produce the same
+/// shape from the same fields, and so the one thing it must never carry — an
+/// Event, which is somebody's alert text — has nowhere to come from.
+fn lost(offered: &Offered) -> Uncollected {
+    Uncollected {
+        delivery: offered.delivery().as_str().to_owned(),
+        tenant: offered.tenant().as_str().to_owned(),
+        origin: offered.origin().as_str().to_owned(),
+        trace: offered.correlation().trace().to_owned(),
+        accepted_at: offered.accepted_at(),
     }
 }
 

@@ -7,7 +7,8 @@
 //! than one crate holding two tables.
 
 use application::ports::{
-    Claimed, Discharged, Handover, Offered, Report, RoomOutcome, StorageUnavailable, TenantId,
+    Behind, Claimed, Discharged, Handover, Offered, Report, RoomOutcome, StorageUnavailable, Swept,
+    TenantId, Uncollected,
 };
 use async_trait::async_trait;
 use domain::{Correlation, DeliveryId, OriginId, Timestamp};
@@ -240,6 +241,93 @@ impl Handover for PostgresHandover {
         } else {
             Ok(Discharged::Settled)
         }
+    }
+
+    async fn sweep(&self, accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {
+        // ONE STATEMENT, and `RETURNING` is what makes this a reportable loss
+        // rather than a silent one: the rows come back as they are deleted, so
+        // there is no window in which something has gone and nothing knows
+        // what. A `DELETE` followed by a `SELECT` would have that window, and
+        // a `SELECT` followed by a `DELETE` would report rows it then failed
+        // to remove.
+        //
+        // The uncollected rows and the settled ones go in the same pass
+        // because they are the same rule — kept for a month from acceptance —
+        // and separating them would invite the two periods to drift apart.
+        let rows = sqlx::query(
+            "DELETE FROM handover \
+             WHERE accepted_at < to_timestamp($1::BIGINT / 1000.0) \
+             RETURNING delivery, tenant, origin, trace, \
+                       (EXTRACT(EPOCH FROM accepted_at) * 1000)::BIGINT AS accepted_at_ms, \
+                       reported_at IS NULL AS uncollected",
+        )
+        .bind(accepted_before.millis_since_epoch())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| StorageUnavailable)?;
+
+        let mut swept = Swept::default();
+        for row in &rows {
+            // Read as text, and that is the port's decision rather than
+            // laziness: a sweep that could fail to parse a row it is deleting
+            // would stop working on exactly the row most worth reporting.
+            let uncollected: bool = row.try_get("uncollected").map_err(|_| StorageUnavailable)?;
+            if !uncollected {
+                swept.settled += 1;
+                continue;
+            }
+            swept.uncollected.push(Uncollected {
+                delivery: row.try_get("delivery").map_err(|_| StorageUnavailable)?,
+                tenant: row.try_get("tenant").map_err(|_| StorageUnavailable)?,
+                origin: row.try_get("origin").map_err(|_| StorageUnavailable)?,
+                trace: row.try_get("trace").map_err(|_| StorageUnavailable)?,
+                accepted_at: Timestamp::from_millis_since_epoch(
+                    row.try_get("accepted_at_ms")
+                        .map_err(|_| StorageUnavailable)?,
+                ),
+            });
+        }
+
+        Ok(swept)
+    }
+
+    async fn behind(&self, accepted_before: Timestamp) -> Result<Vec<Behind>, StorageUnavailable> {
+        // Grouped in the database rather than by reading rows and counting
+        // here: the whole point of this query is the case where there are a lot
+        // of rows, and a version that fetched them would be heaviest exactly
+        // when the system is worst.
+        //
+        // No tenant filter, and this is the one query here that has none —
+        // deliberately. It answers nothing to a caller: the composition root
+        // asks it on an interval to write a log line and move a gauge, and a
+        // tenant's agent never reaches it. Scoping it would mean asking once
+        // per configured tenant to learn the same thing.
+        let rows = sqlx::query(
+            "SELECT tenant, COUNT(*) AS outstanding, \
+                    (EXTRACT(EPOCH FROM MIN(accepted_at)) * 1000)::BIGINT AS oldest_ms \
+             FROM handover \
+             WHERE reported_at IS NULL \
+               AND accepted_at < to_timestamp($1::BIGINT / 1000.0) \
+             GROUP BY tenant \
+             ORDER BY tenant",
+        )
+        .bind(accepted_before.millis_since_epoch())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| StorageUnavailable)?;
+
+        rows.iter()
+            .map(|row| {
+                let outstanding: i64 =
+                    row.try_get("outstanding").map_err(|_| StorageUnavailable)?;
+                let oldest: i64 = row.try_get("oldest_ms").map_err(|_| StorageUnavailable)?;
+                Ok(Behind {
+                    tenant: row.try_get("tenant").map_err(|_| StorageUnavailable)?,
+                    outstanding: usize::try_from(outstanding).unwrap_or(usize::MAX),
+                    oldest: Timestamp::from_millis_since_epoch(oldest),
+                })
+            })
+            .collect()
     }
 }
 
@@ -739,5 +827,150 @@ mod tests {
                 .expect("asked");
         assert_eq!(said["outcome"], "routed_to_nothing");
         assert!(said.get("rooms").is_none(), "{said}");
+    }
+
+    #[tokio::test]
+    async fn retention_deletes_a_settled_row_quietly_and_an_uncollected_one_loudly() {
+        // THE DISTINCTION THE WHOLE SWEEP TURNS ON, and the reason this bead
+        // departed from gc-mnn's "never delete a row still waiting, however
+        // old". A settled row's obligation was discharged before retention
+        // reached it, so its deletion is nothing. An uncollected one is a loss,
+        // and it comes back so somebody can be told — otherwise the one-month
+        // sweep is a quiet shredder (gc-g9x).
+        let store = handover().await;
+        for (id, when) in [("settled", 1), ("never-collected", 2), ("recent", 3)] {
+            store
+                .offer(&offered(id, "wallet-lab-prod", when, vec![a_push(id)]))
+                .await
+                .expect("stored");
+        }
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &DeliveryId::new("settled").expect("an identity"),
+                &Report::RoutedToNothing,
+                at(2),
+            )
+            .await
+            .expect("reported");
+
+        // A cutoff that catches the first two and leaves the third.
+        let swept = store.sweep(at(3)).await.expect("swept");
+
+        assert_eq!(swept.settled, 1, "the discharged row was not deleted");
+        assert_eq!(
+            swept.uncollected.len(),
+            1,
+            "an uncollected row was deleted without being reported: {swept:?}"
+        );
+        let lost = &swept.uncollected[0];
+        assert_eq!(lost.delivery, "never-collected");
+        assert_eq!(lost.tenant, "wallet-lab-prod");
+        assert_eq!(lost.origin, "alertmanager");
+        // The chain, so the loss can be followed back to the sender's own log —
+        // which with no read API is the only way to learn what was in it.
+        assert_eq!(lost.trace, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(lost.accepted_at, at(2));
+
+        // And the row that was not old enough is still there and still owed,
+        // which is the positive oracle: this did not pass by deleting
+        // everything.
+        assert_eq!(
+            store
+                .outstanding(&tenant("wallet-lab-prod"), 10)
+                .await
+                .expect("asked")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_finds_nothing_old_enough_deletes_nothing() {
+        let store = handover().await;
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 10, vec![a_push("x")]))
+            .await
+            .expect("stored");
+
+        let swept = store.sweep(at(5)).await.expect("swept");
+
+        assert_eq!(swept.settled, 0);
+        assert!(swept.uncollected.is_empty());
+        assert_eq!(
+            store
+                .outstanding(&tenant("wallet-lab-prod"), 10)
+                .await
+                .expect("asked")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backlog_is_reported_per_tenant_with_its_oldest() {
+        // The count alone cannot distinguish a busy tenant from a stopped one,
+        // so the oldest acceptance comes with it — that is the number an
+        // operator acts on.
+        let store = handover().await;
+        for (id, whose, when) in [
+            ("d-1", "wallet-lab-prod", 1),
+            ("d-2", "wallet-lab-prod", 2),
+            ("d-3", "wallet-hsm-prod", 3),
+            // Reported, so it is not a backlog however old it is.
+            ("d-4", "wallet-lab-prod", 1),
+            // Too recent to count.
+            ("d-5", "wallet-lab-prod", 99),
+        ] {
+            store
+                .offer(&offered(id, whose, when, vec![a_push(id)]))
+                .await
+                .expect("stored");
+        }
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &DeliveryId::new("d-4").expect("an identity"),
+                &Report::RoutedToNothing,
+                at(5),
+            )
+            .await
+            .expect("reported");
+
+        let behind = store.behind(at(50)).await.expect("asked");
+
+        assert_eq!(behind.len(), 2, "{behind:?}");
+        assert_eq!(behind[0].tenant, "wallet-hsm-prod");
+        assert_eq!(behind[0].outstanding, 1);
+        assert_eq!(behind[0].oldest, at(3));
+        assert_eq!(behind[1].tenant, "wallet-lab-prod");
+        assert_eq!(
+            behind[1].outstanding, 2,
+            "a reported Delivery was counted as a backlog"
+        );
+        assert_eq!(behind[1].oldest, at(1));
+    }
+
+    #[tokio::test]
+    async fn a_tenant_that_is_keeping_up_does_not_appear_in_a_backlog() {
+        // The answer is the exception list, not a row per tenant: what an
+        // operator needs is the short list of names worth asking about, and a
+        // line per healthy tenant every interval is how a log becomes unread.
+        let store = handover().await;
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1, vec![a_push("x")]))
+            .await
+            .expect("stored");
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &DeliveryId::new("d-1").expect("an identity"),
+                &Report::RoutedToNothing,
+                at(2),
+            )
+            .await
+            .expect("reported");
+
+        assert!(store.behind(at(50)).await.expect("asked").is_empty());
     }
 }

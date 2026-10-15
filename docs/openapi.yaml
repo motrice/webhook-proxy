@@ -24,6 +24,14 @@ info:
     independently. Do not treat a `202` as proof a human saw anything, and do
     not retry on it.
 
+    **That promise is being weakened, and this says so before it changes.** A
+    stored delivery is attempted by this service today, and is also offered to
+    the team the sender belongs to, whose own agent delivers it by that team's
+    rules. The second is replacing the first, after which a `202` means *stored,
+    and offered to that team* — weaker, and more honest: a team whose agent is
+    broken leaves alerts sitting where this service would previously have tried
+    and reported a loss. See `x-limitations` for what that costs a sender.
+
     **Each sender defines how it proves itself, and this interface accommodates
     both.** GitHub signs the body; Alertmanager and Grafana send a token. The
     mechanism is read from configuration per Origin and never chosen by looking
@@ -66,6 +74,11 @@ info:
       promised to a sender. The proxy refuses with 503 rather than accepting
       what it cannot promise to keep, so an outage of its store is visible as a
       refusal and never as a quiet loss.
+
+      A team whose own delivery agent has stopped is NOT an outage of this
+      service and a sender sees nothing of it: the alerts are stored, offered,
+      counted and logged, and dropped after a month. That is the one failure
+      this interface cannot report to the sender who caused it.
     responseTime: |
       A 202 is answered as soon as the request is verified and the delivery
       written down, before any room is reached. Reaching a room is not on the
@@ -84,6 +97,10 @@ info:
 
     - Delivery is attempted a bounded number of times. A room unreachable for
       long enough loses that message, and the loss is logged and counted.
+    - An alert nobody ever collects is kept for one month from acceptance and
+      then dropped. The deletion is logged and counted as a loss rather than
+      happening quietly, but no response ever told the sender about it, and
+      "accepted" has never meant "kept indefinitely".
     - Repeats are possible. A room can see the same message twice, when a
       request succeeded but its response was lost. Nothing downstream should
       assume exactly-once.

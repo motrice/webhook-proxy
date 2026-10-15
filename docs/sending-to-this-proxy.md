@@ -78,14 +78,37 @@ that says anything else — or says nothing — is refused with `415` rather tha
 payload to fix. A charset parameter is fine; `application/json; charset=utf-8`
 is the same media type.
 
-What `202` does promise is that the delivery is written down and will be
-attempted until it succeeds or is abandoned — and written down means in a
-database, so a restart of the proxy does not lose it. You do not have to ask
-which storage you are talking to: a deployment without its database refuses to
-start, so a proxy that answered you at all is one that keeps what it accepted.
-That is also why there is a second way to get a `503`. Rather than accept
-something it cannot promise to keep, the proxy refuses everything while the
-store is unreachable — a loud refusal instead of a quiet downgrade.
+What `202` does promise is that the delivery is **written down**, and written
+down means in a database — so a restart of the proxy does not lose it. You do
+not have to ask which storage you are talking to: a deployment without its
+database refuses to start, so a proxy that answered you at all is one that keeps
+what it accepted. That is also why there is a second way to get a `503`. Rather
+than accept something it cannot promise to keep, the proxy refuses everything
+while the store is unreachable — a loud refusal instead of a quiet downgrade.
+
+### What happens after it is written down, and a change to this promise
+
+Two things happen to a stored delivery today, and one of them is going away.
+
+- **This proxy attempts each matching room itself**, retrying until it succeeds
+  or the attempt budget runs out. That is the promise this document has carried
+  so far.
+- **It is also offered to the team the sender belongs to**, whose own agent
+  delivers it to that team's rooms by that team's own rules. Each sender is
+  registered as belonging to exactly one team.
+
+The second is replacing the first. When it does, `202` will mean **stored, and
+offered to the team whose sender you are** — which is *weaker* than what this
+document used to promise, and the weaker statement is the honest one: a team
+whose agent is broken leaves alerts sitting where this proxy would previously
+have tried, and reported a loss. It is written here now rather than when it
+changes, because a sender reading the old promise would be misled about who is
+responsible for an alert that never arrives.
+
+Nothing about what you send or how you send it changes. **One thing worth
+knowing even so:** an alert nobody ever collects is kept for a month and then
+dropped, logged and counted as the loss it is — so "accepted" has never meant
+"kept indefinitely", and now it says so.
 
 So: do not treat `202` as proof a human saw anything, and do not retry on it.
 
@@ -126,6 +149,10 @@ different answers in the same line.
   message twice — when a request succeeded but its response was lost. Do not
   build anything that assumes exactly-once.
 - **Order is not promised.** Two notifications can reach one room out of order.
+- **An alert nobody collects is eventually dropped.** Retention is one month
+  from the moment you were answered. A delivery still owed when it expires is
+  deleted, and that deletion is logged and counted as a loss rather than
+  happening quietly — but it is a loss, and no `5xx` ever told you about it.
 
 Every loss is logged with the delivery's identity, the room's identity and the
 reason, and counted. If you need to know whether something arrived, that log is

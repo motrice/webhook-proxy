@@ -421,9 +421,9 @@ mod tests {
 
     use super::{Refused, Relay, Retry};
     use crate::ports::{
-        Attempt, Claimed, Clock, Discharged, DispatchFailed, Dispatcher, Handover, Ids,
+        Attempt, Behind, Claimed, Clock, Discharged, DispatchFailed, Dispatcher, Handover, Ids,
         MalformedProof, Offered, Outbox, Outcome, Proofs, Recorded, Report, SecretUnavailable,
-        StorageUnavailable, TenantId, Translator, Untranslatable,
+        StorageUnavailable, Swept, TenantId, Translator, Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
@@ -638,6 +638,17 @@ mod tests {
             _at: Timestamp,
         ) -> Result<Discharged, StorageUnavailable> {
             unreachable!("the relay never reports")
+        }
+
+        async fn sweep(&self, _accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {
+            unreachable!("the relay never sweeps")
+        }
+
+        async fn behind(
+            &self,
+            _accepted_before: Timestamp,
+        ) -> Result<Vec<Behind>, StorageUnavailable> {
+            unreachable!("the relay never asks after a backlog")
         }
     }
 

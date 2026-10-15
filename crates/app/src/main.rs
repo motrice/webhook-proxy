@@ -16,7 +16,7 @@ use alertmanager_payload::AlertmanagerPayload;
 mod collecting;
 
 use application::ports::{Dispatcher, Handover, Outbox, Proofs, Translator};
-use application::{Counts, Replay, Retries, Retry, Tally};
+use application::{Backlog, Counts, Replay, Retention, Retries, Retry, Tally};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
 use element_notices::ElementNotices;
@@ -408,6 +408,109 @@ fn sweeping(
     })
 }
 
+/// How long a Delivery nobody collected is kept.
+///
+/// One month, by bead gc-mnn. Measured from acceptance, which is the age a
+/// reader means when they ask how old something is.
+///
+/// Not configurable, deliberately. It is a retention decision about other
+/// people's alert text — a summary, labels, a permalink into monitoring — and
+/// an environment variable would let a deployment quietly choose "forever",
+/// which gc-mnn rejected precisely because it is what happens when nobody
+/// decides.
+const KEEP_FOR: Duration = Duration::from_hours(30 * 24);
+
+/// How long a Delivery may sit uncollected before it is worth saying so.
+///
+/// A day: long enough that a tenant's agent being restarted, or a weekend
+/// deployment freeze, is not an incident; short enough that a stopped agent is
+/// noticed twenty-nine days before its alerts start being dropped.
+const REPORT_BEHIND_AFTER: Duration = Duration::from_hours(24);
+
+/// How often retention runs.
+///
+/// Its own interval rather than the outbox sweep's, which is five seconds: the
+/// questions here are about days and a month, and asking them every five
+/// seconds would mean a `GROUP BY` over every outstanding row twelve times a
+/// minute for an answer that cannot have changed.
+///
+/// A task in this process rather than a cron job, which is bead gc-mnn's
+/// reasoning: a second thing the deployment already does cannot drift out of
+/// the deployment, and a job nobody owns eventually belongs to nobody.
+const REAP_EVERY: Duration = Duration::from_mins(15);
+
+/// Retention, and the only report anybody gets that a tenant has stopped.
+///
+/// A task rather than part of serving, like the outbox sweep: nothing waits on
+/// it. What it writes is the deliverable, not a side effect — bead gc-g9x
+/// deferred the read API on the explicit promise that an operator could still
+/// learn an agent had stopped, and this is where that promise is kept or not.
+fn reaping(
+    handover: Arc<dyn Handover>,
+    backlog: Arc<Backlog>,
+    every: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let clock = SystemClock;
+        let retention = Retention::new(handover.as_ref(), &clock, KEEP_FOR, REPORT_BEHIND_AFTER);
+        loop {
+            match retention.once().await {
+                Ok(reaped) if !reaped.quiet() => {
+                    // ONE LINE PER DROPPED DELIVERY, not a count. This is the
+                    // third kind of loss gc-g9x enumerated, and the one nothing
+                    // else can see: a room that gave up is counted against that
+                    // room, and an alert no tenant ever collected has no room
+                    // to count against. A summary line would make it a number
+                    // with nothing to trace back to the push that caused it.
+                    //
+                    // The trace is what makes it traceable (gc-4oo.5); the
+                    // Events are deliberately not here, because an alert's
+                    // summary and labels are other people's words.
+                    for lost in &reaped.uncollected {
+                        tracing::error!(
+                            delivery = %lost.delivery,
+                            tenant = %lost.tenant,
+                            origin = %lost.origin,
+                            trace = %lost.trace,
+                            accepted_at_ms = lost.accepted_at.millis_since_epoch(),
+                            "dropped an alert its tenant never collected: retention \
+                             reached it first"
+                        );
+                    }
+                    backlog.dropped(reaped.uncollected.len());
+
+                    // One line per tenant that is behind, at warn rather than
+                    // error: it is not yet a loss, which is the distinction the
+                    // whole job rests on. Nothing is logged for a tenant that
+                    // is keeping up, so this stays readable.
+                    for tenant in &reaped.behind {
+                        tracing::warn!(
+                            tenant = %tenant.tenant,
+                            outstanding = tenant.outstanding,
+                            oldest_at_ms = tenant.oldest.millis_since_epoch(),
+                            "a tenant has not collected its alerts"
+                        );
+                    }
+                    backlog.found(&reaped.behind);
+
+                    if reaped.settled > 0 {
+                        tracing::info!(
+                            settled = reaped.settled,
+                            "retention removed settled deliveries"
+                        );
+                    }
+                }
+                // A quiet pass still has to clear the gauges: a tenant that
+                // caught up must stop being reported, or its worst number
+                // stands forever and somebody eventually acts on it.
+                Ok(_) => backlog.found(&[]),
+                Err(why) => tracing::error!(%why, "cannot apply retention"),
+            }
+            tokio::time::sleep(every).await;
+        }
+    })
+}
+
 /// The counters, in the format Prometheus scrapes.
 ///
 /// Beside `/health` and for the same reason: both answer a machine that reaches
@@ -420,7 +523,7 @@ fn sweeping(
 /// monitoring system polling every fifteen seconds would otherwise become load
 /// on the thing it is monitoring, and would go quiet exactly when the database
 /// is in trouble — which is when somebody is looking.
-fn exported(tally: &Tally) -> String {
+fn exported(tally: &Tally, backlog: &Backlog) -> String {
     let mut out = String::new();
 
     for (name, help, pick) in [
@@ -450,6 +553,57 @@ fn exported(tally: &Tally) -> String {
                 pick(counts)
             )
             .expect("writing to a String cannot fail");
+        }
+    }
+
+    // The tenant side. Keyed by tenant rather than by room, because an alert no
+    // agent collected never reached a room and has none to be counted against —
+    // which is exactly why bead gc-g9x called it a third kind of loss.
+    //
+    // Nothing here is a room name, an address or a secret: a tenant is a
+    // namespace, and the numbers are a count and a moment.
+    writeln!(
+        out,
+        "# HELP webhook_proxy_uncollected_dropped_total Alerts deleted by retention \
+         that no tenant ever collected. These are losses."
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "# TYPE webhook_proxy_uncollected_dropped_total counter"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "webhook_proxy_uncollected_dropped_total {}",
+        backlog.losses()
+    )
+    .expect("writing to a String cannot fail");
+
+    for (name, help, kind) in [
+        (
+            "webhook_proxy_outstanding_deliveries",
+            "Deliveries a tenant has not collected, older than the reporting \
+             threshold. A tenant keeping up does not appear.",
+            "gauge",
+        ),
+        (
+            "webhook_proxy_outstanding_oldest_ms",
+            "When the oldest uncollected Delivery for this tenant was accepted. \
+             A count alone cannot tell a busy tenant from a stopped one.",
+            "gauge",
+        ),
+    ] {
+        writeln!(out, "# HELP {name} {help}").expect("writing to a String cannot fail");
+        writeln!(out, "# TYPE {name} {kind}").expect("writing to a String cannot fail");
+        for (tenant, outstanding) in backlog.all() {
+            let value = if name.ends_with("_ms") {
+                outstanding.oldest.millis_since_epoch()
+            } else {
+                i64::try_from(outstanding.owed).unwrap_or(i64::MAX)
+            };
+            writeln!(out, "{name}{{tenant=\"{}\"}} {value}", escaped(&tenant))
+                .expect("writing to a String cannot fail");
         }
     }
 
@@ -740,7 +894,15 @@ async fn run() -> Result<(), Unstartable> {
         routing.tenants().clone(),
     );
 
+    // One backlog, shared: the retention task writes it and the scrape reads it.
+    // A scrape must never touch the store (see `exported`), so what /metrics
+    // says about a tenant is as fresh as the last pass and no fresher — which is
+    // the right trade for a number measured in days.
+    let backlog = Arc::new(Backlog::new());
+    let reaped = reaping(Arc::clone(&handover), Arc::clone(&backlog), REAP_EVERY);
+
     let scraped = Arc::clone(&tally);
+    let counted = Arc::clone(&backlog);
     let app = router(inbound, config.max_body)
         .merge(collecting::routes(collecting))
         .route("/health", get(health))
@@ -749,7 +911,8 @@ async fn run() -> Result<(), Unstartable> {
             "/metrics",
             get(move || {
                 let scraped = Arc::clone(&scraped);
-                async move { exported(&scraped) }
+                let counted = Arc::clone(&counted);
+                async move { exported(&scraped, &counted) }
             }),
         );
 
@@ -780,6 +943,12 @@ async fn run() -> Result<(), Unstartable> {
     // waiting, silently and uncounted; that is why gc-vfz made every deployment
     // name a database rather than leaving the sentence above to be wishful.
     retrying.abort();
+
+    // Stopped the same way, and nothing is lost by it: retention is a month, so
+    // a pass that does not happen because the process is shutting down happens
+    // on the next start instead. Nothing waits on this and nothing is half
+    // done — a sweep deletes and reports in one statement.
+    reaped.abort();
 
     Ok(())
 }

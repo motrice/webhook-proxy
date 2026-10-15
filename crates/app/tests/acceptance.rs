@@ -1489,6 +1489,27 @@ async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped()
 
     assert!(scraped.contains("# TYPE webhook_proxy_dispatches_delivered_total counter"));
     assert!(!scraped.contains("destination="), "{scraped}");
+
+    // The tenant side, which exists for the one loss nothing else can see: an
+    // alert no agent ever collected reached no room, so it has none to be
+    // counted against (bead gc-g9x). Present at zero rather than absent, for
+    // the same reason as the lines above — a scraper must not have to tell "no
+    // data" from "no endpoint", and an alerting rule on a counter that does not
+    // exist yet never fires.
+    assert!(
+        scraped.contains("webhook_proxy_uncollected_dropped_total 0"),
+        "{scraped}"
+    );
+    assert!(
+        scraped.contains("# TYPE webhook_proxy_outstanding_deliveries gauge"),
+        "{scraped}"
+    );
+    assert!(
+        scraped.contains("# TYPE webhook_proxy_outstanding_oldest_ms gauge"),
+        "{scraped}"
+    );
+    // And no tenant is behind on a fresh pod, so the gauges carry no series.
+    assert!(!scraped.contains("tenant="), "{scraped}");
 }
 
 #[tokio::test]

@@ -11,15 +11,19 @@
 //!
 //! Tests here use in-memory fakes of the ports, not mocks of a database.
 
+mod backlog;
 mod collect;
 pub mod ports;
 mod relay;
 mod replay;
+mod retention;
 mod retries;
 mod tally;
 
+pub use backlog::{Backlog, Outstanding};
 pub use collect::{Collect, Refused as NotCollected};
 pub use relay::{Refused, Relay, Relayed, Retry};
 pub use replay::{Replay, Replayed, Unreplayable};
+pub use retention::{Reaped, Retention};
 pub use retries::{Attempted, Retries};
 pub use tally::{Counts, Tally};

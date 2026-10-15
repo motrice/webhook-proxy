@@ -775,6 +775,68 @@ pub enum Report {
     RoutedToNothing,
 }
 
+/// A Delivery retention deleted that no tenant ever collected.
+///
+/// A LOSS, and the whole reason this type exists rather than the sweep
+/// returning a number. Bead gc-g9x enumerated three kinds of loss and this is
+/// the third: without it the one-month sweep is a quiet shredder, and gc-vfz's
+/// argument was that an invisible loss is indistinguishable from a working
+/// system.
+///
+/// TEXT RATHER THAN DOMAIN VALUES, and the reason is the sweep's reliability
+/// rather than convenience. This is a report destined for a log, and a sweep
+/// that could fail to parse a row it is deleting would stop working on exactly
+/// the row most worth reporting — a tenant whose name this build no longer
+/// reads is precisely the case somebody needs told about.
+///
+/// NO EVENTS. What a loss report must name is what was lost and whose, never
+/// what it said: an Event carries an alert's summary and labels, which is other
+/// people's words and has no place in a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uncollected {
+    /// Which Delivery, so the loss can be traced to the request that made it.
+    pub delivery: String,
+    /// Whose it was. The tenant whose agent never came for it.
+    pub tenant: String,
+    /// Who sent it, as a name.
+    pub origin: String,
+    /// The chain it arrived on, so a reader can follow it back to the sender's
+    /// own log — which with no read API is the only way to learn what was in it.
+    pub trace: String,
+    /// When the sender was told it had been accepted.
+    pub accepted_at: Timestamp,
+}
+
+/// What one pass of retention removed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Swept {
+    /// Rows whose tenant had reported them. Not losses: the obligation was
+    /// discharged before retention reached them.
+    pub settled: usize,
+    /// Rows no tenant ever collected. Every one of these is a loss.
+    pub uncollected: Vec<Uncollected>,
+}
+
+/// A tenant that has stopped keeping up, and by how much.
+///
+/// THE ONLY WAY ANYBODY LEARNS AN AGENT HAS STOPPED, in a version with no read
+/// API. Bead gc-g9x refused to let the platform invent "abandoned on the
+/// tenant's behalf" — it keeps offering — so what it owes instead is this: a
+/// count and an age, logged and exported, for a tenant whose work is piling up.
+///
+/// Text for the tenant, for the reason [`Uncollected`] gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Behind {
+    /// Whose backlog this is.
+    pub tenant: String,
+    /// How many Deliveries are outstanding and older than the threshold asked
+    /// about.
+    pub outstanding: usize,
+    /// The oldest one's acceptance, which is the number an operator acts on: a
+    /// count alone cannot distinguish a busy tenant from a stopped one.
+    pub oldest: Timestamp,
+}
+
 /// Whether a report discharged anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Discharged {
@@ -866,6 +928,48 @@ pub trait Handover: Send + Sync {
         report: &Report,
         at: Timestamp,
     ) -> Result<Discharged, StorageUnavailable>;
+
+    /// Removes everything accepted before `accepted_before`, and says what was
+    /// lost doing it.
+    ///
+    /// UNCOLLECTED ROWS GO TOO, which departs from bead gc-mnn's "never delete
+    /// a row still waiting, however old" — and the departure is deliberate,
+    /// recorded on both beads. That rule was written about the [`Outbox`],
+    /// where a waiting row is an attempt *this service* still owes and will
+    /// make, so deleting it discharges an obligation silently. A row here is
+    /// owed by a tenant that may never return, and keeping it forever
+    /// reintroduces exactly the unbounded retention of other people's alert
+    /// text gc-mnn rejected — through a side door, for the rows most likely to
+    /// pile up. So it is deleted, and bead gc-g9x's requirement does the work
+    /// gc-mnn's was reaching for: every such deletion is reported here so the
+    /// caller can log and count it as the loss it is.
+    ///
+    /// Nothing is deleted on the caller's behalf quietly: an implementation
+    /// that returned a count instead of the rows would make this a shredder
+    /// with a number attached.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked. Nothing was
+    /// deleted in that case — the caller tries again on the next pass rather
+    /// than having to reconcile a half-finished sweep.
+    async fn sweep(&self, accepted_before: Timestamp) -> Result<Swept, StorageUnavailable>;
+
+    /// Which tenants have work outstanding from before `accepted_before`.
+    ///
+    /// Asked on an interval and never at scrape time: a monitoring system
+    /// polling every fifteen seconds would otherwise become load on the thing
+    /// it is monitoring, and would go quiet exactly when the database is in
+    /// trouble, which is when somebody is looking.
+    ///
+    /// A tenant that is keeping up does not appear. The answer is the exception
+    /// list, not a row per tenant, because what an operator needs is the short
+    /// list of names worth asking about.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked.
+    async fn behind(&self, accepted_before: Timestamp) -> Result<Vec<Behind>, StorageUnavailable>;
 
     /// What this tenant has not yet discharged, oldest first, at most `limit`.
     ///

@@ -140,8 +140,8 @@ mod tests {
 
     use super::{Collect, Refused};
     use crate::ports::{
-        Claimed, Clock, Discharged, Handover, Offered, Report, RoomOutcome, StorageUnavailable,
-        TenantId,
+        Behind, Claimed, Clock, Discharged, Handover, Offered, Report, RoomOutcome,
+        StorageUnavailable, Swept, TenantId,
     };
 
     fn at(millis: i64) -> Timestamp {
@@ -246,6 +246,19 @@ mod tests {
                 .into_iter()
                 .map(|offered| Claimed::new(offered, now.after(lease)))
                 .collect())
+        }
+
+        // Nothing in this file sweeps: what is kept and who is told about a
+        // backlog is `retention.rs`, and its own fake implements these.
+        async fn sweep(&self, _accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {
+            unreachable!("collecting never sweeps")
+        }
+
+        async fn behind(
+            &self,
+            _accepted_before: Timestamp,
+        ) -> Result<Vec<Behind>, StorageUnavailable> {
+            unreachable!("collecting never asks after a backlog")
         }
 
         async fn report(
