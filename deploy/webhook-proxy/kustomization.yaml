@@ -22,6 +22,7 @@ resources:
   - service.yaml
   - deployment.yaml
   - httproute.yaml
+  - networkpolicy.yaml
 
 configMapGenerator:
   # The published example itself, not a copy of it: one file, which the

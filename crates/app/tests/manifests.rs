@@ -24,6 +24,8 @@ use tokio::process::Command;
 const DEPLOYMENT: &str = include_str!("../../../deploy/webhook-proxy/deployment.yaml");
 const SERVICE: &str = include_str!("../../../deploy/webhook-proxy/service.yaml");
 const ROUTE: &str = include_str!("../../../deploy/webhook-proxy/httproute.yaml");
+const POLICY: &str = include_str!("../../../deploy/webhook-proxy/networkpolicy.yaml");
+const KUSTOMIZATION: &str = include_str!("../../../deploy/webhook-proxy/kustomization.yaml");
 const CONTAINERFILE: &str = include_str!("../../../deploy/Containerfile");
 const AGENT: &str = include_str!("../../../deploy/webhook-proxy/vault-agent.hcl");
 const ROUTING: &str = include_str!("../../../deploy/webhook-proxy/config.example.yaml");
@@ -431,6 +433,33 @@ fn the_port_is_the_same_number_everywhere_it_appears() {
         Some(listen),
         "the Service forwards to a port nothing listens on"
     );
+
+    // The NetworkPolicy filters the pod's port, not the Service's, because it
+    // is evaluated after the Service has rewritten the destination. Here the
+    // two numbers are equal, so naming the wrong one would pass — and would go
+    // on passing until somebody made them differ, by which time the policy
+    // would be denying the traffic it was written to allow.
+    let policy: Value = serde_yaml_ng::from_str(POLICY).expect("the NetworkPolicy parses");
+    let allowed = policy["spec"]["ingress"]
+        .as_sequence()
+        .expect("the policy allows something");
+    assert!(!allowed.is_empty(), "the policy allows nothing in");
+    for rule in allowed {
+        let ports = rule["ports"]
+            .as_sequence()
+            .expect("a rule names the ports it allows");
+        assert!(
+            !ports.is_empty(),
+            "a rule names no port, so it allows every port this pod ever opens"
+        );
+        for port in ports {
+            assert_eq!(
+                port["port"].as_u64(),
+                Some(listen),
+                "the policy allows a port nothing listens on"
+            );
+        }
+    }
 }
 
 #[test]
@@ -482,12 +511,36 @@ fn the_image_is_one_that_was_published_rather_than_built_here() {
     let container = container();
     let image = container["image"].as_str().expect("an image reference");
 
+    // Named by registry rather than by the one registry, because a cluster
+    // whose pods have no route to the internet has to pull this through its own
+    // mirror — the OpenShift estate pulls everything through Nexus (gc-hzn).
+    // "Published" is the property that matters, and what proves it is a
+    // registry host and a tag: a bare `webhook-proxy:dev` resolves to whatever
+    // happens to be in the node's image store, which is the second build path
+    // gc-kow exists to forbid.
+    // Split the digest off before the tag: a digest contains a colon of its
+    // own, so looking for the last colon in `repo@sha256:abc` finds the wrong
+    // one. Pinning by digest is better than pinning by tag and should not be
+    // the thing this test rejects.
+    let (repository, reference) = match image.split_once('@') {
+        Some((repository, digest)) => (repository, digest),
+        None => image
+            .rsplit_once(':')
+            .expect("an image with a tag or a digest"),
+    };
     assert!(
-        image.starts_with("ghcr.io/motrice/webhook-proxy:"),
-        "{image} is not the published image"
+        repository
+            .split('/')
+            .next()
+            .is_some_and(|host| host.contains('.') || host.contains(':')),
+        "{image} names no registry, so it resolves to whatever the node already has"
     );
     assert!(
-        !image.ends_with(":latest"),
+        repository.ends_with("/webhook-proxy"),
+        "{image} is not this product, whatever else it is"
+    );
+    assert!(
+        !reference.is_empty() && reference != "latest",
         "{image} names no particular build, so a rollback has nothing to roll back to"
     );
 }
@@ -623,6 +676,12 @@ fn every_rendered_secret_is_readable_by_the_group_the_proxy_runs_as() {
     // nobody, and the symptom is a pod reporting a secret as absent for a file
     // that is present and unreadable — which this deployment has already paid
     // for once, on the Secret that preceded this (gc-d01).
+    //
+    // This now carries weight `fsGroup: 65532` used to. With no pod-level ids
+    // (see deployment.yaml), what the two containers are guaranteed to share is
+    // the group, not the uid: a cluster that assigns a uid per namespace still
+    // runs both with the same primary group. Group-read is therefore the
+    // mechanism and not a belt-and-braces second one.
     let granting: Vec<&str> = AGENT
         .lines()
         .filter_map(|line| line.trim().strip_prefix("perms"))
@@ -711,5 +770,86 @@ fn something_in_the_pod_actually_fills_the_directory_the_proxy_waits_on() {
         filling.len(),
         1,
         "exactly one container should write the secrets the proxy reads, found {filling:?}"
+    );
+}
+
+#[test]
+fn no_user_or_group_id_is_hardcoded_so_a_cluster_that_assigns_one_can() {
+    // This manifest named 65532 three times and was right to, on a cluster that
+    // lets a workload choose. OpenShift's `restricted-v2` does not: it assigns
+    // a uid from the namespace's `openshift.io/sa.scc.uid-range` and refuses a
+    // pod that names its own, and it range-checks `fsGroup` the same way. The
+    // platform has the receipt for a chart that hardcoded 10001.
+    //
+    // Written as "none of these keys appear" rather than "the uid is not
+    // 65532", because a different number would fail in exactly the same way and
+    // for the same reason. Bead gc-hzn.
+    let manifest: Value = serde_yaml_ng::from_str(DEPLOYMENT).expect("the Deployment parses");
+    let pod = &manifest["spec"]["template"]["spec"]["securityContext"];
+
+    for assigned in ["runAsUser", "runAsGroup", "fsGroup", "supplementalGroups"] {
+        assert!(
+            pod[assigned].is_null(),
+            "the pod names its own {assigned}, which a cluster that assigns ids will refuse"
+        );
+    }
+    for (name, container) in containers() {
+        for assigned in ["runAsUser", "runAsGroup"] {
+            assert!(
+                container["securityContext"][assigned].is_null(),
+                "{name} names its own {assigned}, which a cluster that assigns ids will refuse"
+            );
+        }
+    }
+
+    // And the part that must survive the removal: not naming a uid is not the
+    // same as accepting root. `runAsNonRoot` says the only thing this workload
+    // actually needs to say about who it runs as.
+    assert_eq!(
+        pod["runAsNonRoot"].as_bool(),
+        Some(true),
+        "nothing requires a non-root uid any more, so an image defaulting to root would run as root"
+    );
+}
+
+#[test]
+fn every_manifest_in_the_directory_is_one_the_kustomization_applies() {
+    // A manifest that is written, reviewed, committed and never applied. The
+    // NetworkPolicy this bead added would have been exactly that if the
+    // kustomization had not been edited too, and nothing would have said so:
+    // `kubectl apply -k` would succeed, the pod would come up, and on a cluster
+    // with default-deny it would be unreachable for the original reason.
+    let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/webhook-proxy");
+    let applied: Vec<&str> = KUSTOMIZATION
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .map(str::trim)
+        .collect();
+
+    let mut unapplied: Vec<String> = Vec::new();
+    for entry in fs::read_dir(directory).expect("the deployment directory is readable") {
+        let path = entry.expect("a readable entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a named file")
+            .to_owned();
+        let yaml = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("yaml"));
+        if !yaml || name == "kustomization.yaml" {
+            continue;
+        }
+        // A file named anywhere in the kustomization counts: a generator names
+        // its input as `config.yaml=config.example.yaml`, which is applied just
+        // as much as a resource is, only not as one.
+        if !applied.iter().any(|line| line.contains(&name)) {
+            unapplied.push(name);
+        }
+    }
+
+    assert!(
+        unapplied.is_empty(),
+        "{unapplied:?} will never be applied: nothing in kustomization.yaml names them"
     );
 }

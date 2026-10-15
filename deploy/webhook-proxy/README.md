@@ -1,7 +1,11 @@
-# Running the proxy on k3s
+# Running the proxy
 
-The manifests for the proxy itself: a Namespace, a Deployment, a Service and an
-HTTPRoute. Bead gc-d01.
+The manifests for the proxy itself: a Namespace, a Deployment, a Service, an
+HTTPRoute and a NetworkPolicy. Bead gc-d01, with gc-hzn for the parts that only
+matter on OpenShift.
+
+They are written for this k3s development cluster and say, below, what differs on
+the OpenShift platform they are headed for.
 
 What is deliberately **not** here: the image, the ConfigMap, and the Secret. Each
 is absent for its own reason, and each is the first thing someone looks for.
@@ -76,6 +80,8 @@ Everything marked `REPLACE` in `vault-agent.hcl` and `deployment.yaml`, which is
   that do not exist
 - `ghcr.io/motrice/webhook-proxy:main`, which should be pinned to a digest there;
   a moving tag cannot be rolled back to
+- the namespace selectors in `networkpolicy.yaml` — the Gateway's namespace, and
+  the scraper's if there is one
 
 The role binding that lets this service account read those secrets lives in the
 secret store, not here.
@@ -129,6 +135,37 @@ what it is waiting for (bead gc-6b7). That works under a plain sidecar, a native
 one, an injector, or a plainly mounted Secret, and leaves the choice to whoever
 owns the platform.
 
+## Who may reach the pods
+
+`networkpolicy.yaml` allows ingress from the Gateway's namespace, and from a
+metrics scraper's, on the **pod's** port. Nothing else.
+
+On a cluster with no default-deny it changes nothing you can observe, which is
+why it was missing until bead gc-hzn. On a cluster that denies ingress per
+namespace — every namespace in the OpenShift estate below has a
+`default-deny-ingress` — its absence is a pod that is Running, Ready, passing
+both probes and unreachable, with an empty log because no request ever arrived
+and a 503 from the Gateway as the only symptom.
+
+Two things to keep right when editing it:
+
+- **It names the pod's port, not the Service's.** The policy is evaluated after
+  the Service has rewritten the destination. Here both numbers are 8080, so
+  naming the wrong one would pass unnoticed until somebody made them differ.
+- **Its `podSelector` has to match the Deployment's own selector.** A policy
+  selecting no pod is accepted, reports nothing, and protects nothing.
+
+`manifests.rs` checks both, and checks that every manifest in this directory is
+one the kustomization applies — a policy committed and never applied fails in
+exactly the way the missing policy did.
+
+There is no `Egress` rule, deliberately. This pod reaches the secret store, the
+database and every chat room it posts into, and only the first two have an
+address this repository knows. An egress policy written from what is visible
+here would deny the rooms, and the loss would be reported as the destination
+refusing. Restricting egress means enumerating the rooms, which belongs where
+the rooms are configured.
+
 ## An HTTPRoute, not an Ingress
 
 gc-d01's acceptance criterion said Ingress. The target cluster has no Ingress
@@ -144,6 +181,59 @@ service.
 `webhook-proxy.dev.test` resolves only on the development machine. **Reaching
 this from a forge on the internet needs a real hostname and is the maintainer's
 step**, not something a manifest in this repository can provide.
+
+## Running it on OpenShift instead
+
+The platform these manifests are headed for is OpenShift, and four things that
+are correct on k3s are wrong there. Bead gc-hzn; two are fixed here and two
+cannot be, because they are facts about the cluster rather than about this
+workload.
+
+**Fixed: no uid, gid or `fsGroup` is named.** `restricted-v2` assigns a uid from
+the namespace's `openshift.io/sa.scc.uid-range` and *refuses* a pod that names
+its own; `fsGroup` is range-checked the same way. This manifest named 65532
+three times and was right to on a cluster that lets a workload choose. What is
+left is `runAsNonRoot: true` and `seccompProfile: RuntimeDefault`, which say the
+only thing this workload actually needs to say about who it runs as.
+
+`fsGroup` went for a second reason worth recording: it was added by gc-d01 so
+the proxy could read a Secret the kubelet mounted root-owned, and gc-ast.13
+replaced that Secret with the agent rendering into a tmpfs the pod owns. The fix
+had outlived its problem. What makes the rendered files readable now is
+`perms = "0440"` plus the two containers sharing a group — which is the group
+the platform assigns, not one named here.
+
+> **On a cluster that assigns no uid — plain Kubernetes, k3s, this development
+> cluster — the two containers fall back to their images' own `USER`, and if
+> those differ the proxy cannot read what the agent wrote.** There, set a
+> pod-level `runAsUser` and `fsGroup` to one value both containers share. The
+> distroless `nonroot` tag this image uses declares 65532.
+
+**Fixed: the image reference is checked for being published, not for being on
+GHCR.** Cluster pods have no general route to the internet, so the image has to
+come through the platform's own mirror. `manifests.rs` asks for a registry host
+and a tag or digest, which a mirrored path satisfies and a locally built
+`webhook-proxy:dev` does not.
+
+**Not fixed, and not fixable here: the Gateway and the hostname.**
+`httproute.yaml` attaches to `dev-local/default` with hostname
+`webhook-proxy.dev.test`. The estate runs its Gateways in `istio-ingress`, whose
+listeners select namespaces by label, and hostnames are
+`<product>.<namespace>.<scope>`-shaped under a wildcard certificate. A new
+namespace therefore needs *platform-side* work — a listener that selects it and
+a SAN on that certificate — before any route here attaches to anything. The
+GitOps copy of `httproute.yaml` names the real Gateway; this one cannot.
+
+**Not fixed: the namespace's own labels.** `namespace.yaml` carries
+`app.kubernetes.io/*` only. The estate's Gateway listeners select by label and
+its service mesh injects by `istio.io/rev`, so the namespace this is applied
+into needs whatever labels that platform requires — which are the platform's to
+state, and change without this repository hearing about it.
+
+A platform-owned database has its own requirements that are not ours either: a
+CloudNativePG `Cluster` in that estate needs
+`inheritedMetadata.annotations: sidecar.istio.io/inject: "false"`, an explicit
+storage class and resources set, or its backup Jobs never complete.
 
 ## Applying it
 
@@ -196,7 +286,11 @@ binary, and asserts the binary visibly obeys it:
 - the port is the same number in the environment, the `containerPort`, both
   probes and the Service
 - the configured paths are paths something is actually mounted at, read-only
-- the image is the published one and is not `:latest`
+- the port is also the only port the NetworkPolicy allows, and the policy
+  selects the pods the Deployment creates
+- the image names a registry and a particular build, and is not `:latest`
+- no uid, gid or `fsGroup` is hardcoded, while `runAsNonRoot` still holds
+- every manifest in this directory is one the kustomization applies
 - the route publishes `/webhook` and nothing else
 - the Containerfile still names the `runtime` stage that gc-lw3's release
   configuration will ask for

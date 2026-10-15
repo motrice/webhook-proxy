@@ -1,0 +1,72 @@
+# Who may reach these pods.
+#
+# On a cluster with no default-deny this changes nothing observable, which is
+# why it was missing: everything worked without it. On a cluster that denies
+# ingress per namespace — every namespace in the target OpenShift estate has a
+# `default-deny-ingress` — its absence is a pod that is Running, Ready, passing
+# both probes, and unreachable. Nothing reports that; the Gateway simply answers
+# 503 and the pod's logs are empty, because no request ever arrived. Bead gc-hzn.
+#
+# A NetworkPolicy is additive: it grants, and never denies. So the two rules
+# below are the whole list of what may talk to this workload, and anything that
+# needs to talk to it later has to be added here deliberately.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webhook-proxy
+  namespace: webhook-proxy
+  labels:
+    app.kubernetes.io/name: webhook-proxy
+spec:
+  # The same selector the Deployment's own `spec.selector` uses, and
+  # crates/app/tests/manifests.rs checks that it is: a policy whose selector
+  # matches no pod is accepted by the API server, reports nothing, and protects
+  # nothing.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: webhook-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    # The gateway in front of this, which is the only thing that should reach
+    # the webhook endpoint. TLS terminates there; see httproute.yaml.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # REPLACE: the namespace the Gateway's own data-plane pods run in.
+              # `default` is where this cluster's `dev-local` Gateway lives; the
+              # OpenShift estate runs its three Gateways in `istio-ingress`.
+              #
+              # By namespace rather than by pod label on purpose: the label a
+              # Gateway implementation puts on its data-plane pods is the
+              # implementation's business and changes with it, while the
+              # namespace is a deployment decision somebody made.
+              kubernetes.io/metadata.name: default
+      ports:
+        # THE POD'S PORT, NOT THE SERVICE'S. A NetworkPolicy is evaluated after
+        # the Service has already rewritten the destination, so a policy naming
+        # the Service port filters traffic that no longer exists. Here both
+        # numbers are 8080 — service.yaml keeps them equal deliberately — so the
+        # mistake would not show, which is exactly why this says which one it is.
+        - protocol: TCP
+          port: 8080
+    # The metrics scraper. Nothing scrapes /metrics today; this is here because
+    # under default-deny the first thing to try will fail by timing out against
+    # a Ready pod, and that failure is expensive to diagnose and cheap to
+    # prevent. A namespaceSelector naming a namespace that does not exist
+    # matches nothing and grants nothing, so on this cluster it is inert.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # REPLACE: the namespace the scraper runs in, if there is one.
+              kubernetes.io/metadata.name: openshift-monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+# No Egress rule, and that is a decision rather than an omission. This pod has
+# to reach the secret store, the database and every chat room it posts into, and
+# of those three only the first two have an address this repository knows. An
+# egress policy listing what it could see would deny the rooms, and a loss the
+# proxy reports as "the destination refused" would in fact be a policy here.
+# Whoever restricts egress has to enumerate the rooms, which means doing it
+# where the rooms are configured.

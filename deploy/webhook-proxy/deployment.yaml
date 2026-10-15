@@ -35,20 +35,29 @@ spec:
       # The identity the agent authenticates to the secret store with. It holds
       # no Kubernetes permissions; see serviceaccount.yaml.
       serviceAccountName: webhook-proxy
+      # NO runAsUser, runAsGroup OR fsGroup, and their absence is deliberate.
+      #
+      # OpenShift's `restricted-v2` assigns a uid from the namespace's
+      # `openshift.io/sa.scc.uid-range` and REJECTS a workload that names its
+      # own — the platform recorded exactly that failure for a chart hardcoding
+      # 10001. `fsGroup` is range-checked the same way. So a hardcoded id is not
+      # a second lock, it is a pod that never starts (bead gc-hzn).
+      #
+      # `fsGroup: 65532` was here because the proxy had to read a Secret the
+      # kubelet mounted root-owned (gc-d01). That Secret is gone: gc-ast.13
+      # replaced it with an agent rendering into a tmpfs the pod owns, so the
+      # fix outlived the problem it solved. Both containers share whatever uid
+      # the platform assigns, and the agent writes `0440`, so owner-read is
+      # enough.
+      #
+      # ON A CLUSTER THAT ASSIGNS NO UID — plain Kubernetes, k3s — the two
+      # containers fall back to their images' own `USER`, which may differ, and
+      # then the proxy cannot read what the agent wrote. There, set a pod-level
+      # `runAsUser` and `fsGroup` to one value both containers share. That is a
+      # property of the cluster, not of this workload, which is why it is
+      # documented rather than committed.
       securityContext:
         runAsNonRoot: true
-        # The uid distroless's `nonroot` tag provides; the image also declares it,
-        # so this is a second lock rather than the only one.
-        runAsUser: 65532
-        runAsGroup: 65532
-        # Group ownership of the mounted volumes, which is the only way the
-        # process can read a Secret it does not own. Without it the kubelet
-        # mounts those files root-owned, the mode below makes them readable by
-        # the owner alone, and the pod crash-loops with "no secret of that name
-        # is in /etc/webhook-proxy/secrets" — a message about absence for a file
-        # that is present and unreadable. Found by applying this to a real
-        # cluster, which is why gc-d01 insists on that.
-        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       # Required while the repository, and therefore the GHCR package, is

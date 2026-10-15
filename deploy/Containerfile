@@ -52,8 +52,12 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=build /usr/local/bin/webhook-proxy /usr/local/bin/webhook-proxy
 
-# 65532, the uid distroless's `nonroot` tag provides. Stated here as well so the
-# image refuses to run as root even where no Kubernetes securityContext applies.
+# 65532, the uid distroless's `nonroot` tag provides. Stated here, and this is
+# load-bearing rather than belt-and-braces: the Deployment names no uid, so a
+# cluster can assign one (gc-hzn), and where none is assigned this line is what
+# decides. It is also what lets `runAsNonRoot: true` be satisfied at all — the
+# kubelet reads the image's USER to check it, and an image declaring none makes
+# that pod refuse to start.
 USER 65532:65532
 
 # Nothing is baked in but the entrypoint. Where to listen, what to route and
