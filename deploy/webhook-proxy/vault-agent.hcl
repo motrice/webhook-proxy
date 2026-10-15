@@ -94,20 +94,9 @@ template {
 # Each room's URL is itself a credential: anyone holding it can post to that room
 # (bead gc-o61). That is why they are here and not in the routing file, which is
 # reviewed as a diff.
-template {
-  destination = "/vault/secrets/devsecops-room-url"
-  perms       = "0440"
-  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.devsecops_room_url }}{{ end }}"
-}
 
-template {
-  destination = "/vault/secrets/platform-room-url"
-  perms       = "0440"
-  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.platform_room_url }}{{ end }}"
-}
-
-template {
-  destination = "/vault/secrets/audit-room-url"
-  perms       = "0440"
-  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.audit_room_url }}{{ end }}"
-}
+# No room URLs here, and that is the split rather than an omission. This
+# deployment reaches no room: every alert is offered to its tenant, whose own
+# agent holds the URLs under secret/<tenant>/* and renders them beside itself
+# (beads gc-g9x, gc-72e.3.2). A room URL in this file would be a credential held
+# by a service with no use for it.

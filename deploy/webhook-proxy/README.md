@@ -166,6 +166,25 @@ here would deny the rooms, and the loss would be reported as the destination
 refusing. Restricting egress means enumerating the rooms, which belongs where
 the rooms are configured.
 
+## Before applying the cutover: drain the outbox
+
+**`0008_drop_dispatch.sql` drops a table, and it is irreversible.** Until bead
+`gc-72e.3.2` this service delivered to rooms itself, from a `dispatch` table.
+Anything still waiting there has been accepted from a sender and not yet
+delivered, and the migration drops it with no log line and no counter.
+
+That is free the first time, because nothing is deployed yet — `gc-lw3` has
+published no image and `gc-ugm` has proved no real push. **It will not be free
+the second time.** Before applying this to a deployment that has been running:
+
+1. Stop sending to it, or accept that what arrives next is offered to a tenant
+   rather than delivered here.
+2. Wait for the outbox to drain — `SELECT count(*) FROM dispatch WHERE outcome =
+   'waiting'` reaching zero — or decide deliberately that what is left is lost.
+3. Deploy the tenant agents, or the alerts are stored and offered to nobody.
+   They are counted and logged (`gc-wcw.3`), so this is visible rather than
+   silent, but it is still nobody being told.
+
 ## The hand-off to a tenant's agent needs a service mesh
 
 Two paths — `/deliveries/claim` and `/deliveries/{delivery}/report` — are a

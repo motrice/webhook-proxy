@@ -24,11 +24,62 @@ use domain::{
     Correlation, DeliveryId, Destination, DestinationId, Event, Subscription, destinations_for,
 };
 
-use crate::Retry;
 use crate::ports::{
     Acknowledged, Attempt, Clock, DispatchFailed, Dispatcher, Ids, Offers, Owed, Pause, Report,
     RoomOutcome, Unreachable,
 };
+
+/// How long to wait before trying a room again, and when to stop.
+///
+/// A POLICY, AND THE ONLY PART OF THE OLD RETRY MACHINERY THAT TRANSFERRED.
+/// `Retries` drove a loop over an `Outbox`: ask what is due, attempt it, hand
+/// the outcome back to be remembered. The agent has no store, so that loop is
+/// gone and this is not — which is what gc-g9x predicted when it said `Retries`
+/// does not transfer unchanged, and the clearest evidence this workspace has
+/// produced that the seam between a policy and the loop running it was drawn in
+/// the right place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    first: Duration,
+    ceiling: Duration,
+    attempts: u32,
+}
+
+impl Retry {
+    /// Wait `first` after the first failure, doubling up to `ceiling`, and give
+    /// up after `attempts` of them.
+    #[must_use]
+    pub const fn new(first: Duration, ceiling: Duration, attempts: u32) -> Self {
+        Self {
+            first,
+            ceiling,
+            attempts,
+        }
+    }
+
+    /// How long to wait after this many failures, or `None` to give up.
+    ///
+    /// Doubling, because a room that is down is usually down for longer than
+    /// the last wait; and capped, because a budget spent entirely on one very
+    /// long wait would mean a room that recovered in between is still not told.
+    #[must_use]
+    pub fn again_after(&self, failures: u32) -> Option<Duration> {
+        if failures >= self.attempts {
+            return None;
+        }
+        // failures is at least 1 here, so the first wait is `first` itself.
+        let doubling = self
+            .first
+            .saturating_mul(1_u32 << failures.saturating_sub(1).min(31));
+        Some(doubling.min(self.ceiling))
+    }
+
+    /// How many attempts a room gets before it is given up on.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
 
 /// What one pass did.
 ///
@@ -299,8 +350,7 @@ mod tests {
         RepositoryName, Subscription, Summary, Timestamp,
     };
 
-    use super::Deliver;
-    use crate::Retry;
+    use super::{Deliver, Retry};
     use crate::ports::{
         Acknowledged, Attempt, Clock, DispatchFailed, Dispatcher, Ids, Offers, Owed, Pause, Report,
         RoomOutcome, Unreachable,

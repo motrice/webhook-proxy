@@ -1,0 +1,21 @@
+-- The outbox goes, with the delivery loop that read it.
+--
+-- Bead gc-72e.3.2, on the maintainer's decision. This service no longer
+-- delivers to rooms: routing moved to each tenant's own agent (gc-g9x), so
+-- nothing writes this table and nothing reads it.
+--
+-- DROPPED RATHER THAN LEFT, and that is a retention decision as much as a
+-- tidiness one. Every row holds an alert's summary and labels -- other people's
+-- words, written by whoever can deploy a workload -- and a table nothing reads
+-- is a table nobody sweeps. Leaving it would be exactly the unbounded retention
+-- bead gc-mnn rejected, arrived at by neglect instead of by choice.
+--
+-- IRREVERSIBLE, AND THE ORDER MATTERS: run this with the outbox DRAINED.
+-- Anything still waiting here has been accepted from a sender and not yet
+-- delivered, and this drops it with no log line and no counter. That is free
+-- today because nothing is deployed, and it will not be free the next time --
+-- see deploy/webhook-proxy/README.md, which says so where somebody about to
+-- apply this will read it.
+--
+-- The indexes go with the table; naming them would be noise.
+DROP TABLE IF EXISTS dispatch;

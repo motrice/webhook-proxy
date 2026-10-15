@@ -1,0 +1,70 @@
+# What this agent may reach, and what may reach it.
+#
+# EGRESS ONLY, which is the shape of a thing that pulls. There is no ingress
+# rule at all — not a restrictive one, none — because nothing should reach this
+# pod: no Service, no HTTPRoute, no scrape. Under a namespace's
+# default-deny-ingress that absence is already the whole policy, and writing an
+# empty ingress rule would look like an oversight somebody should fill in.
+#
+# This is the opposite of the platform's policy, which is all ingress and no
+# egress. Between them they say the direction data flows: the platform is
+# reached, the agent reaches.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alert-agent
+  # REPLACE: the tenant's own namespace.
+  namespace: example-tenant
+  labels:
+    app.kubernetes.io/name: alert-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: alert-agent
+  policyTypes:
+    - Egress
+  egress:
+    # The platform, which is the only thing this agent claims from.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: webhook-proxy
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # DNS, without which none of the names below resolve. Easy to forget, and
+    # the symptom is an agent that logs "cannot reach the platform" forever
+    # while the platform is perfectly healthy.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # The rooms, and the secret store the room URLs come from. BOTH ARE OUTSIDE
+    # THE CLUSTER or outside this namespace, and neither has an address this
+    # repository knows: a tenant's rooms are in its own configuration, and the
+    # secret store is the platform's. So this stanza is a REPLACE rather than a
+    # value — and it is the one the platform's own policy deliberately does not
+    # have, because by the time rooms are reachable from somewhere, it is here.
+    #
+    # REPLACE with the CIDRs or namespaces this tenant's rooms and secret store
+    # actually live in. Leaving it as `0.0.0.0/0` works and is worth not doing:
+    # an agent that can reach anything is an agent whose compromise reaches
+    # anything.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # The cluster's own ranges, so a wide rule here cannot be used to
+              # reach other workloads. REPLACE with this cluster's pod and
+              # service CIDRs.
+              - 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443

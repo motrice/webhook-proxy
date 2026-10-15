@@ -2,7 +2,7 @@
 
 use crate::event::present;
 use crate::label::{self, LabelName, LabelValue};
-use crate::{Blank, Correlation, DeliveryId, Event, Labels, OriginId};
+use crate::{Blank, Event, Labels, OriginId};
 
 /// Identifies a [`Destination`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,134 +22,6 @@ pub enum DestinationKind {
     ChatRoom,
     /// Another forge, which consumes structure rather than prose.
     Forge,
-}
-
-/// A Dispatch's identity once something is keeping track of it.
-///
-/// Minted by whatever stores it rather than at the boundary, unlike
-/// [`DeliveryId`], and for a reason worth stating: a Delivery is named when it
-/// arrives because a loss report has to name what was lost even if nothing ever
-/// stored it. A Dispatch only needs a name once there is something to refer to
-/// it by — a row to mark delivered, a row to retry.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DispatchId(String);
-
-impl DispatchId {
-    /// Names a Dispatch.
-    ///
-    /// # Errors
-    ///
-    /// [`Blank`] if the identity is empty or only whitespace.
-    pub fn new(id: &str) -> Result<Self, Blank> {
-        present(id, "a dispatch identity").map(Self)
-    }
-
-    /// The identity as text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// What one Destination is to be told, from one Delivery.
-///
-/// The unit of work the delivery promise is about: one message, attempted and
-/// succeeding or failing on its own. That is what lets a Dispatch be stored,
-/// retried and reported on separately, which gc-mbr's promise requires — one
-/// Delivery can be half delivered, and saying which half is the whole value of
-/// recording it.
-///
-/// It carries the Events that selected *this* Destination rather than one Event,
-/// because a sender that grouped them meant a room to get one message (gc-lhh).
-/// Different alerts in one notification can select different rooms, so the set
-/// differs per Destination and the group a room sees is one this proxy composed,
-/// not the one the sender did.
-///
-/// It carries the Destination rather than only its identity because a
-/// Destination is an identity and a kind and deliberately nothing else — no URL,
-/// no token — so keeping it whole costs nothing and loses no secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dispatch {
-    delivery: DeliveryId,
-    origin: OriginId,
-    events: Vec<Event>,
-    destination: Destination,
-    correlation: Correlation,
-}
-
-impl Dispatch {
-    /// What is to be sent, where, and on whose behalf.
-    ///
-    /// `None` when there is nothing to say. A Dispatch with no Events would
-    /// render an empty Notice and send it, which is a blank message in somebody's
-    /// room — so it cannot be built rather than being guarded against at every
-    /// place one is used.
-    #[must_use]
-    pub fn new(
-        delivery: DeliveryId,
-        origin: OriginId,
-        events: Vec<Event>,
-        destination: Destination,
-        correlation: Correlation,
-    ) -> Option<Self> {
-        if events.is_empty() {
-            return None;
-        }
-        Some(Self {
-            delivery,
-            origin,
-            events,
-            destination,
-            correlation,
-        })
-    }
-
-    /// Which Delivery this came from.
-    #[must_use]
-    pub fn delivery(&self) -> &DeliveryId {
-        &self.delivery
-    }
-
-    /// The call chain this belongs to, which is the caller's and not ours.
-    ///
-    /// Carried on the Dispatch rather than alongside it because a Dispatch
-    /// outlives the request that made it: the sweep sends one again minutes
-    /// later, and that onward call belongs to the same chain as the original.
-    /// Keeping the two together is what makes a retry traceable back to the push
-    /// or the alert that caused it.
-    #[must_use]
-    pub fn correlation(&self) -> &Correlation {
-        &self.correlation
-    }
-
-    /// Which Origin was verified as having sent it.
-    ///
-    /// Kept because a Dispatch is not enough to route one again without it.
-    /// `origin` is the one label the proxy sets rather than reads, and every
-    /// rule that names it relies on that — so sending this somewhere new later
-    /// has to use the Origin that was *established* at the boundary, never one
-    /// an operator typed when asking for a replay.
-    #[must_use]
-    pub fn origin(&self) -> &OriginId {
-        &self.origin
-    }
-
-    /// Everything that happened, in the order the sender reported it.
-    ///
-    /// More than one when a sender grouped them. Alertmanager's `group_by`
-    /// collapses many firing alerts into one notification precisely so a room
-    /// gets one message, and sending one message per alert would undo a decision
-    /// the sender made deliberately — see bead gc-lhh. Never empty.
-    #[must_use]
-    pub fn events(&self) -> &[Event] {
-        &self.events
-    }
-
-    /// Where it is going.
-    #[must_use]
-    pub fn destination(&self) -> &Destination {
-        &self.destination
-    }
 }
 
 /// An internal system that should be told about Events.
@@ -336,12 +208,12 @@ pub fn destinations_for<'s>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Correlation, Destination, DestinationId, DestinationKind, Dispatch, Filter, Subscription,
-        destinations_for, routing_labels,
+        Destination, DestinationId, DestinationKind, Filter, Subscription, destinations_for,
+        routing_labels,
     };
     use crate::{
-        AlertId, AlertStatus, BranchName, DeliveryId, Event, LabelName, LabelValue, Labels,
-        OriginId, Pusher, RepositoryName, Severity, Summary, Timestamp,
+        AlertId, AlertStatus, BranchName, Event, LabelName, LabelValue, Labels, OriginId, Pusher,
+        RepositoryName, Severity, Summary, Timestamp,
     };
 
     fn destination(id: &str) -> Destination {
@@ -675,24 +547,10 @@ mod tests {
         assert!(destinations_for(&origin("a-forge"), &push_to("any"), &[]).is_empty());
     }
 
-    #[test]
-    fn a_dispatch_with_nothing_to_say_cannot_be_built() {
-        // It would render an empty Notice and send it, which is a blank message
-        // in somebody's room. Refused at construction rather than guarded
-        // against everywhere one is used.
-        assert!(
-            Dispatch::new(
-                DeliveryId::new("d-1").expect("a non-blank id"),
-                OriginId::new("github").expect("a non-blank id"),
-                Vec::new(),
-                Destination::new(
-                    DestinationId::new("a-room").expect("a non-blank id"),
-                    DestinationKind::ChatRoom,
-                ),
-                Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
-                    .expect("a well formed correlation"),
-            )
-            .is_none()
-        );
-    }
+    // The test that used to sit here proved a Dispatch with no Events could not
+    // be built. `Dispatch` went with the delivery loop that stored them (bead
+    // gc-72e.3.2), and the rule it protected did not go with it: the same
+    // refusal now lives on `Offered` and on `Owed`, which are the types that
+    // carry Events across the hand-off. Each has its own test, in the crate
+    // that owns it.
 }

@@ -15,17 +15,16 @@ use std::time::Instant;
 use alertmanager_payload::AlertmanagerPayload;
 mod collecting;
 
-use application::ports::{Dispatcher, Handover, Outbox, Proofs, Reoffered, Translator};
-use application::{Backlog, Counts, Retention, Retries, Retry, Tally};
+use application::ports::{Handover, Proofs, Reoffered, Translator};
+use application::{Backlog, Retention};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
-use element_notices::ElementNotices;
 use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
 use grafana_payload::GrafanaPayload;
 use inbound_http::{AUTHORIZATION_HEADER, Inbound, SIGNATURE_HEADER, Sender, router};
-use memory_outbox::{MemoryHandover, MemoryOutbox};
-use postgres_outbox::{PostgresHandover, PostgresOutbox};
+use memory_outbox::MemoryHandover;
+use postgres_outbox::PostgresHandover;
 use shared_values::SharedValues;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,7 +43,6 @@ enum Unstartable {
     /// field, so this adds nothing to it.
     Configuration(String),
     /// The HTTP client for the destination could not be built.
-    NoClient,
     /// The listening socket could not be served.
     Serving(String),
 }
@@ -54,7 +52,6 @@ impl fmt::Display for Unstartable {
         match self {
             Self::Unusable { name, why } => write!(f, "{name} is unusable: {why}"),
             Self::Configuration(why) => write!(f, "{why}"),
-            Self::NoClient => write!(f, "the HTTP client for the destination could not be built"),
             Self::Serving(why) => write!(f, "could not serve: {why}"),
         }
     }
@@ -69,12 +66,9 @@ impl fmt::Display for Unstartable {
 struct Config {
     listen: String,
     max_body: usize,
-    timeout: Duration,
     file: PathBuf,
     secrets: PathBuf,
     startup_wait: Duration,
-    retry: Retry,
-    sweep: Duration,
     /// The name of the secret holding the database connection string, if there
     /// is one. The NAME, never the value: a connection string carries a
     /// password, and an environment variable is visible in a process listing
@@ -101,11 +95,6 @@ impl Config {
             max_body: optional("WEBHOOK_PROXY_MAX_BODY", "1048576")
                 .parse()
                 .unwrap_or(1_048_576),
-            timeout: Duration::from_millis(
-                optional("WEBHOOK_PROXY_TIMEOUT_MS", "5000")
-                    .parse()
-                    .unwrap_or(5_000),
-            ),
             file: PathBuf::from(optional(
                 "WEBHOOK_PROXY_CONFIG",
                 "/etc/webhook-proxy/config.yaml",
@@ -125,23 +114,6 @@ impl Config {
                     .parse()
                     .unwrap_or(30_000),
             ),
-            // Five attempts over about half a minute of waiting, doubling from
-            // one second and capped at thirty. Long enough to ride out a chat
-            // server restart; short enough that an alert nobody will ever get is
-            // reported as lost while somebody still cares.
-            retry: Retry::new(
-                Duration::from_secs(1),
-                Duration::from_secs(30),
-                optional("WEBHOOK_PROXY_ATTEMPTS", "5").parse().unwrap_or(5),
-            ),
-            // How often to look for work. Nothing waits on this — the relay has
-            // already sent what it could — so it is a sweep rather than a queue,
-            // and a short one would be mostly empty polls.
-            sweep: Duration::from_millis(
-                optional("WEBHOOK_PROXY_SWEEP_MS", "5000")
-                    .parse()
-                    .unwrap_or(5_000),
-            ),
             database: std::env::var("WEBHOOK_PROXY_DATABASE_SECRET")
                 .ok()
                 .filter(|name| !name.trim().is_empty()),
@@ -155,12 +127,6 @@ fn optional(name: &str, fallback: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback.to_owned())
 }
-
-/// How many Dispatches one sweep of the outbox takes at a time.
-///
-/// Bounded so a pass cannot hold a replica for an unbounded time, and so two
-/// replicas share the work rather than one taking all of it.
-const RETRY_BATCH: usize = 32;
 
 /// How often to look again while waiting for configuration.
 ///
@@ -237,24 +203,13 @@ const DATABASE_CONNECTIONS: u32 = 8;
 /// reasoning recorded there rather than argued again in a comment.
 /// The two durable stores, which stand or fall together.
 ///
-/// Returned as a pair rather than fetched separately because they share one
-/// connection pool, and because a deployment holding one and not the other is
-/// not a state worth being able to reach: a 202 means stored AND owed to a
-/// tenant (bead gc-g9x), so a process that could write only one of them would
-/// be promising something it cannot keep.
-struct Stores {
-    /// What this service delivers from itself.
-    outbox: Arc<dyn Outbox>,
-    /// What a tenant's agent collects from.
-    handover: Arc<dyn Handover>,
-}
-
-async fn stored(config: &Config) -> Result<Stores, Unstartable> {
+/// Where a Delivery waits for its tenant.
+///
+/// One store, where there were two until bead gc-72e.3.2: the other held work
+/// this service delivered itself, and it no longer delivers anything.
+async fn stored(config: &Config) -> Result<Arc<dyn Handover>, Unstartable> {
     let Some(name) = config.database.as_deref() else {
-        return Ok(Stores {
-            outbox: Arc::new(MemoryOutbox::new()),
-            handover: Arc::new(MemoryHandover::new()),
-        });
+        return Ok(Arc::new(MemoryHandover::new()));
     };
 
     // Read from the mounted directory like every other secret, and never from
@@ -277,16 +232,8 @@ async fn stored(config: &Config) -> Result<Stores, Unstartable> {
     let deadline = Instant::now() + config.startup_wait;
     let mut said = false;
     loop {
-        match PostgresOutbox::connect(url, DATABASE_CONNECTIONS).await {
-            Ok(outbox) => {
-                // One pool for both stores, so there is one migrator and one
-                // advisory lock at start-up rather than two of each racing.
-                let handover = PostgresHandover::using(outbox.pool().clone());
-                return Ok(Stores {
-                    outbox: Arc::new(outbox),
-                    handover: Arc::new(handover),
-                });
-            }
+        match PostgresHandover::connect(url, DATABASE_CONNECTIONS).await {
+            Ok(handover) => return Ok(Arc::new(handover)),
             Err(why) if Instant::now() < deadline => {
                 if !said {
                     // No address and no password: StorageUnavailable carries
@@ -329,10 +276,9 @@ async fn replay(id: &str) -> Result<String, Unstartable> {
     let delivery = DeliveryId::new(id)
         .map_err(|why| Unstartable::Configuration(format!("that is not a delivery: {why}")))?;
 
-    // Only the handover. Nothing here dispatches, reads a routing file or
-    // reaches a room: a replay is now one row changing its mind about being
-    // settled.
-    let handover = stored(&config).await?.handover;
+    // Nothing here dispatches, reads a routing file or reaches a room: a replay
+    // is now one row changing its mind about being settled.
+    let handover = stored(&config).await?;
 
     let mut said = String::new();
     match handover
@@ -362,53 +308,6 @@ async fn replay(id: &str) -> Result<String, Unstartable> {
         }
     }
     Ok(said)
-}
-
-/// Comes back to whatever the request path could not deliver.
-///
-/// The second half of the promise, and a task rather than part of serving:
-/// nothing waits on it, because the relay has already sent what it could. A
-/// sweep rather than a queue, so a short interval would be mostly empty polls.
-fn sweeping(
-    dispatcher: Arc<dyn Dispatcher>,
-    outbox: Arc<dyn Outbox>,
-    tally: Arc<Tally>,
-    retry: Retry,
-    sweep: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let clock = SystemClock;
-        let retries = Retries::new(dispatcher.as_ref(), outbox.as_ref(), &clock, retry);
-        loop {
-            match retries.once(RETRY_BATCH).await {
-                Ok(attempted) if !attempted.idle() => {
-                    // Counted here rather than inside the worker, which holds no
-                    // state of its own: what it did is a value it returns, and
-                    // who keeps a running total is this crate's business.
-                    for room in &attempted.delivered {
-                        tally.delivered(room);
-                    }
-                    for room in &attempted.retrying {
-                        tally.retrying(room);
-                    }
-                    for room in &attempted.abandoned {
-                        tally.abandoned(room);
-                    }
-                    tracing::info!(
-                        delivered = attempted.delivered.len(),
-                        retrying = attempted.retrying.len(),
-                        abandoned = attempted.abandoned.len(),
-                        "retried what was due"
-                    );
-                }
-                Ok(_) => {}
-                // No address, no credential: StorageUnavailable carries none,
-                // and this line is written from it.
-                Err(why) => tracing::error!(%why, "cannot read the outbox"),
-            }
-            tokio::time::sleep(sweep).await;
-        }
-    })
 }
 
 /// How long a Delivery nobody collected is kept.
@@ -526,42 +425,15 @@ fn reaping(
 /// monitoring system polling every fifteen seconds would otherwise become load
 /// on the thing it is monitoring, and would go quiet exactly when the database
 /// is in trouble — which is when somebody is looking.
-fn exported(tally: &Tally, backlog: &Backlog) -> String {
+fn exported(backlog: &Backlog) -> String {
     let mut out = String::new();
 
-    for (name, help, pick) in [
-        (
-            "webhook_proxy_dispatches_delivered_total",
-            "Dispatches that reached a room. What a reader there actually saw.",
-            (|counts: Counts| counts.delivered) as fn(Counts) -> u64,
-        ),
-        (
-            "webhook_proxy_dispatch_attempts_retried_total",
-            "Failed attempts that were stored for another try. Attempts, not              messages: a room that is unreachable makes this climb.",
-            |counts: Counts| counts.retrying,
-        ),
-        (
-            "webhook_proxy_dispatches_abandoned_total",
-            "Dispatches given up on. These are the losses.",
-            |counts: Counts| counts.abandoned,
-        ),
-    ] {
-        writeln!(out, "# HELP {name} {help}").expect("writing to a String cannot fail");
-        writeln!(out, "# TYPE {name} counter").expect("writing to a String cannot fail");
-        for (destination, counts) in tally.all() {
-            writeln!(
-                out,
-                "{name}{{destination=\"{}\"}} {}",
-                escaped(&destination),
-                pick(counts)
-            )
-            .expect("writing to a String cannot fail");
-        }
-    }
-
-    // The tenant side. Keyed by tenant rather than by room, because an alert no
-    // agent collected never reached a room and has none to be counted against —
-    // which is exactly why bead gc-g9x called it a third kind of loss.
+    // KEYED BY TENANT, AND THERE IS NOTHING KEYED BY ROOM ANY MORE. This
+    // service used to count what each room was sent; it does not reach a room
+    // now, and a tenant's agent does — in another namespace, with no scrape
+    // endpoint of its own by design (bead gc-72e). So what a room saw is in
+    // that agent's log and nowhere else, which gc-g9x accepted when it deferred
+    // the read API: the loss line is the deliverable.
     //
     // Nothing here is a room name, an address or a secret: a tenant is a
     // namespace, and the numbers are a count and a moment.
@@ -823,11 +695,6 @@ async fn run() -> Result<(), Unstartable> {
     let signing: Arc<dyn Proofs> = Arc::new(GithubSignatures::new(secrets.clone()));
     let sharing: Arc<dyn Proofs> = Arc::new(SharedValues::new(secrets));
 
-    let dispatcher: Arc<dyn Dispatcher> = Arc::new(
-        ElementNotices::new(routing.webhooks().clone(), config.timeout)
-            .map_err(|_| Unstartable::NoClient)?,
-    );
-
     // The one place that maps a declaration onto what enforces it.
     //
     // Both matches are exhaustive, so every mechanism has exactly one verifier
@@ -860,30 +727,13 @@ async fn run() -> Result<(), Unstartable> {
         })
         .collect();
 
-    let Stores { outbox, handover } = stored(&config).await?;
-
-    // One tally, shared: the request path sends immediately and the worker comes
-    // back to whatever failed, so a count held by either alone would be wrong.
-    let tally = Arc::new(Tally::new());
+    let handover = stored(&config).await?;
 
     let inbound = Inbound::new(
         senders,
-        Arc::clone(&dispatcher),
-        Arc::clone(&outbox),
         Arc::clone(&handover),
         Arc::new(SystemClock),
         Arc::new(RandomIds),
-        routing.subscriptions().to_vec(),
-        config.retry,
-        Arc::clone(&tally),
-    );
-
-    let retrying = sweeping(
-        Arc::clone(&dispatcher),
-        Arc::clone(&outbox),
-        Arc::clone(&tally),
-        config.retry,
-        config.sweep,
     );
 
     // The hand-off to a tenant's agent. Merged rather than layered, so these two
@@ -904,7 +754,6 @@ async fn run() -> Result<(), Unstartable> {
     let backlog = Arc::new(Backlog::new());
     let reaped = reaping(Arc::clone(&handover), Arc::clone(&backlog), REAP_EVERY);
 
-    let scraped = Arc::clone(&tally);
     let counted = Arc::clone(&backlog);
     let app = router(inbound, config.max_body)
         .merge(collecting::routes(collecting))
@@ -913,9 +762,8 @@ async fn run() -> Result<(), Unstartable> {
         .route(
             "/metrics",
             get(move || {
-                let scraped = Arc::clone(&scraped);
                 let counted = Arc::clone(&counted);
-                async move { exported(&scraped, &counted) }
+                async move { exported(&counted) }
             }),
         );
 
@@ -945,9 +793,7 @@ async fn run() -> Result<(), Unstartable> {
     // durable one. Against the memory outbox this line drops whatever was
     // waiting, silently and uncounted; that is why gc-vfz made every deployment
     // name a database rather than leaving the sentence above to be wishful.
-    retrying.abort();
-
-    // Stopped the same way, and nothing is lost by it: retention is a month, so
+    // Stopped with the listener, and nothing is lost by it: retention is a month, so
     // a pass that does not happen because the process is shutting down happens
     // on the next start instead. Nothing waits on this and nothing is half
     // done — a sweep deletes and reports in one statement.

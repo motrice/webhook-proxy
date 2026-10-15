@@ -163,8 +163,8 @@ pub async fn started() -> Database {
         .await
         .expect("a connection to the container this test just started");
 
-    // One migrator for both tables, which is also how the process runs.
-    crate::PostgresOutbox::migrate(&pool)
+    // The same migrator the process runs at start-up.
+    crate::PostgresHandover::migrate(&pool)
         .await
         .expect("the schema");
 

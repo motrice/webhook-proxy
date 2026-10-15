@@ -39,6 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 # The acceptance test writes its own routing file and secrets directory.
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+# The deployment manifests are read by a test, so a manifest that disagrees with
+# this crate's environment contract fails the build rather than a pod.
+serde_yaml_ng = "0.10"
 
 [lints]
 workspace = true

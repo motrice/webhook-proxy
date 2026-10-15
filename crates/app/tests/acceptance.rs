@@ -14,13 +14,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -35,7 +31,6 @@ const DELETION_SIGNATURE: &str =
     include_str!("../../adapters/github-signatures/fixtures/branch-delete.signature");
 
 const ROOM: &str = "devsecops-room";
-const PLATFORM: &str = "platform-room";
 
 /// The value the monitoring sender shares. Long enough to be a real one, and
 /// obviously not.
@@ -56,9 +51,6 @@ const GRAFANA_NOTIFICATION: &[u8] =
 const NOTIFICATION: &[u8] =
     include_bytes!("../../adapters/alertmanager-payload/fixtures/firing.json");
 
-/// What the stub hookshot recorded: which room, and the body it was sent.
-type Notices = Arc<Mutex<Vec<(String, String)>>>;
-
 /// Kills the child when the test ends, however it ends.
 #[derive(Debug)]
 struct Proxy {
@@ -72,38 +64,6 @@ impl Drop for Proxy {
         // bound port behind would make the next run flaky.
         let _ = self.child.start_kill();
     }
-}
-
-/// A stub hookshot. Returns its URL and the bodies it was sent.
-async fn hookshot() -> (String, Notices) {
-    // Which room received what, not just what was received: a test that cannot
-    // tell the rooms apart cannot say that a rule selected the right one.
-    let seen: Notices = Arc::new(Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route(
-            "/hook/{id}",
-            post(
-                |State(seen): State<Notices>,
-                 axum::extract::Path(id): axum::extract::Path<String>,
-                 body: String| async move {
-                    seen.lock().expect("not poisoned").push((id, body));
-                    (StatusCode::OK, r#"{"ok":true}"#)
-                },
-            ),
-        )
-        .with_state(Arc::clone(&seen));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a loopback port");
-    let address = listener.local_addr().expect("an address");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("the stub serves");
-    });
-
-    // The base; each room's own address is this plus its identity, so the stub
-    // can say which rule selected it.
-    (format!("http://{address}/hook"), seen)
 }
 
 /// Starts the binary and waits until it says which port it took.
@@ -155,7 +115,7 @@ async fn start(extra: HashMap<&str, String>) -> Result<Proxy, String> {
 /// Two senders on two mechanisms and three rules, because that is the shape a
 /// reviewer has to believe. The `TempDir` is returned so the files outlive the
 /// call: dropping it would delete them before the binary read them.
-fn configured(base: &str) -> (tempfile::TempDir, HashMap<&'static str, String>) {
+fn configured() -> (tempfile::TempDir, HashMap<&'static str, String>) {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let secrets = dir.path().join("secrets");
     fs::create_dir(&secrets).expect("a writable temporary directory");
@@ -164,8 +124,6 @@ fn configured(base: &str) -> (tempfile::TempDir, HashMap<&'static str, String>) 
         ("github-webhook-secret", SECRET.to_owned()),
         ("alertmanager-token", TOKEN.to_owned()),
         ("grafana-token", GRAFANA_TOKEN.to_owned()),
-        ("devsecops-room-url", format!("{base}/{ROOM}")),
-        ("platform-room-url", format!("{base}/{PLATFORM}")),
     ] {
         fs::write(secrets.join(name), value).expect("a writable temporary directory");
     }
@@ -173,8 +131,7 @@ fn configured(base: &str) -> (tempfile::TempDir, HashMap<&'static str, String>) 
     let file = dir.path().join("config.yaml");
     fs::write(
         &file,
-        format!(
-            "version: 1
+        "version: 1
 tenants:
   - devsecops
   - platform
@@ -197,37 +154,7 @@ origins:
     verify:
       bearer:
         secret: grafana-token
-destinations:
-  - id: {ROOM}
-    kind: chat_room
-    webhook:
-      secret: devsecops-room-url
-  - id: {PLATFORM}
-    kind: chat_room
-    webhook:
-      secret: platform-room-url
-subscriptions:
-  - destination: {ROOM}
-    match:
-      origin: github
-  - destination: {ROOM}
-    match:
-      origin: alertmanager
-      severity: critical
-  - destination: {PLATFORM}
-    match:
-      origin: alertmanager
-      namespace: prod
-  - destination: {PLATFORM}
-    match:
-      origin: grafana
-      grafana_folder: Platform
-  - destination: {ROOM}
-    match:
-      origin: grafana
-      severity: critical
-"
-        ),
+",
     )
     .expect("a writable temporary directory");
 
@@ -279,47 +206,11 @@ async fn post_webhook(address: &str, signature: Option<&str>, body: &[u8]) -> St
     post_as(address, "github", credential, body).await
 }
 
-/// The stub is answered asynchronously, so give it a moment — bounded, and
-/// polled rather than slept through, so a working path is fast and a broken one
-/// still fails.
-/// Waits until at least `wanted` notices have arrived, or gives up.
-///
-/// Takes the count rather than waiting for the first, because a test asserting
-/// that three alerts reached two rooms has to wait for all of them: returning on
-/// the first would make the assertion race the dispatcher.
-async fn delivered(
-    seen: &Arc<Mutex<Vec<(String, String)>>>,
-    wanted: usize,
-) -> Vec<(String, String)> {
-    for _ in 0..50 {
-        let received = seen.lock().expect("not poisoned").clone();
-        if received.len() >= wanted {
-            return received;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    seen.lock().expect("not poisoned").clone()
-}
-
-/// What one room was told, as text.
-fn told(received: &[(String, String)], room: &str) -> Vec<String> {
-    received
-        .iter()
-        .filter(|(id, _)| id == room)
-        .map(|(_, body)| {
-            let sent: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
-            sent["text"].as_str().expect("a text field").to_owned()
-        })
-        .collect()
-}
-
 #[tokio::test]
 async fn two_senders_prove_themselves_two_ways_through_one_front_door() {
     // The test a reviewer reads to believe this epic. One deployment, two
     // Origins, two mechanisms, and neither accepts the other's credential.
-    let (base, _seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     // Each with its own credential: accepted.
@@ -365,93 +256,28 @@ async fn two_senders_prove_themselves_two_ways_through_one_front_door() {
 }
 
 #[tokio::test]
-async fn a_push_and_an_alert_reach_only_their_own_subscribers() {
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+async fn a_signed_branch_deletion_is_translated_and_accepted() {
+    // A second real GitHub payload, with its own signature, through the binary.
+    // The test that used to cover this asserted the room showed it as a
+    // deletion; this service reaches no room now (bead gc-72e.3.2), so what is
+    // left to prove here is the half that is still this service's — that the
+    // translator reads a payload shaped unlike a push and the delivery is
+    // accepted rather than refused as unreadable.
+    //
+    // How it RENDERS in a room is the agent's, and element-notices has its own
+    // tests for that.
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     assert_eq!(
-        post_webhook(&proxy.address, Some(SIGNATURE), PAYLOAD).await,
+        post_webhook(&proxy.address, Some(DELETION_SIGNATURE.trim()), DELETION).await,
         StatusCode::ACCEPTED
-    );
-
-    let received = delivered(&seen, 1).await;
-    let devsecops = told(&received, ROOM);
-    assert_eq!(devsecops.len(), 1, "{received:?}");
-    assert!(devsecops[0].contains("bjornmolin"), "{devsecops:?}");
-
-    // The room that only subscribes to alerts hears nothing about a push.
-    assert!(told(&received, PLATFORM).is_empty(), "{received:?}");
-}
-
-#[tokio::test]
-async fn an_alert_reaches_every_room_whose_rule_matches_and_no_others() {
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
-    let proxy = start(env).await.expect("the proxy starts");
-
-    assert_eq!(
-        post_as(
-            &proxy.address,
-            "alertmanager",
-            Credential::Shared(TOKEN),
-            NOTIFICATION
-        )
-        .await,
-        StatusCode::ACCEPTED
-    );
-
-    // The notification carries three alerts, chosen so that one matches two
-    // rules, one matches one, and one matches none:
-    //
-    //   critical / prod    -> devsecops (severity) and platform (namespace)
-    //   unstated / prod    -> platform only
-    //   unrecognised / platform -> nothing at all
-    //
-    // Two messages, not three. The sender grouped these alerts into one
-    // notification and this proxy no longer undoes that (gc-lhh): each room
-    // gets ONE message carrying the alerts that selected it, and the subsets
-    // differ, which is why the group a room sees is one we composed rather than
-    // the one Alertmanager did.
-    let received = delivered(&seen, 2).await;
-
-    // One alert selected this room, so it arrives rendered in full — the common
-    // case outside an incident, and it must not have been made worse.
-    let devsecops = told(&received, ROOM);
-    assert_eq!(devsecops.len(), 1, "devsecops: {received:?}");
-    assert!(
-        devsecops[0].starts_with("firing — critical:"),
-        "{devsecops:?}"
-    );
-
-    // Two selected this one, so they arrive together, counted and listed.
-    let platform = told(&received, PLATFORM);
-    assert_eq!(platform.len(), 1, "platform: {received:?}");
-    assert!(platform[0].starts_with("2 things happened"), "{platform:?}");
-    assert!(
-        platform[0].contains("api latency above target"),
-        "{platform:?}"
-    );
-    assert!(
-        platform[0].contains("only a description, no summary annotation"),
-        "{platform:?}"
-    );
-
-    // And the third reached nobody, which is not an error: the sender was told
-    // its notification was accepted.
-    assert_eq!(received.len(), 2, "{received:?}");
-    assert!(
-        !received
-            .iter()
-            .any(|(_, body)| body.contains("CertExpiring")),
-        "an alert matching no rule was delivered anyway: {received:?}"
     );
 }
 
 #[tokio::test]
-async fn a_wrongly_signed_push_reaches_nobody() {
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+async fn a_wrongly_signed_push_is_refused_and_stored_nowhere() {
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     // A well-formed signature of the right length for the wrong body.
@@ -460,13 +286,11 @@ async fn a_wrongly_signed_push_reaches_nobody() {
         post_webhook(&proxy.address, Some(&wrong), PAYLOAD).await,
         StatusCode::UNAUTHORIZED
     );
-    assert!(delivered(&seen, 1).await.is_empty());
 }
 
 #[tokio::test]
 async fn no_configured_sender_can_be_reached_without_its_credential() {
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     for (sender, body) in [("github", PAYLOAD), ("alertmanager", NOTIFICATION)] {
@@ -476,13 +300,11 @@ async fn no_configured_sender_can_be_reached_without_its_credential() {
             "{sender} was reachable with no credential"
         );
     }
-    assert!(delivered(&seen, 1).await.is_empty());
 }
 
 #[tokio::test]
 async fn a_path_naming_no_configured_sender_is_not_found() {
-    let (base, _seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     // Not 401: there is nothing here to authenticate against. The set of senders
@@ -501,34 +323,8 @@ async fn a_path_naming_no_configured_sender_is_not_found() {
 }
 
 #[tokio::test]
-async fn a_signed_branch_deletion_reaches_the_room_as_a_deletion() {
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
-    let proxy = start(env).await.expect("the proxy starts");
-
-    assert_eq!(
-        post_as(
-            &proxy.address,
-            "github",
-            Credential::Signature(DELETION_SIGNATURE),
-            DELETION
-        )
-        .await,
-        StatusCode::ACCEPTED
-    );
-
-    let received = delivered(&seen, 1).await;
-    let devsecops = told(&received, ROOM);
-    assert_eq!(devsecops.len(), 1, "{received:?}");
-    assert!(devsecops[0].contains("deleted"), "{devsecops:?}");
-    assert!(!devsecops[0].contains("no commits"), "{devsecops:?}");
-    assert!(!devsecops[0].contains("://"), "{devsecops:?}");
-}
-
-#[tokio::test]
 async fn health_answers_without_asking_the_destination() {
-    let (base, _seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     let body = reqwest::get(format!("http://{}/health", proxy.address))
@@ -583,7 +379,7 @@ async fn an_agent_is_offered_none_of_another_tenants_deliveries() {
     //
     // Two senders belonging to two tenants, per the fixture: `github` is
     // devsecops's and `grafana` is platform's.
-    let (_dir, env) = configured("http://127.0.0.1:1");
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     assert_eq!(
@@ -641,7 +437,7 @@ async fn a_caller_the_mesh_did_not_identify_is_offered_nothing() {
     // than an attacker — and is the case where answering anything at all would
     // be the worst possible failure. 401 and not 403: nothing established who
     // is calling, so there is nothing to authorise.
-    let (_dir, env) = configured("http://127.0.0.1:1");
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     let answered = reqwest::Client::new()
@@ -659,7 +455,7 @@ async fn a_caller_speaking_for_no_tenant_here_is_offered_nothing() {
     // routing: a request arriving through the ingress gateway carries the
     // GATEWAY's identity, and `istio-ingress` is not a tenant. So even a
     // deployment that published this path by mistake would hand out nothing.
-    let (_dir, env) = configured("http://127.0.0.1:1");
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     for namespace in ["istio-ingress", "wallet-lab-prod", "default"] {
@@ -685,7 +481,7 @@ async fn an_agent_reports_its_rooms_and_is_not_offered_it_again() {
     // The other half of the hand-off: a report is terminal, and what it
     // discharges is not offered to anybody again. Without this the queue never
     // drains and every tenant looks like a tenant that has stopped collecting.
-    let (_dir, env) = configured("http://127.0.0.1:1");
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     assert_eq!(
@@ -737,7 +533,7 @@ async fn one_tenant_cannot_report_another_tenants_delivery() {
     // DeliveryId is random, so guessing one is not a practical attack — but it
     // travels, in traces and logs and room messages, and authorisation that
     // rests on an identifier being hard to guess is not authorisation.
-    let (_dir, env) = configured("http://127.0.0.1:1");
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     assert_eq!(
@@ -807,15 +603,6 @@ origins:
     verify:
       hmac_sha256:
         secret: a-secret
-destinations:
-  - id: a-room
-    kind: chat_room
-    webhook:
-      secret: a-url
-subscriptions:
-  - destination: a-room
-    match:
-      origin: a-forge
 ",
     )
     .expect("writable");
@@ -851,7 +638,7 @@ fn check_says_which_tenant_each_sender_files_under() {
     // inferred from anything else in the file — so the one thing a reviewer of
     // a routing change most needs to see is exactly the thing `check` has to
     // print. This is the pipeline's view of it.
-    let (_dir, env) = configured("http://127.0.0.1:1");
+    let (_dir, env) = configured();
 
     let (ok, out, err) = check(&env);
 
@@ -883,16 +670,7 @@ origins:
     speaks: github
     verify:
       hmac_sha256:
-        secret: a-secret
-destinations:
-  - id: a-room
-    kind: chat_room
-    webhook:
-      secret: a-url
-subscriptions:
-  - destination: no-such-room
-    match:
-      origin: a-forge
+        secret: no-such-secret
 ",
     )
     .expect("writable");
@@ -915,8 +693,8 @@ subscriptions:
     let why = start(env).await.expect_err("it must refuse to start");
 
     assert!(why.contains("config.yaml"), "{why}");
-    assert!(why.contains("subscriptions[0].destination"), "{why}");
-    assert!(why.contains("no-such-room"), "{why}");
+    assert!(why.contains("origins[0].verify.secret"), "{why}");
+    assert!(why.contains("no-such-secret"), "{why}");
     // No secret value, ever, in the line most likely to be pasted somewhere.
     assert!(!why.contains("shhh"), "{why}");
 }
@@ -984,8 +762,15 @@ fn check_prints_what_the_published_example_would_route() {
     assert!(out.contains("/webhook/github"), "{out}");
     assert!(out.contains("/webhook/alertmanager"), "{out}");
     assert!(out.contains("/webhook/grafana"), "{out}");
-    assert!(out.contains("namespace*=platform"), "{out}");
-    assert!(out.contains("grafana_folder*=Platform"), "{out}");
+    // Whose each sender's alerts are, which this half of the configuration
+    // still decides and which a reviewer cannot infer from anything else.
+    assert!(out.contains("for tenant devsecops"), "{out}");
+    assert!(out.contains("for tenant platform"), "{out}");
+    // AND NO ROOMS AND NO RULES, because this service has none (bead
+    // gc-72e.3.2). `alert-agent check` is what prints those, against the
+    // tenant's own file.
+    assert!(!out.contains("rooms"), "{out}");
+    assert!(!out.contains("room(s)"), "{out}");
     assert!(
         out.contains(&format!("{} secret(s) present", wanted.len())),
         "{out}"
@@ -1041,16 +826,7 @@ origins:
     speaks: github
     verify:
       hmac_sha256:
-        secret: a-secret
-destinations:
-  - id: a-room
-    kind: chat_room
-    webhook:
-      secret: a-url
-subscriptions:
-  - destination: typo-room
-    match:
-      origin: a-forge
+        secret: no-such-secret
 ",
     )
     .expect("writable");
@@ -1070,157 +846,14 @@ subscriptions:
 
     let (ok, _out, err) = check(&env);
 
-    assert!(!ok, "check accepted a file naming an undeclared room");
-    assert!(err.contains("config.yaml"), "{err}");
-    assert!(err.contains("subscriptions[0].destination"), "{err}");
-    assert!(err.contains("typo-room"), "{err}");
-    assert!(!err.contains("shhh"), "{err}");
-}
-
-#[test]
-fn check_shows_a_room_that_a_typo_left_unreachable() {
-    // The case no validation rule could catch: the file is entirely valid, and a
-    // room will simply never hear anything. Visible as a line in a pull request.
-    let dir = tempfile::tempdir().expect("a temporary directory");
-    let file = dir.path().join("config.yaml");
-    fs::write(
-        &file,
-        "version: 1
-tenants:
-  - a-tenant
-origins:
-  - id: a-forge
-    tenant: a-tenant
-    speaks: github
-    verify:
-      hmac_sha256:
-        secret: a-secret
-destinations:
-  - id: watched-room
-    kind: chat_room
-    webhook:
-      secret: a-url
-  - id: forgotten-room
-    kind: chat_room
-    webhook:
-      secret: b-url
-subscriptions:
-  - destination: watched-room
-    match:
-      repositry: motrice/webhook-proxy
-",
-    )
-    .expect("writable");
-    for (name, value) in [
-        ("a-secret", "shhh"),
-        ("a-url", "http://127.0.0.1:1/a"),
-        ("b-url", "http://127.0.0.1:1/b"),
-    ] {
-        fs::write(dir.path().join(name), value).expect("writable");
-    }
-
-    let env = HashMap::from([
-        (
-            "WEBHOOK_PROXY_CONFIG",
-            file.to_str().expect("a utf-8 path").to_owned(),
-        ),
-        (
-            "WEBHOOK_PROXY_SECRETS_DIR",
-            dir.path().to_str().expect("a utf-8 path").to_owned(),
-        ),
-    ]);
-
-    let (ok, out, err) = check(&env);
-
-    // Valid, so it starts. And useless, which only the table can tell you.
-    assert!(ok, "{err}{out}");
-    assert!(out.contains("(nothing selects this room)"), "{out}");
-    // And the typo itself: a name no Event ever offers, so it can only match if
-    // a sender chooses to send it — which a forge never will.
-    assert!(out.contains("repositry*="), "{out}");
-}
-
-/// A stub hookshot that records what it was sent and only then takes its time
-/// answering.
-///
-/// Recording first is what makes the shutdown test deterministic rather than
-/// timed: once a notice has been recorded the proxy is provably inside the
-/// dispatcher, still holding the request open, which is the only moment at which
-/// a termination signal proves anything.
-async fn unhurried_hookshot(answering_after: Duration) -> (String, Notices) {
-    let seen: Notices = Arc::new(Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route(
-            "/hook/{id}",
-            post(
-                move |State(seen): State<Notices>,
-                      axum::extract::Path(id): axum::extract::Path<String>,
-                      body: String| async move {
-                    seen.lock().expect("not poisoned").push((id, body));
-                    tokio::time::sleep(answering_after).await;
-                    (StatusCode::OK, r#"{"ok":true}"#)
-                },
-            ),
-        )
-        .with_state(Arc::clone(&seen));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a loopback port");
-    let address = listener.local_addr().expect("an address");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("the stub serves");
-    });
-
-    (format!("http://{address}/hook"), seen)
-}
-
-/// Asks the process to stop the way Kubernetes does.
-fn ask_to_stop(pid: u32) {
-    let signalled = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .expect("kill(1) runs");
-    assert!(signalled.success(), "could not signal {pid}");
-}
-
-#[tokio::test]
-async fn a_termination_signal_lets_a_request_already_accepted_finish() {
-    // The delivery promise is best-effort, and the deployment criterion is that
-    // a restart loses at most what is in flight. Without a graceful stop even
-    // that is not true: SIGTERM kills the process between the dispatch and the
-    // response, so the sender sees a reset connection on a webhook that was in
-    // fact delivered — the worst of both, because it will be retried.
-    let (base, seen) = unhurried_hookshot(Duration::from_millis(750)).await;
-    let (_dir, env) = configured(&base);
-    let mut proxy = start(env).await.expect("the binary starts");
-    let address = proxy.address.clone();
-    let pid = proxy.child.id().expect("a running child");
-
-    let signature = SIGNATURE.trim().to_owned();
-    let posting =
-        tokio::spawn(async move { post_webhook(&address, Some(&signature), PAYLOAD).await });
-
-    // The notice has reached the stub, so the proxy is inside the dispatcher
-    // with the request still open. Signal exactly there.
-    assert_eq!(delivered(&seen, 1).await.len(), 1);
-    ask_to_stop(pid);
-
-    assert_eq!(
-        posting.await.expect("the request task survives"),
-        StatusCode::ACCEPTED,
-        "the response was lost to the signal"
+    assert!(
+        !ok,
+        "check accepted a file naming a secret that is not there"
     );
-
-    let stopped = tokio::time::timeout(Duration::from_secs(10), proxy.child.wait())
-        .await
-        .expect("it stops within ten seconds")
-        .expect("a wait status");
-
-    // Killed by a signal is not a clean stop: it is what happens when nothing
-    // handles SIGTERM, and it is what this asserts is no longer the case.
-    assert!(stopped.success(), "did not stop cleanly: {stopped:?}");
+    assert!(err.contains("config.yaml"), "{err}");
+    assert!(err.contains("origins[0].verify.secret"), "{err}");
+    assert!(err.contains("no-such-secret"), "{err}");
+    assert!(!err.contains("shhh"), "{err}");
 }
 
 #[tokio::test]
@@ -1236,8 +869,7 @@ async fn a_secret_that_arrives_a_moment_late_is_waited_for() {
     // first version of this test wrote the file after 400ms and passed with no
     // waiting implemented at all, because a debug binary takes longer than that
     // to reach its first read — it was measuring which of two races won.
-    let (base, _) = hookshot().await;
-    let (dir, env) = configured(&base);
+    let (dir, env) = configured();
 
     let late = dir.path().join("secrets").join("github-webhook-secret");
     let contents = fs::read_to_string(&late).expect("the fixture wrote it");
@@ -1284,8 +916,7 @@ async fn a_secret_that_never_arrives_still_stops_the_process_and_names_it() {
     // The other half, and the one that matters more: waiting must not turn a
     // misconfiguration into a process that hangs. A deployment missing a secret
     // is broken, and it should say which secret, in seconds.
-    let (base, _) = hookshot().await;
-    let (dir, mut env) = configured(&base);
+    let (dir, mut env) = configured();
 
     fs::remove_file(dir.path().join("secrets").join("github-webhook-secret"))
         .expect("a writable temporary directory");
@@ -1333,52 +964,13 @@ fn check_does_not_wait_for_anything() {
 }
 
 #[tokio::test]
-async fn a_grafana_alert_reaches_only_the_rooms_its_labels_select() {
-    // The epic's second success criterion, for the half of it that was only ever
-    // proved at the adapter. grafana-payload had unit tests and the composition
-    // root wired it, but nothing had carried a Grafana payload through
-    // verification, translation and routing — so a published example that
-    // declared no grafana sender went unnoticed, and the documentation told an
-    // operator to post at a path that answered 404. Bead gc-ceg.
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
-    let proxy = start(env).await.expect("the binary starts");
-
-    let status = post_as(
-        &proxy.address,
-        "grafana",
-        Credential::Shared(GRAFANA_TOKEN),
-        GRAFANA_NOTIFICATION,
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::ACCEPTED);
-
-    // The fixture carries three alerts, and exactly one of them is selected —
-    // by both rules at once. HighLatency is critical and sits in the Platform
-    // folder, so it reaches the room routing on severity and the room routing on
-    // folder. DiskFilling states no severity and no folder; CertExpiring is a
-    // warning in no folder. Neither is selected by anything, and a renderer that
-    // quietly sent them anyway would pass a weaker assertion.
-    let mut rooms: Vec<String> = delivered(&seen, 2)
-        .await
-        .into_iter()
-        .map(|(room, _)| room)
-        .collect();
-    rooms.sort();
-
-    assert_eq!(rooms, vec![ROOM.to_owned(), PLATFORM.to_owned()]);
-}
-
-#[tokio::test]
 async fn the_alerting_senders_do_not_share_a_credential() {
     // Two senders, two tokens, and neither opens the other. Without this a rule
     // naming `origin: grafana` would be worth no more than one naming
     // `origin: alertmanager`, because whoever held either value could claim to be
     // either — and `origin` is the one label the proxy sets rather than reads,
     // which is the whole reason a rule may rely on it.
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the binary starts");
 
     let borrowed = post_as(
@@ -1398,62 +990,18 @@ async fn the_alerting_senders_do_not_share_a_credential() {
 
     assert_eq!(borrowed, StatusCode::UNAUTHORIZED);
     assert_eq!(other_way, StatusCode::UNAUTHORIZED);
-    assert!(
-        seen.lock().expect("not poisoned").is_empty(),
-        "a refused delivery reached a room"
-    );
 }
 
 #[tokio::test]
-async fn the_counters_say_which_room_was_sent_what() {
-    // The gap gc-nd9 half-closed and this finishes: the numbers existed and
-    // nothing could read them, so the first signal of alert fatigue was still
-    // somebody muting the channel.
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
-    let proxy = start(env).await.expect("the binary starts");
-
-    // One push, which the routing file sends to one room.
-    let status = post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(delivered(&seen, 1).await.len(), 1);
-
-    let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
-        .await
-        .expect("the binary answers a scrape")
-        .text()
-        .await
-        .expect("a body");
-
-    assert!(
-        scraped.contains(&format!(
-            "webhook_proxy_dispatches_delivered_total{{destination=\"{ROOM}\"}} 1"
-        )),
-        "{scraped}"
-    );
-    // Declared, so a scraper knows what kind of number each one is.
-    assert!(
-        scraped.contains("# TYPE webhook_proxy_dispatches_delivered_total counter"),
-        "{scraped}"
-    );
-    assert!(
-        scraped.contains("webhook_proxy_dispatches_abandoned_total"),
-        "{scraped}"
-    );
-}
-
-#[tokio::test]
-async fn a_scrape_reveals_no_room_url_and_no_secret() {
+async fn a_scrape_reveals_no_secret_and_nothing_about_a_room() {
     // These numbers are the sort of thing that ends up on a dashboard anybody
-    // can open. A Destination is a name; where it lives belongs to the adapter
-    // that reaches it, and neither the token nor the webhook secret is anywhere
+    // can open. There is nothing about a room here to leak — this service
+    // reaches none (bead gc-72e.3.2) — and the senders' credentials are nowhere
     // near a counter.
-    let (base, seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the binary starts");
 
     post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
-    delivered(&seen, 1).await;
 
     let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
         .await
@@ -1462,11 +1010,9 @@ async fn a_scrape_reveals_no_room_url_and_no_secret() {
         .await
         .expect("a body");
 
-    assert!(
-        !scraped.contains(&base),
-        "a room's URL was published: {scraped}"
-    );
     assert!(!scraped.contains("http"), "{scraped}");
+    // Not a room name either, which this service never learns.
+    assert!(!scraped.contains("room"), "{scraped}");
     assert!(!scraped.contains(TOKEN), "{scraped}");
     assert!(!scraped.contains(SECRET.trim()), "{scraped}");
 }
@@ -1476,8 +1022,7 @@ async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped()
     // Not an error and not a blank page: a scraper meeting a fresh pod should
     // get the metric names it expects, with nothing under them, rather than
     // having to tell "no data" apart from "no endpoint".
-    let (base, _) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the binary starts");
 
     let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
@@ -1487,8 +1032,12 @@ async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped()
         .await
         .expect("a body");
 
-    assert!(scraped.contains("# TYPE webhook_proxy_dispatches_delivered_total counter"));
+    // NOTHING IS KEYED BY ROOM ANY MORE, and that is the shape of this
+    // service now: it does not reach a room, so it counts nothing about one
+    // (bead gc-72e.3.2). What a room saw is in its tenant's agent's log, in
+    // another namespace.
     assert!(!scraped.contains("destination="), "{scraped}");
+    assert!(!scraped.contains("dispatches_delivered"), "{scraped}");
 
     // The tenant side, which exists for the one loss nothing else can see: an
     // alert no agent ever collected reached no room, so it has none to be
@@ -1519,8 +1068,7 @@ async fn api_info_says_what_is_answering_without_being_asked_for_a_credential() 
     // which version answered. Unauthenticated by its own definition, which is
     // why it may name the API and its documentation and NOTHING about Origins,
     // Destinations, rooms or secrets — see the assertions at the end.
-    let (base, _seen) = hookshot().await;
-    let (_dir, env) = configured(&base);
+    let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
     let answered = reqwest::Client::new()
@@ -1579,7 +1127,7 @@ async fn api_info_says_what_is_answering_without_being_asked_for_a_credential() 
     // three rooms and three secrets; api-info is reachable by anyone who can
     // reach the port, so a leak here is a leak to everyone.
     let whole = body.to_string();
-    for forbidden in [ROOM, PLATFORM, TOKEN, GRAFANA_TOKEN, SECRET.trim(), &base] {
+    for forbidden in [TOKEN, GRAFANA_TOKEN, SECRET.trim()] {
         assert!(
             !whole.contains(forbidden),
             "api-info carries {forbidden:?}, which a caller it does not authenticate must not see: {whole}"

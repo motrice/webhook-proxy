@@ -14,8 +14,8 @@
 
 use async_trait::async_trait;
 use domain::{
-    Body, Correlation, DeliveryId, Destination, DestinationId, Dispatch, DispatchId, Event, Origin,
-    OriginId, Proof, Timestamp, VerifiedDelivery,
+    Body, Correlation, DeliveryId, Destination, DestinationId, Event, Origin, OriginId, Proof,
+    Timestamp, VerifiedDelivery,
 };
 
 /// The signature an Origin's secret produces over a body.
@@ -199,192 +199,6 @@ impl core::fmt::Display for StorageUnavailable {
 
 impl std::error::Error for StorageUnavailable {}
 
-/// What became of a Dispatch.
-///
-/// Three states and no fourth, which is the point: a Dispatch is waiting to be
-/// tried, or it arrived, or it was given up on. There is no "failed" that is not
-/// one of those — a failure either earns another attempt or ends it, and
-/// collapsing them would make an abandoned Dispatch indistinguishable from one
-/// still in the queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    /// Not yet sent. Not to be tried again before this moment.
-    Waiting {
-        /// When it next becomes due.
-        again_at: Timestamp,
-    },
-    /// The Destination took it.
-    Delivered {
-        /// When it did.
-        at: Timestamp,
-    },
-    /// Attempted until the budget ran out, and it is a loss.
-    Abandoned {
-        /// When it was given up on.
-        at: Timestamp,
-    },
-}
-
-/// A Dispatch as the outbox holds it: what to send, and what has happened to it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Recorded {
-    id: DispatchId,
-    dispatch: Dispatch,
-    attempts: u32,
-    outcome: Outcome,
-    accepted_at: Timestamp,
-}
-
-impl Recorded {
-    /// Assembles what the store knows about one Dispatch.
-    #[must_use]
-    pub fn new(
-        id: DispatchId,
-        dispatch: Dispatch,
-        attempts: u32,
-        outcome: Outcome,
-        accepted_at: Timestamp,
-    ) -> Self {
-        Self {
-            id,
-            dispatch,
-            attempts,
-            outcome,
-            accepted_at,
-        }
-    }
-
-    /// When the store took it, which is when the sender was answered.
-    ///
-    /// Distinct from the moments in [`Outcome`], and the distinction is what a
-    /// time query needs: those say when this proxy last did something about a
-    /// Dispatch, this says when the sender sent it. A reader asking what arrived
-    /// yesterday means the latter.
-    #[must_use]
-    pub fn accepted_at(&self) -> Timestamp {
-        self.accepted_at
-    }
-
-    /// How the store refers to it.
-    #[must_use]
-    pub fn id(&self) -> &DispatchId {
-        &self.id
-    }
-
-    /// What is to be sent, and where.
-    #[must_use]
-    pub fn dispatch(&self) -> &Dispatch {
-        &self.dispatch
-    }
-
-    /// How many times it has been tried, including attempts that failed.
-    #[must_use]
-    pub fn attempts(&self) -> u32 {
-        self.attempts
-    }
-
-    /// What became of it.
-    #[must_use]
-    pub fn outcome(&self) -> Outcome {
-        self.outcome
-    }
-}
-
-/// Where Dispatches wait until they have been sent.
-///
-/// The port the outbox needs. It holds what a verified Delivery *produced* — a
-/// Dispatch per Event per Destination — and not the Delivery itself, which is
-/// the one thing it cannot hold: a `VerifiedDelivery` exists only as the result
-/// of presenting two matching proofs, and there is a `compile_fail` test
-/// asserting no other way to make one. Reading one back from a store would
-/// either need a constructor that forges it, or the proof kept alongside it, and
-/// the proof is derived from a secret. Verification happens once, at the
-/// boundary; what survives it is the intent to tell somebody something.
-///
-/// Nothing here decides *when* to try again or *how often* to give up. The store
-/// is told the moment; the policy belongs to the use case, so that changing it
-/// does not mean changing every implementation of this port.
-#[async_trait]
-pub trait Outbox: Send + Sync {
-    /// Records everything one Delivery produced, before its sender is told.
-    ///
-    /// All of them or none. A Delivery whose Dispatches were half stored and
-    /// then acknowledged is the failure this port exists to prevent: the sender
-    /// believes it is delivered, and the Destinations that were not recorded are
-    /// never attempted and never reported. An implementation that cannot do this
-    /// atomically cannot implement this port.
-    ///
-    /// Each arrives [`Outcome::Waiting`] and due at `at`, so a Dispatch is
-    /// attempted as soon as something looks rather than after a first delay.
-    ///
-    /// Returns what was stored, in the order given, so the caller can say what
-    /// became of each without asking again. The caller sends immediately and
-    /// reports the outcome; the store is what makes a failure survivable, not
-    /// what makes a success slow.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if nothing was stored. The caller refuses the
-    /// sender; it does not fall back to sending without storing.
-    async fn accept(
-        &self,
-        dispatches: &[Dispatch],
-        at: Timestamp,
-    ) -> Result<Vec<Recorded>, StorageUnavailable>;
-
-    /// Everything accepted under this Delivery's identity, and what became of it.
-    ///
-    /// In the order it was accepted, because a reader comparing two runs should
-    /// not have to sort them, and because the order a Delivery fanned out in is
-    /// the order its rules are written in.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be asked. An identity that
-    /// was never accepted is not an error; it is an empty answer.
-    async fn accepted(&self, delivery: &DeliveryId) -> Result<Vec<Recorded>, StorageUnavailable>;
-
-    /// Dispatches waiting and due to be tried, oldest first, at most `limit`.
-    ///
-    /// Claimed by the caller: two processes asking at once must not be handed
-    /// the same Dispatch, because both would send it and a room would see it
-    /// twice. The Deployment runs two replicas, so this is the normal case and
-    /// not an edge one.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be asked.
-    async fn due(&self, now: Timestamp, limit: usize) -> Result<Vec<Recorded>, StorageUnavailable>;
-
-    /// It arrived.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be told. The Notice was
-    /// still delivered; what is lost is the record of it, which is why the
-    /// caller logs rather than retries — retrying would send it twice.
-    async fn delivered(&self, id: &DispatchId, at: Timestamp) -> Result<(), StorageUnavailable>;
-
-    /// It failed, and is worth another attempt at `again_at`.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be told.
-    async fn failed(
-        &self,
-        id: &DispatchId,
-        at: Timestamp,
-        again_at: Timestamp,
-    ) -> Result<(), StorageUnavailable>;
-
-    /// It failed and will not be tried again. This is a loss.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be told.
-    async fn abandoned(&self, id: &DispatchId, at: Timestamp) -> Result<(), StorageUnavailable>;
-}
-
 /// What time it is.
 ///
 /// A port because reading the clock is an effect, and `purity` fails the build
@@ -525,9 +339,10 @@ impl std::error::Error for NotATenant {}
 /// NO DESTINATION, and this is the shape of the whole split. The platform
 /// cannot know a tenant's rooms — routing is the tenant's, in its own
 /// repository — so what is stored is what arrived and whose it is, never where
-/// it is going. Compare [`Recorded`], which carries a Dispatch and therefore a
-/// Destination: that is the model the platform keeps for its own delivery loop,
-/// and this is the model it keeps for somebody else's.
+/// it is going. There used to be a second model beside this one, carrying a
+/// Dispatch and therefore a Destination, for work this service delivered
+/// itself; bead gc-72e.3.2 removed it, because this service no longer delivers
+/// anything.
 ///
 /// WHAT THIS CANNOT CARRY IS STRUCTURAL RATHER THAN CAREFUL. It holds an
 /// `OriginId`, a name, and not an `Origin`, which carries the `Verification`
@@ -793,12 +608,14 @@ pub enum Discharged {
 
 /// Where a verified Delivery waits for the tenant it belongs to.
 ///
-/// Named for the thing that is actually new: a hand-off across a trust
-/// boundary. [`Outbox`] is where this service's own delivery loop keeps work it
-/// will attempt itself; this is where it keeps work somebody else will attempt,
-/// in another namespace, under another team's control, possibly never. The two
-/// are not the same port with a different column, because the unit differs — a
-/// Dispatch there, a Delivery here — and so does who is owed.
+/// Named for the thing that was actually new when it arrived: a hand-off across
+/// a trust boundary. It is where this service keeps work SOMEBODY ELSE will
+/// attempt, in another namespace, under another team's control, possibly never.
+///
+/// It is now the only store. There used to be an `Outbox` beside it holding
+/// work this service attempted itself, one Dispatch per room; bead gc-72e.3.2
+/// removed it with the delivery loop that read it. The two were never the same
+/// port with a different column — the unit differed, and so did who was owed.
 ///
 /// WHAT IS NOT HERE YET, deliberately. There is no claim, no lease and no
 /// report: bead gc-wcw.1 builds the record and bead gc-wcw.2 builds the

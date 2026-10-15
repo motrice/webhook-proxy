@@ -12,8 +12,16 @@
 #     long to wait, how large a body to accept.
 #
 # Secrets are in neither. This file names one; the value is read from a file in
-# the secrets directory, mounted from a Kubernetes Secret. No secret value ever
-# appears here, not even as a placeholder.
+# the secrets directory, rendered there by an agent beside the process. No
+# secret value ever appears here, not even as a placeholder.
+#
+# WHAT IS NOT HERE, AND WHERE IT WENT. There is no `destinations:` and no
+# `subscriptions:` — which rooms hear what is a tenant's own business, decided
+# in the tenant's own repository and delivered by the tenant's own agent (beads
+# gc-g9x and gc-72e.3.2). A file still carrying either is refused, by name, with
+# that explanation. See deploy/alert-agent/config.example.yaml for the other
+# half, and note that NEITHER HALF CAN NAME THE OTHER'S SECRETS: this one holds
+# sender credentials, that one holds room URLs.
 #
 # Nothing is reloaded while running. A change to the ConfigMap rolls the
 # Deployment, so the start-up log always says what was actually loaded — which is
@@ -106,75 +114,3 @@ origins:
     verify:
       bearer:
         secret: grafana-token
-
-# Everywhere an Event can be sent. The address is named, never written: for a
-# chat room served by a generic webhook, possession of the URL is the only
-# credential it has, so putting it here would publish it to everyone who can read
-# this repository.
-destinations:
-  - id: devsecops-room
-    kind: chat_room
-    webhook:
-      secret: devsecops-room-url
-
-  - id: platform-room
-    kind: chat_room
-    webhook:
-      secret: platform-room-url
-
-  - id: audit-room
-    kind: chat_room
-    webhook:
-      secret: audit-room-url
-
-# Which Destination hears which Events.
-#
-# A rule names labels a fact must carry; values are compared for equality and
-# nothing else. No negation and no regular expressions: a regex engine would be a
-# dependency in a crate that has none, and it would run attacker-influenced
-# annotation text through a backtracking matcher.
-#
-# `origin` is a reserved label. The proxy sets it from the verified delivery and a
-# sender cannot, so a rule naming it is trustworthy even though every other label
-# an alert carries comes from whoever can deploy a workload.
-#
-# Exactly one of `match` (non-empty) or `everything: true` per rule. An empty
-# `match` is an error on purpose: a templating accident rendering an empty mapping
-# would turn a narrow rule into a firehose while looking like a formatting change
-# in review, so the most dangerous thing in this file is the hardest to write by
-# accident.
-#
-# Two rules may name the same Destination — that is how a room says it wants two
-# unrelated things — and it is still told once per Event.
-subscriptions:
-  # Pushes to one branch of one repository.
-  - destination: devsecops-room
-    match:
-      origin: github
-      repository: motrice/webhook-proxy
-      branch: main
-
-  # And critical alerts, wherever in the cluster they come from.
-  - destination: devsecops-room
-    match:
-      origin: alertmanager-devsecops
-      severity: critical
-
-  # One team's namespace, at any severity.
-  - destination: platform-room
-    match:
-      origin: alertmanager-platform
-      namespace: platform
-
-  # Grafana puts the rule's folder on every alert it sends, which makes the
-  # folder a routing key: a team owning a folder gets its alerts without anyone
-  # labelling each rule. `grafana_folder` is marked with a * by `check`, because
-  # it is a label only a sender supplies — unlike `origin`, which the proxy sets.
-  - destination: platform-room
-    match:
-      origin: grafana
-      grafana_folder: Platform
-
-  # Everything, said out loud so a reviewer sees it.
-  - destination: audit-room
-    everything: true

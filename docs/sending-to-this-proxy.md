@@ -86,29 +86,31 @@ what it accepted. That is also why there is a second way to get a `503`. Rather
 than accept something it cannot promise to keep, the proxy refuses everything
 while the store is unreachable — a loud refusal instead of a quiet downgrade.
 
-### What happens after it is written down, and a change to this promise
+### What happens after it is written down
 
-Two things happen to a stored delivery today, and one of them is going away.
+**It is offered to the team your sender belongs to**, whose own agent delivers
+it to that team's rooms by that team's own rules. Each sender is registered as
+belonging to exactly one team, and which rooms hear what is decided in that
+team's repository — not here.
 
-- **This proxy attempts each matching room itself**, retrying until it succeeds
-  or the attempt budget runs out. That is the promise this document has carried
-  so far.
-- **It is also offered to the team the sender belongs to**, whose own agent
-  delivers it to that team's rooms by that team's own rules. Each sender is
-  registered as belonging to exactly one team.
+So `202` means **stored, and offered to the team whose sender you are.** That is
+*weaker* than what this document promised until recently, and the weaker
+statement is the honest one: this proxy no longer attempts a room itself, so a
+team whose agent is broken leaves alerts sitting where this proxy would once
+have tried and reported a loss. **Nobody will tell you that has happened** — it
+is visible to whoever runs the proxy, as a count and a log, and to the team, in
+its own agent's log. It is not visible in anything you get back.
 
-The second is replacing the first. When it does, `202` will mean **stored, and
-offered to the team whose sender you are** — which is *weaker* than what this
-document used to promise, and the weaker statement is the honest one: a team
-whose agent is broken leaves alerts sitting where this proxy would previously
-have tried, and reported a loss. It is written here now rather than when it
-changes, because a sender reading the old promise would be misled about who is
-responsible for an alert that never arrives.
+Nothing about what you send or how you send it changed when that did.
 
-Nothing about what you send or how you send it changes. **One thing worth
-knowing even so:** an alert nobody ever collects is kept for a month and then
-dropped, logged and counted as the loss it is — so "accepted" has never meant
-"kept indefinitely", and now it says so.
+**Two things worth knowing even so:**
+
+- An alert nobody ever collects is kept for a month and then dropped, logged and
+  counted as the loss it is. "Accepted" has never meant "kept indefinitely", and
+  now it says so.
+- A delivery can be sent to its team again, by identity, by somebody who runs
+  the proxy. The room shows `(replayed)` when that happens, so a responder can
+  tell a resend from a situation getting worse.
 
 So: do not treat `202` as proof a human saw anything, and do not retry on it.
 

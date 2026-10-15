@@ -17,13 +17,9 @@ mod deliver;
 pub mod ports;
 mod relay;
 mod retention;
-mod retries;
-mod tally;
 
 pub use backlog::{Backlog, Outstanding};
 pub use collect::{Collect, Refused as NotCollected};
-pub use deliver::{Deliver, Delivered, idle_for};
-pub use relay::{Refused, Relay, Relayed, Retry};
+pub use deliver::{Deliver, Delivered, Retry, idle_for};
+pub use relay::{Refused, Relay, Relayed};
 pub use retention::{Reaped, Retention};
-pub use retries::{Attempted, Retries};
-pub use tally::{Counts, Tally};

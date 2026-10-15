@@ -79,9 +79,12 @@ pub struct Declared {
 /// Everything the composition root needs in order to start.
 #[derive(Clone)]
 pub struct Configuration {
-    /// The rooms, their rules and the secret values behind both. Shared with a
-    /// tenant's configuration because it is the same reading.
-    rooms: Rooms,
+    /// Every secret value this deployment uses, by the name the file gave it.
+    ///
+    /// Sender secrets, and nothing else. A room URL cannot be here: this file
+    /// cannot name one, which is the property bead gc-g9x said makes the split
+    /// worth having.
+    secrets: HashMap<String, String>,
     /// Every tenant this deployment serves, as the file lists them.
     ///
     /// LISTED, NEVER INFERRED from the Origins that mention them (bead gc-nkb).
@@ -102,12 +105,10 @@ impl fmt::Debug for Configuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Configuration({} tenants, {} origins, {} destinations, {} rules, {} secrets loaded)",
+            "Configuration({} tenants, {} origins, {} secrets loaded)",
             self.tenants.len(),
             self.origins.len(),
-            self.rooms.webhooks.len(),
-            self.rooms.subscriptions.len(),
-            self.rooms.secrets.len()
+            self.secrets.len()
         )
     }
 }
@@ -162,8 +163,19 @@ struct Document {
     version: u8,
     tenants: Vec<String>,
     origins: Vec<OriginEntry>,
-    destinations: Vec<DestinationEntry>,
-    subscriptions: Vec<SubscriptionEntry>,
+
+    /// Accepted by the parser only so they can be refused with a sentence that
+    /// says where they went.
+    ///
+    /// They were this document's until bead gc-72e.3.2: this service routed and
+    /// delivered, so it held the rooms and the rules. It does neither now, and
+    /// a file still carrying them is a file somebody has not finished splitting
+    /// — which `deny_unknown_fields` would report as "unknown field", true and
+    /// useless.
+    #[serde(default)]
+    destinations: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    subscriptions: Option<serde_yaml_ng::Value>,
 }
 
 /// The tenant's half of the file, which is a different document.
@@ -264,6 +276,70 @@ struct SubscriptionEntry {
     everything: Option<bool>,
 }
 
+/// Reads one secret by name into `into`, or says exactly what is wrong.
+///
+/// A free function rather than a method, because both halves of the
+/// configuration need it and they no longer share a type: the platform holds
+/// sender secrets, a tenant holds room URLs, and neither may name the other's.
+/// What they do share is this rule about what a name may contain, which must
+/// exist once — it is the only thing standing between a name in a reviewable
+/// file and a path that walks up the tree.
+fn read_secret(
+    file: &Path,
+    secrets: &Path,
+    at: &str,
+    named: &str,
+    into: &mut HashMap<String, String>,
+) -> Result<SecretId, Unusable> {
+    let id = SecretId::new(named)
+        .map_err(|blank| Unusable::at(file, format!("{at}.secret"), blank.to_string()))?;
+
+    if !is_nameable(id.as_str()) {
+        return Err(Unusable::at(
+            file,
+            format!("{at}.secret"),
+            format!(
+                "names {:?}, which is not a usable file name. A secret name may \
+             hold letters, digits, underscore, dot and hyphen only — it \
+             becomes a path, and this file is editable by more people than \
+             the secrets it names",
+                id.as_str()
+            ),
+        ));
+    }
+
+    if !into.contains_key(id.as_str()) {
+        let path = secrets.join(id.as_str());
+        let value = std::fs::read_to_string(&path).map_err(|_| {
+            Unusable::at(
+                file,
+                format!("{at}.secret"),
+                format!(
+                    "names {:?}, and no secret of that name is in {}",
+                    id.as_str(),
+                    secrets.display()
+                ),
+            )
+        })?;
+
+        // Trailing whitespace is an editor's doing, not the secret's. A
+        // blank one is a configuration mistake and is refused here rather
+        // than failing every request later.
+        let value = value.trim_end_matches(['\n', '\r']).to_owned();
+        if value.trim().is_empty() {
+            return Err(Unusable::at(
+                file,
+                format!("{at}.secret"),
+                format!("names {:?}, whose secret is empty", id.as_str()),
+            ));
+        }
+
+        into.insert(id.as_str().to_owned(), value);
+    }
+
+    Ok(id)
+}
+
 /// The rooms half of either file: where each room is reached, which rules select
 /// it, and the secret values behind both.
 ///
@@ -301,7 +377,13 @@ impl Rooms {
                 ));
             }
 
-            let secret = self.read_secret(file, secrets, &at("webhook"), &entry.webhook.secret)?;
+            let secret = read_secret(
+                file,
+                secrets,
+                &at("webhook"),
+                &entry.webhook.secret,
+                &mut self.secrets,
+            )?;
             // The address never enters the domain: a Destination is an identity
             // and a kind, and this table is what the outbound adapter reaches
             // for. Looked up by the secret's name so the value is held once.
@@ -396,63 +478,6 @@ impl Rooms {
 
         Ok(())
     }
-
-    /// Reads one named secret, recording its value against its name.
-    fn read_secret(
-        &mut self,
-        file: &Path,
-        secrets: &Path,
-        at: &str,
-        named: &str,
-    ) -> Result<SecretId, Unusable> {
-        let id = SecretId::new(named)
-            .map_err(|blank| Unusable::at(file, format!("{at}.secret"), blank.to_string()))?;
-
-        if !is_nameable(id.as_str()) {
-            return Err(Unusable::at(
-                file,
-                format!("{at}.secret"),
-                format!(
-                    "names {:?}, which is not a usable file name. A secret name may \
-                     hold letters, digits, underscore, dot and hyphen only — it \
-                     becomes a path, and this file is editable by more people than \
-                     the secrets it names",
-                    id.as_str()
-                ),
-            ));
-        }
-
-        if !self.secrets.contains_key(id.as_str()) {
-            let path = secrets.join(id.as_str());
-            let value = std::fs::read_to_string(&path).map_err(|_| {
-                Unusable::at(
-                    file,
-                    format!("{at}.secret"),
-                    format!(
-                        "names {:?}, and no secret of that name is in {}",
-                        id.as_str(),
-                        secrets.display()
-                    ),
-                )
-            })?;
-
-            // Trailing whitespace is an editor's doing, not the secret's. A
-            // blank one is a configuration mistake and is refused here rather
-            // than failing every request later.
-            let value = value.trim_end_matches(['\n', '\r']).to_owned();
-            if value.trim().is_empty() {
-                return Err(Unusable::at(
-                    file,
-                    format!("{at}.secret"),
-                    format!("names {:?}, whose secret is empty", id.as_str()),
-                ));
-            }
-
-            self.secrets.insert(id.as_str().to_owned(), value);
-        }
-
-        Ok(id)
-    }
 }
 
 impl Configuration {
@@ -479,8 +504,27 @@ impl Configuration {
             ));
         }
 
+        // Refused with a reason rather than ignored, and the reason is where
+        // they went rather than that they are unknown.
+        for (present, field) in [
+            (document.destinations.is_some(), "destinations"),
+            (document.subscriptions.is_some(), "subscriptions"),
+        ] {
+            if present {
+                return Err(Unusable::at(
+                    file,
+                    field,
+                    "belongs to a tenant's configuration now, not the platform's: \
+                     this service does not route and does not reach a room, so \
+                     which rooms hear what is decided in the tenant's own \
+                     repository by its own agent — see deploy/alert-agent and \
+                     bead gc-g9x",
+                ));
+            }
+        }
+
         let mut config = Self {
-            rooms: Rooms::default(),
+            secrets: HashMap::new(),
             tenants: BTreeSet::new(),
             origins: HashMap::new(),
         };
@@ -488,12 +532,6 @@ impl Configuration {
         // Before the Origins, because an Origin is checked against this list.
         config.read_tenants(file, &document.tenants)?;
         config.read_origins(file, secrets, &document.origins)?;
-        let declared = config
-            .rooms
-            .read_destinations(file, secrets, &document.destinations)?;
-        config
-            .rooms
-            .read_subscriptions(file, &declared, &document.subscriptions)?;
 
         Ok(config)
     }
@@ -573,9 +611,13 @@ impl Configuration {
                 ));
             }
 
-            let secret = self
-                .rooms
-                .read_secret(file, secrets, &at("verify"), &holder.secret)?;
+            let secret = read_secret(
+                file,
+                secrets,
+                &at("verify"),
+                &holder.secret,
+                &mut self.secrets,
+            )?;
             let verify = match mechanism.as_str() {
                 SIGNED => Verification::Signed { secret },
                 SHARED => Verification::Shared { secret },
@@ -686,33 +728,16 @@ impl Configuration {
             );
         }
 
-        out.push_str("\nrooms  (* marks a label only a sender can supply)\n");
-        let mut rooms: Vec<&String> = self.rooms.webhooks.keys().collect();
-        rooms.sort();
-        for room in rooms {
-            let _ = writeln!(out, "  {room}");
-            let mut selected = 0usize;
-            for subscription in &self.rooms.subscriptions {
-                if subscription.destination().id().as_str() != room {
-                    continue;
-                }
-                selected += 1;
-                let _ = writeln!(out, "    - {}", describe(subscription.filter()));
-            }
-            if selected == 0 {
-                // The failure this exists to make visible.
-                out.push_str("    (nothing selects this room)\n");
-            }
-        }
-
+        // No rooms and no rules, and their absence is the whole of bead
+        // gc-72e.3.2 as a reviewer sees it. This service verifies a sender and
+        // owes the alert to a tenant; which rooms hear what is in the tenant's
+        // own file, and `alert-agent check` is what prints that.
         let _ = writeln!(
             out,
-            "\n{} tenant(s), {} sender(s), {} room(s), {} rule(s), {} secret(s) present",
+            "\n{} tenant(s), {} sender(s), {} secret(s) present",
             self.tenants.len(),
             self.origins.len(),
-            self.rooms.webhooks.len(),
-            self.rooms.subscriptions.len(),
-            self.rooms.secrets.len()
+            self.secrets.len()
         );
 
         out
@@ -730,22 +755,10 @@ impl Configuration {
         &self.origins
     }
 
-    /// Every rule, in the order the file gave them.
-    #[must_use]
-    pub fn subscriptions(&self) -> &[Subscription] {
-        &self.rooms.subscriptions
-    }
-
     /// Every secret value, by the name the file used.
     #[must_use]
     pub fn secrets(&self) -> &HashMap<String, String> {
-        &self.rooms.secrets
-    }
-
-    /// Where each Destination is reached, by its identity.
-    #[must_use]
-    pub fn webhooks(&self) -> &HashMap<String, String> {
-        &self.rooms.webhooks
+        &self.secrets
     }
 }
 
@@ -968,10 +981,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use domain::{
-        BranchName, Event, LabelName, LabelValue, Labels, OriginId, Pusher, RepositoryName,
-        Verification, destinations_for,
-    };
+    use domain::Verification;
 
     use super::Configuration;
 
@@ -1041,15 +1051,6 @@ origins:
     verify:
       hmac_sha256:
         secret: a-secret
-destinations:
-  - id: a-room
-    kind: chat_room
-    webhook:
-      secret: a-url
-subscriptions:
-  - destination: a-room
-    match:
-      origin: a-forge
 "
         .to_owned()
     }
@@ -1063,48 +1064,10 @@ subscriptions:
         .expect("writable");
     }
 
-    fn push_to(repository: &str, branch: &str) -> Event {
-        Event::PushedCommits {
-            repository: RepositoryName::new(repository).expect("a name"),
-            branch: BranchName::new(branch).expect("a name"),
-            pusher: Pusher::new("bjorn").expect("a name"),
-            commits: vec![],
-            permalink: None,
-        }
-    }
-
-    fn alert_labelled(pairs: &[(&str, &str)]) -> Event {
-        Event::Alert {
-            id: domain::AlertId::new("abc").expect("an identity"),
-            severity: domain::Severity::Unstated,
-            status: domain::AlertStatus::Firing,
-            summary: domain::Summary::new("something").expect("a summary"),
-            labels: pairs.iter().fold(Labels::none(), |set, (n, v)| {
-                set.with(
-                    LabelName::new(n).expect("a name"),
-                    LabelValue::new(v).expect("a value"),
-                )
-            }),
-            started: domain::Timestamp::from_millis_since_epoch(0),
-            permalink: None,
-        }
-    }
-
-    fn reached(config: &Configuration, origin: &str, event: &Event) -> Vec<String> {
-        destinations_for(
-            &OriginId::new(origin).expect("an identity"),
-            event,
-            config.subscriptions(),
-        )
-        .into_iter()
-        .map(|d| d.id().as_str().to_owned())
-        .collect()
-    }
-
     // ---- the published example ------------------------------------------
 
     #[test]
-    fn the_published_example_produces_the_routing_it_describes() {
+    fn the_published_example_declares_the_senders_it_describes() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         secrets_for_the_example(dir.path());
 
@@ -1116,72 +1079,25 @@ subscriptions:
         // accident, so the count is asserted rather than left to drift.
         assert_eq!(config.tenants().len(), 2);
         assert_eq!(config.origins().len(), 4);
-        assert_eq!(config.webhooks().len(), 3);
-        assert_eq!(config.subscriptions().len(), 5);
+        // One secret per sender and nothing else. A room URL cannot be in this
+        // half of the configuration, which is the property gc-g9x said makes
+        // the split worth having — and the tenant module asserts the other
+        // direction across both published examples.
+        assert_eq!(config.secrets().len(), 4);
 
-        // Parsing is not the point; this is. A push to main of that repository,
-        // from the forge, reaches the room watching it and the room watching
-        // everything — and nothing else.
+        // What a rule would match on, which is the one thing this half still
+        // decides about routing: the Origin identity a tenant's file names.
+        // Longer than a tenant expects, deliberately (gc-nkb).
+        let mut senders: Vec<&String> = config.origins().keys().collect();
+        senders.sort();
         assert_eq!(
-            reached(&config, "github", &push_to("motrice/webhook-proxy", "main")),
-            vec!["devsecops-room", "audit-room"]
-        );
-
-        // A push to another branch is not that rule's business.
-        assert_eq!(
-            reached(
-                &config,
-                "github",
-                &push_to("motrice/webhook-proxy", "topic")
-            ),
-            vec!["audit-room"]
-        );
-
-        // A critical alert reaches the same room by a different rule, which is
-        // the point of one mechanism serving both senders.
-        assert_eq!(
-            reached(
-                &config,
+            senders,
+            vec![
                 "alertmanager-devsecops",
-                &alert_labelled(&[("severity", "critical")])
-            ),
-            vec!["devsecops-room", "audit-room"]
-        );
-
-        // And one team's namespace reaches that team.
-        assert_eq!(
-            reached(
-                &config,
                 "alertmanager-platform",
-                &alert_labelled(&[("namespace", "platform")])
-            ),
-            vec!["platform-room", "audit-room"]
-        );
-
-        // THE RULES ARE PER ORIGIN AND THE ORIGINS ARE PER TENANT, so one
-        // tenant's Alertmanager cannot reach the other's room by sending the
-        // other's label. That is bead gc-nkb's whole argument made executable:
-        // `namespace: platform` on an alert from the devsecops credential
-        // selects nothing but the room that takes everything, because the rule
-        // naming that room also names which Origin it trusts.
-        assert_eq!(
-            reached(
-                &config,
-                "alertmanager-devsecops",
-                &alert_labelled(&[("namespace", "platform")])
-            ),
-            vec!["audit-room"]
-        );
-
-        // A sender cannot reach a room by claiming to be the other Origin: the
-        // origin label comes from the delivery, not from the payload.
-        assert_eq!(
-            reached(
-                &config,
-                "somebody-else",
-                &alert_labelled(&[("severity", "critical")])
-            ),
-            vec!["audit-room"]
+                "github",
+                "grafana"
+            ]
         );
     }
 
@@ -1225,93 +1141,6 @@ subscriptions:
     // ---- the routing table ----------------------------------------------
 
     #[test]
-    fn the_table_shows_what_the_published_example_actually_routes() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        secrets_for_the_example(dir.path());
-        let config = Configuration::read(Path::new(EXAMPLE), dir.path()).expect("it parses");
-
-        let table = config.routing_table();
-
-        // Each sender, by the path it answers on and how it proves itself.
-        assert!(
-            table.contains("/webhook/github  signs its body, speaks github"),
-            "{table}"
-        );
-        assert!(
-            table.contains(
-                "/webhook/alertmanager-devsecops  presents a shared value, \
-                 speaks alertmanager, for tenant devsecops"
-            ),
-            "{table}"
-        );
-
-        // Whose each sender's alerts are, which is the thing a reviewer of this
-        // file most needs to see and cannot infer: the tenant decides which
-        // agent is ever offered the alert, and it is read from here.
-        assert!(table.contains("for tenant platform"), "{table}");
-        // And the tenants themselves, listed, with nothing marked — every one of
-        // them has a sender in this example.
-        assert!(table.contains("tenants  (*"), "{table}");
-        assert!(!table.contains("platform  *"), "{table}");
-
-        // Each room with the rules that select it.
-        assert!(table.contains("devsecops-room"), "{table}");
-        // Alphabetical, because Labels is a map and a table a reader compares
-        // between deploys must not reorder itself.
-        assert!(
-            table.contains("- branch=main origin=github repository=motrice/webhook-proxy"),
-            "{table}"
-        );
-        assert!(table.contains("everything"), "{table}");
-
-        assert!(
-            table.contains("2 tenant(s), 4 sender(s), 3 room(s), 5 rule(s), 7 secret(s) present"),
-            "{table}"
-        );
-    }
-
-    #[test]
-    fn a_label_only_a_sender_can_supply_is_marked() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        secrets_for_the_example(dir.path());
-        let config = Configuration::read(Path::new(EXAMPLE), dir.path()).expect("it parses");
-
-        let table = config.routing_table();
-
-        // namespace is the sender's, so it carries the marker; origin and
-        // severity are ours, so they do not.
-        assert!(table.contains("namespace*=platform"), "{table}");
-        assert!(table.contains("severity=critical"), "{table}");
-        assert!(!table.contains("severity*="), "{table}");
-        assert!(!table.contains("origin*="), "{table}");
-    }
-
-    #[test]
-    fn a_room_nothing_selects_says_so() {
-        // The failure this whole subcommand exists to make visible: a typo in a
-        // rule leaves a room that will never hear anything, and nothing about the
-        // file is invalid.
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        sound_secrets(dir.path());
-        fs::write(dir.path().join("b-url"), "https://rooms.example/hook/B").expect("writable");
-
-        let yaml = sound().replace(
-            "destinations:\n  - id: a-room",
-            "destinations:\n  - id: forgotten-room\n    kind: chat_room\n    webhook:\n      secret: b-url\n  - id: a-room",
-        );
-        let file = written(dir.path(), &yaml);
-        let config = Configuration::read(&file, dir.path()).expect("it parses");
-
-        let table = config.routing_table();
-
-        assert!(table.contains("forgotten-room"), "{table}");
-        assert!(table.contains("(nothing selects this room)"), "{table}");
-        // And the room that is selected does not say it.
-        let after = table.split("a-room").nth(1).expect("a-room appears");
-        assert!(!after.starts_with("\n    (nothing"), "{table}");
-    }
-
-    #[test]
     fn the_table_never_prints_a_secret_value() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         sound_secrets(dir.path());
@@ -1320,11 +1149,10 @@ subscriptions:
 
         let table = config.routing_table();
 
-        assert!(!table.contains("SUPERSECRETHOOKID"), "{table}");
         assert!(!table.contains("shhh"), "{table}");
         assert!(!table.contains("://"), "{table}");
         // The count is fine; the values are not.
-        assert!(table.contains("2 secret(s) present"), "{table}");
+        assert!(table.contains("1 secret(s) present"), "{table}");
     }
 
     #[test]
@@ -1356,30 +1184,18 @@ subscriptions:
     #[test]
     fn every_refusal_names_the_file_and_the_path_to_the_field() {
         // The whole operator experience of a bad deploy is this one line.
-        let bad = sound().replace("destination: a-room", "destination: no-such-room");
+        let bad = sound().replace("secret: a-secret", "secret: no-such-secret");
         let e = refused(&bad);
 
         let message = e.to_string();
         assert!(message.contains("config.yaml"), "{message}");
-        assert!(
-            message.contains("subscriptions[0].destination"),
-            "{message}"
-        );
-        assert_eq!(e.path(), "subscriptions[0].destination");
-    }
-
-    #[test]
-    fn a_rule_naming_a_destination_nobody_declared_is_refused() {
-        let bad = sound().replace("destination: a-room", "destination: no-such-room");
-        let e = refused(&bad);
-
-        assert_eq!(e.path(), "subscriptions[0].destination");
-        assert!(e.to_string().contains("no-such-room"), "{e}");
+        assert!(message.contains("origins[0].verify.secret"), "{message}");
+        assert_eq!(e.path(), "origins[0].verify.secret");
     }
 
     #[test]
     fn a_field_nobody_knows_is_refused_and_named() {
-        let bad = sound().replace("  - id: a-room", "  - id: a-room\n    colour: blue");
+        let bad = sound().replace("  - id: a-forge", "  - id: a-forge\n    colour: blue");
         let e = refused(&bad);
 
         // serde names the field; this crate names the file.
@@ -1424,18 +1240,6 @@ subscriptions:
 
         assert_eq!(e.path(), "origins[0].verify.secret");
         assert!(e.to_string().contains("not a usable file name"), "{e}");
-    }
-
-    #[test]
-    fn a_file_with_no_rules_is_refused_rather_than_starting_silent() {
-        let bad = sound().replace(
-            "subscriptions:\n  - destination: a-room\n    match:\n      origin: a-forge",
-            "subscriptions: []",
-        );
-        let e = refused(&bad);
-
-        assert_eq!(e.path(), "subscriptions");
-        assert!(e.to_string().contains("reporting healthy"), "{e}");
     }
 
     // ---- tenants ---------------------------------------------------------
@@ -1507,54 +1311,15 @@ subscriptions:
 
     #[test]
     fn two_origins_with_one_identity_are_refused() {
-        let bad = sound().replace(
-            "destinations:",
-            "  - id: a-forge\n    tenant: a-tenant\n    speaks: github\n    verify:\n      bearer:\n        secret: a-secret\ndestinations:",
+        let bad = format!(
+            "{}  - id: a-forge\n    tenant: a-tenant\n    speaks: github\n    verify:\n      \
+             bearer:\n        secret: a-secret\n",
+            sound()
         );
         let e = refused(&bad);
 
         assert_eq!(e.path(), "origins[1].id");
         assert!(e.to_string().contains("declared twice"), "{e}");
-    }
-
-    #[test]
-    fn two_destinations_with_one_identity_are_refused() {
-        let bad = sound().replace(
-            "subscriptions:",
-            "  - id: a-room\n    kind: chat_room\n    webhook:\n      secret: a-url\nsubscriptions:",
-        );
-        let e = refused(&bad);
-
-        assert_eq!(e.path(), "destinations[1].id");
-    }
-
-    #[test]
-    fn an_empty_match_is_refused_and_says_what_to_write_instead() {
-        let bad = sound().replace("    match:\n      origin: a-forge", "    match: {}");
-        let e = refused(&bad);
-
-        assert_eq!(e.path(), "subscriptions[0].match");
-        assert!(e.to_string().contains("everything: true"), "{e}");
-    }
-
-    #[test]
-    fn a_rule_with_both_match_and_everything_is_refused() {
-        let bad = sound().replace(
-            "    match:\n      origin: a-forge",
-            "    everything: true\n    match:\n      origin: a-forge",
-        );
-        let e = refused(&bad);
-
-        assert_eq!(e.path(), "subscriptions[0]");
-    }
-
-    #[test]
-    fn a_rule_with_neither_match_nor_everything_is_refused() {
-        let bad = sound().replace("    match:\n      origin: a-forge", "");
-        let e = refused(&bad);
-
-        assert_eq!(e.path(), "subscriptions[0]");
-        assert!(e.to_string().contains("stay silent"), "{e}");
     }
 
     #[test]

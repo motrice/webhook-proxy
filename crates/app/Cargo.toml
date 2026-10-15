@@ -17,7 +17,6 @@ path = "src/main.rs"
 [dependencies]
 domain = { path = "../domain" }
 application = { path = "../application" }
-element-notices = { path = "../adapters/element-notices" }
 inbound-http = { path = "../adapters/inbound-http" }
 github-payload = { path = "../adapters/github-payload" }
 github-signatures = { path = "../adapters/github-signatures" }
@@ -25,6 +24,8 @@ shared-values = { path = "../adapters/shared-values" }
 alertmanager-payload = { path = "../adapters/alertmanager-payload" }
 grafana-payload = { path = "../adapters/grafana-payload" }
 yaml-config = { path = "../adapters/yaml-config" }
+# Named for an outbox it no longer holds: it is the in-memory handover now.
+# Renaming the crate is its own small job (bead gc-72e.3.2).
 memory-outbox = { path = "../adapters/memory-outbox" }
 postgres-outbox = { path = "../adapters/postgres-outbox" }
 system = { path = "../adapters/system" }

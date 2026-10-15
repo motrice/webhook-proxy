@@ -24,13 +24,13 @@ info:
     independently. Do not treat a `202` as proof a human saw anything, and do
     not retry on it.
 
-    **That promise is being weakened, and this says so before it changes.** A
-    stored delivery is attempted by this service today, and is also offered to
-    the team the sender belongs to, whose own agent delivers it by that team's
-    rules. The second is replacing the first, after which a `202` means *stored,
-    and offered to that team* — weaker, and more honest: a team whose agent is
-    broken leaves alerts sitting where this service would previously have tried
-    and reported a loss. See `x-limitations` for what that costs a sender.
+    **A `202` means stored and offered to the team the sender belongs to.** This
+    service does not attempt a room itself: it verifies, stores, and offers the
+    delivery to that team, whose own agent delivers it by its own rules to rooms
+    this service does not know. That is weaker than an earlier version of this
+    document promised, and more honest — a team whose agent is broken leaves
+    alerts sitting here, and nothing in a response says so. See `x-limitations`
+    for what that costs a sender.
 
     **Each sender defines how it proves itself, and this interface accommodates
     both.** GitHub signs the body; Alertmanager and Grafana send a token. The
@@ -95,8 +95,10 @@ info:
   x-limitations: |
     At-least-once, with limits worth knowing before relying on this:
 
-    - Delivery is attempted a bounded number of times. A room unreachable for
-      long enough loses that message, and the loss is logged and counted.
+    - Delivery is attempted a bounded number of times, by the team's own agent
+      rather than by this service. A room unreachable for long enough loses that
+      message, and the loss is logged where it happened — in that team's
+      namespace, not here.
     - An alert nobody ever collects is kept for one month from acceptance and
       then dropped. The deletion is logged and counted as a loss rather than
       happening quietly, but no response ever told the sender about it, and
@@ -316,8 +318,11 @@ paths:
     get:
       summary: What each room was sent, for a scraper.
       description: |
-        Prometheus text format. Carries counts per destination identity and
-        nothing else: no address, no secret, no part of any payload.
+        Prometheus text format. Carries counts per TEAM: how much each has not
+        yet collected, how old the oldest of that is, and how much was dropped
+        uncollected. Nothing per room, because this service reaches none — what
+        a room saw is in its team's own agent's log. No address, no secret, no
+        part of any payload.
       operationId: metrics
       security: []
       responses:

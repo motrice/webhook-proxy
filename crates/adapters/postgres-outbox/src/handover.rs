@@ -1,10 +1,9 @@
 //! Deliveries owed to their tenants, against a real database.
 //!
-//! A second store beside [`crate::PostgresOutbox`], sharing its pool and its
-//! migrator. In this crate rather than its own because an adapter may not
-//! depend on another adapter: a separate crate could not reach this one's
-//! connection pool, and two pools against one database is a worse thing to own
-//! than one crate holding two tables.
+//! The only store now. There was a second one beside it, holding work this
+//! service delivered itself, until bead gc-72e.3.2 removed the delivery loop
+//! that read it — so the connection and the migrator moved here, where they
+//! had been borrowed from.
 
 use application::ports::{
     Behind, Claimed, Discharged, Handover, Offered, Reoffered, Report, RoomOutcome,
@@ -13,15 +12,22 @@ use application::ports::{
 use async_trait::async_trait;
 use domain::{Correlation, DeliveryId, OriginId, Timestamp};
 use sqlx::Row;
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use crate::stored;
 
+/// Applied at start-up, behind an advisory lock sqlx takes for us.
+///
+/// That lock is the answer to "the schema is created by something two replicas
+/// cannot race": both may run this, one waits, and the second finds the work
+/// already done rather than doing it again.
+static SCHEMA: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// Deliveries waiting for their tenants, in `PostgreSQL`.
 ///
-/// `Debug` prints what is safe and nothing else, for the reason
-/// [`crate::PostgresOutbox`] gives: a connection string carries a password and
-/// drivers put theirs in error messages as a matter of course.
+/// `Debug` prints what is safe and nothing else: a connection string carries a
+/// password, and database drivers put theirs in error messages as a matter of
+/// course — see bead gc-b0n. Nothing here will put one in a log.
 pub struct PostgresHandover {
     pool: PgPool,
 }
@@ -33,11 +39,38 @@ impl core::fmt::Debug for PostgresHandover {
 }
 
 impl PostgresHandover {
-    /// Uses a pool somebody else made, which is how it shares one with the
-    /// outbox: one pool, one migrator, one advisory lock at start-up.
+    /// Connects, and brings the schema up to date.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the database cannot be reached or the schema
+    /// cannot be applied. Deliberately carries nothing else: the caller logs
+    /// this, and the driver's own error would name the host and the password.
+    pub async fn connect(url: &str, connections: u32) -> Result<Self, StorageUnavailable> {
+        let pool = PgPoolOptions::new()
+            .max_connections(connections)
+            .connect(url)
+            .await
+            .map_err(|_| StorageUnavailable)?;
+
+        SCHEMA.run(&pool).await.map_err(|_| StorageUnavailable)?;
+
+        Ok(Self { pool })
+    }
+
+    /// Uses a pool somebody else made. For tests, which bring their own.
     #[must_use]
     pub fn using(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Brings the schema up to date on a pool already connected.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the schema cannot be applied.
+    pub async fn migrate(pool: &PgPool) -> Result<(), StorageUnavailable> {
+        SCHEMA.run(pool).await.map_err(|_| StorageUnavailable)
     }
 
     /// The pool, for a test that needs to look at the table itself.

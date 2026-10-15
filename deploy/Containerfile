@@ -34,8 +34,9 @@ COPY . .
 # tested.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked --bin webhook-proxy \
-    && cp /src/target/release/webhook-proxy /usr/local/bin/webhook-proxy
+    cargo build --release --locked --bin webhook-proxy --bin alert-agent \
+    && cp /src/target/release/webhook-proxy /usr/local/bin/webhook-proxy \
+    && cp /src/target/release/alert-agent /usr/local/bin/alert-agent
 
 # Distroless rather than debian-slim: no shell, no package manager, nothing to
 # live off. `cc` rather than `static` because the build above is a glibc build.
@@ -50,7 +51,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # image locally — not by poking at a running pod.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
+# BOTH BINARIES IN ONE IMAGE, which is a decision rather than laziness. They
+# are two deployments and they ship together: built from one commit, verified by
+# one gate, and released as one tag — so a platform and an agent that disagree
+# about the hand-off format cannot be deployed from the same tag. Two images
+# would make that possible, and the format is agreed between the two
+# composition roots with nothing else checking it (see crates/app/tests/
+# cutover.rs). The cost is a few megabytes in a tenant's namespace.
+#
+# The entrypoint picks which one runs. The agent's Deployment names
+# `alert-agent`; the platform's names nothing and gets the default below.
 COPY --from=build /usr/local/bin/webhook-proxy /usr/local/bin/webhook-proxy
+COPY --from=build /usr/local/bin/alert-agent /usr/local/bin/alert-agent
 
 # 65532, the uid distroless's `nonroot` tag provides. Stated here, and this is
 # load-bearing rather than belt-and-braces: the Deployment names no uid, so a

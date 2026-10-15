@@ -1,0 +1,116 @@
+# The tenant agent, in a tenant's own namespace.
+#
+# WHAT IS NOT HERE IS MOST OF THE POINT. There is no Service, no HTTPRoute and
+# no ingress NetworkPolicy, because nothing reaches this: it PULLS. That absence
+# is most of what "thin" means (bead gc-72e), and it is why a tenant running
+# this takes on no public surface of its own.
+#
+# There is also no database. What has not been delivered is the platform's to
+# remember; this process forgets everything at exit and is offered the work
+# again when its lease lapses.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-agent
+  # REPLACE: the tenant's own namespace. The platform derives which tenant this
+  # agent speaks for from THIS name, through the SPIFFE identity the mesh
+  # presents — so it is not configuration, it is the identity. See
+  # docs/tenant-agent-api.md.
+  namespace: example-tenant
+  labels:
+    app.kubernetes.io/name: alert-agent
+spec:
+  # ONE, and this is the one place this deployment differs from the platform's
+  # reasoning. Two replicas would both claim, and the platform hands each
+  # Delivery to exactly one of them — so two would work correctly and halve
+  # nothing: the work is one message per alert, not a queue to parallelise. One
+  # pod also means one loss log to read, which in a version with no read API is
+  # the thing an operator actually uses.
+  replicas: 1
+  strategy:
+    # Not RollingUpdate: two agents briefly running is correct but pointless,
+    # and a claim held by a pod being terminated lapses and is offered again
+    # rather than being lost. Recreate keeps "one agent" true at all times,
+    # which makes a log easier to read than a few seconds of overlap would.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alert-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alert-agent
+    spec:
+      # The identity the platform authorises. Its namespace IS the tenant and
+      # its name is what the platform's AuthorizationPolicy lists, so renaming
+      # either stops this agent being offered anything — which is the correct
+      # failure, and a loud one: it gets 403 and logs it.
+      serviceAccountName: alert-agent
+      # No uid, gid or fsGroup, for the reason deploy/webhook-proxy/deployment.yaml
+      # gives at length: a cluster that assigns them refuses a workload that
+      # names its own.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: alert-agent
+          # The same image as the platform, and the same tag. They are two
+          # deployments that ship together — one commit, one gate, one tag — so
+          # an agent and a platform that disagree about the hand-off format
+          # cannot be deployed from the same release. Only the command differs.
+          image: ghcr.io/motrice/webhook-proxy:main
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/alert-agent"]
+          env:
+            # Where the platform answers. The mesh is what makes this address
+            # trustworthy in both directions: it authenticates the platform to
+            # this agent, and this agent to the platform.
+            - name: ALERT_AGENT_PLATFORM
+              # REPLACE: the platform Service, in its own namespace.
+              value: http://webhook-proxy.webhook-proxy.svc.cluster.local:8080
+            - name: ALERT_AGENT_CONFIG
+              value: /etc/alert-agent/routing/config.yaml
+            - name: ALERT_AGENT_SECRETS_DIR
+              value: /etc/alert-agent/secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          # NO PROBES, and that is deliberate rather than forgotten. A probe
+          # answers a question about whether traffic should be routed here, and
+          # nothing routes traffic here. What "working" means for this process
+          # is that it is claiming — which a liveness probe on a port it does
+          # not open cannot tell, and which its log says plainly.
+          volumeMounts:
+            - name: routing
+              mountPath: /etc/alert-agent/routing
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/alert-agent/secrets
+              readOnly: true
+      volumes:
+        - name: routing
+          configMap:
+            name: alert-agent-routing
+        # The room URLs, rendered here by an agent beside this process from
+        # secret/<tenant>/*. Memory-backed, so a room URL — which is itself a
+        # credential (bead gc-o61) — never reaches a disk.
+        #
+        # THIS IS THE PATTERN'S FIRST REAL USER. The platform's own
+        # tenant/wallet-devops-docs-prod/docs/secrets.md marks it "Unverified —
+        # needs a first-tenant trial run", and live tenants still fill Secret
+        # stubs by hand. Expect to find something here rather than to confirm it
+        # works, and see deploy/alert-agent/README.md.
+        - name: secrets
+          emptyDir:
+            medium: Memory

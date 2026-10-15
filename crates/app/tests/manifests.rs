@@ -246,15 +246,6 @@ origins:
     verify:
       hmac_sha256:
         secret: a-secret
-destinations:
-  - id: a-room
-    kind: chat_room
-    webhook:
-      secret: a-room-url
-subscriptions:
-  - destination: a-room
-    match:
-      origin: a-forge
 ",
     )
     .expect("writable");
@@ -604,6 +595,23 @@ fn the_containerfile_declares_the_stage_the_release_workflow_will_name() {
         !building[0].contains("--target"),
         "a pinned target triple would make one architecture a special case"
     );
+
+    // BOTH BINARIES, from one build. They are two deployments that ship
+    // together — one commit, one gate, one tag — so a platform and an agent
+    // that disagree about the hand-off format cannot come from the same tag.
+    // Two images would make that possible, and nothing but
+    // crates/app/tests/cutover.rs checks that agreement.
+    for binary in ["webhook-proxy", "alert-agent"] {
+        assert!(
+            building[0].contains(&format!("--bin {binary}")),
+            "{binary} is not built: {}",
+            building[0]
+        );
+        assert!(
+            CONTAINERFILE.contains(&format!("/usr/local/bin/{binary} /usr/local/bin/{binary}")),
+            "{binary} is built and not copied into the runtime stage"
+        );
+    }
 
     // The context is the whole workspace, so the host's build output has to be
     // excluded from it — not for size, though it is gigabytes, but because a

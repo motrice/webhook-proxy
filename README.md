@@ -89,11 +89,19 @@ follows from it:
 - **Order is not promised.** Destinations are dispatched to independently, so
   two events can reach one destination out of order.
 
-Durability and replay are built — a PostgreSQL outbox a Dispatch waits in, a
-sweep that retries what is due, and a `replay` subcommand that sends a stored
-delivery to a room again. The shape above is what made that additive: the
-`Outbox` port was the only thing that had to exist, and the domain did not
-change. Which store is used is a choice at the composition root, in memory
+Durability and replay are built — a PostgreSQL store a Delivery waits in until
+its team's agent collects it, a retention sweep, and a `replay` subcommand that
+offers a stored delivery to its team again, marked so the room shows
+`(replayed)`.
+
+**This service no longer delivers to a room itself** (`gc-72e.3.2`). It
+verifies, stores, and offers; a thin agent in each team's own namespace holds
+that team's rooms and rules and does the delivering. The shape above is what
+made *that* cheap too: what left was a port and its two adapters, the domain
+needed one type deleting and nothing changing, and the retry *policy* moved to
+the agent unchanged while the loop that drove it did not — which is the clearest
+evidence this workspace has produced that the seams were drawn in the right
+places. Which store is used is still a choice at the composition root, in memory
 unless a deployment names a database.
 
 The manifests name one (`gc-vfz`), and the proxy refuses to start if the

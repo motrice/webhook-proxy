@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# No Namespace object, and that is the difference from the platform's
+# kustomization: a tenant's namespace already exists and is not this
+# deployment's to create. Set it here and on each manifest, for the reason the
+# platform's says — kustomize matches a generated ConfigMap to the Deployment
+# that references it by name AND namespace.
+#
+# REPLACE: the tenant's own namespace.
+namespace: example-tenant
+
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - networkpolicy.yaml
+
+configMapGenerator:
+  # The published example itself, not a copy: one file, which `alert-agent
+  # check` and yaml-config's own tests both read, so a routing file that is
+  # deployed is a routing file something checks.
+  - name: alert-agent-routing
+    files:
+      - config.yaml=config.example.yaml

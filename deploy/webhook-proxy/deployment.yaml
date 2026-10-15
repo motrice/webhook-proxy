@@ -29,8 +29,15 @@ spec:
     spec:
       # The process handles SIGTERM and finishes what it has accepted before
       # exiting, which is what makes "a restart loses at most what is in flight"
-      # true rather than aspirational. The acceptance test proving it is
-      # a_termination_signal_lets_a_request_already_accepted_finish.
+      # true rather than aspirational.
+      #
+      # NO LONGER PROVED BY A TEST, and that is worth saying rather than leaving
+      # this comment pointing at a name that no longer exists. The test that
+      # proved it held a request open inside a slow room; this service reaches
+      # no room now (bead gc-72e.3.2), so its request path has no slow point to
+      # catch a shutdown in. The handling is still there — `with_graceful_shutdown`
+      # in the composition root — and what is gone is the evidence, which is a
+      # smaller claim than the one this comment used to make.
       terminationGracePeriodSeconds: 30
       # The identity the agent authenticates to the secret store with. It holds
       # no Kubernetes permissions; see serviceaccount.yaml.

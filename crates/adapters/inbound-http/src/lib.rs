@@ -12,15 +12,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use application::ports::{Clock, Dispatcher, Handover, Ids, Outbox, Proofs, TenantId, Translator};
-use application::{Refused, Relay, Retry, Tally};
+use application::ports::{Clock, Handover, Ids, Proofs, TenantId, Translator};
+use application::{Refused, Relay};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::post;
-use domain::{Body, Correlation, Origin, Subscription};
+use domain::{Body, Correlation, Origin};
 
 /// Where a sender's credential arrives.
 ///
@@ -98,20 +98,10 @@ pub struct Inbound {
     /// therefore refused — which is also what keeps the set of senders
     /// unenumerable from outside.
     senders: Arc<HashMap<String, Sender>>,
-    dispatcher: Arc<dyn Dispatcher>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn Ids>,
-    subscriptions: Arc<Vec<Subscription>>,
-    outbox: Arc<dyn Outbox>,
-    /// Where a Delivery waits for the tenant it belongs to.
+    /// Where a Delivery waits for the tenant it belongs to. The only store.
     handover: Arc<dyn Handover>,
-    retry: Retry,
-    /// What each room has been sent, shared with the worker.
-    ///
-    /// Shared rather than owned, because a Dispatch is attempted in two places:
-    /// here, immediately, and in the worker that comes back to whatever failed.
-    /// A count living only here would miss every retry.
-    tally: Arc<Tally>,
     /// Senders refused because the store could not take their Delivery.
     ///
     /// Deliberately not counted as losses. A refusal is the promise working:
@@ -143,25 +133,15 @@ impl Inbound {
     )]
     pub fn new(
         senders: HashMap<String, Sender>,
-        dispatcher: Arc<dyn Dispatcher>,
-        outbox: Arc<dyn Outbox>,
         handover: Arc<dyn Handover>,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn Ids>,
-        subscriptions: Vec<Subscription>,
-        retry: Retry,
-        tally: Arc<Tally>,
     ) -> Self {
         Self {
             senders: Arc::new(senders),
-            dispatcher,
-            outbox,
             handover,
-            retry,
             clock,
             ids,
-            subscriptions: Arc::new(subscriptions),
-            tally,
             refusals: Arc::new(AtomicU64::new(0)),
             storage_was_down: Arc::new(AtomicBool::new(false)),
         }
@@ -172,22 +152,6 @@ impl Inbound {
     #[must_use]
     pub fn refusals(&self) -> u64 {
         self.refusals.load(Ordering::Relaxed)
-    }
-
-    /// How many Dispatches have been dropped since start.
-    ///
-    /// The delivery promise is best-effort, and a best-effort system whose
-    /// losses are invisible is indistinguishable from a broken one. This is the
-    /// count that makes the promise auditable.
-    #[must_use]
-    pub fn losses(&self) -> u64 {
-        self.tally.losses()
-    }
-
-    /// What each room has been sent, and what became of it.
-    #[must_use]
-    pub fn tally(&self) -> &Tally {
-        &self.tally
     }
 }
 
@@ -358,13 +322,9 @@ async fn receive(
     let relay = Relay::new(
         sender.proofs.as_ref(),
         sender.translator.as_ref(),
-        inbound.dispatcher.as_ref(),
-        inbound.outbox.as_ref(),
         inbound.handover.as_ref(),
         inbound.clock.as_ref(),
         inbound.ids.as_ref(),
-        inbound.subscriptions.as_slice(),
-        inbound.retry,
     );
 
     // Read before anything is relayed, so the same correlation goes outward and
@@ -394,51 +354,12 @@ async fn receive(
                 );
             }
 
-            // What each room actually saw, which is the number somebody asks
-            // for when a channel starts feeling noisy.
-            for destination in relayed.reached() {
-                inbound.tally.delivered(destination);
-            }
-
-            for (destination, failure, alerts) in relayed.retrying() {
-                inbound.tally.retrying(destination);
-                // Not a loss and not counted as one: it is stored and due to be
-                // tried again. An operator told a Notice was lost goes looking
-                // for it; one told it will be retried waits.
-                tracing::info!(
-                    delivery = relayed.delivery().as_str(),
-                    destination = destination.as_str(),
-                    events = alerts,
-                    failure = ?failure,
-                    "dispatch failed, stored for another attempt"
-                );
-            }
-
-            for (destination, failure, alerts) in relayed.abandoned() {
-                inbound.tally.abandoned(destination);
-                // One loss, however many facts it carried: it is one message
-                // that did not arrive, and counting a grouped dispatch as
-                // several would make the number mean something different
-                // depending on how the sender configured its grouping. The
-                // count is in the line so the detail is still recoverable —
-                // gc-lhh left this to be decided here, with the code in front
-                // of us.
-                //
-                // Identities, a reason and a number. A Destination holds no
-                // address, so there is no credential here to spill.
-                tracing::warn!(
-                    delivery = relayed.delivery().as_str(),
-                    // The caller's chain, so this line can be put beside
-                    // whatever the sender and the room were doing at the time.
-                    // A DeliveryId says which message; a trace says what else
-                    // was going on (bead gc-4oo.5).
-                    trace = relayed.correlation().trace(),
-                    destination = destination.as_str(),
-                    events = alerts,
-                    failure = ?failure,
-                    "dispatch lost"
-                );
-            }
+            // Nothing is logged per room here, and there are no rooms to log.
+            // This service verified the Delivery and owes it to a tenant; what
+            // became of each room is that tenant's agent to attempt, to report
+            // and to log where it happened (bead gc-72e.3.2). The answer below
+            // carries the chain, which is what lets those two logs be read
+            // together across two namespaces.
             (StatusCode::ACCEPTED, answering(relayed.correlation()))
         }
         Err(Refused::ProofMismatch) => (StatusCode::UNAUTHORIZED, HeaderMap::new()),
@@ -473,23 +394,18 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use application::ports::{
-        Attempt, Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs,
-        Recorded, SecretUnavailable, StorageUnavailable, TenantId, Translator, Untranslatable,
+        Behind, Claimed, Clock, Discharged, Handover, Ids, MalformedProof, Offered, Proofs,
+        Reoffered, Report, SecretUnavailable, StorageUnavailable, Swept, TenantId, Translator,
+        Untranslatable,
     };
-    use application::{Retry, Tally};
-    // The real in-memory adapter rather than a fake. These tests are about the
-    // front door, and what the hand-off store does is proved in its own crate;
-    // a fake here would be a second implementation to keep honest.
     use async_trait::async_trait;
     use axum::Router;
     use axum::body::Body as AxumBody;
     use axum::http::{Request, StatusCode};
     use domain::{
-        Body, BranchName, Correlation, DeliveryId, Destination, DestinationId, DestinationKind,
-        DispatchId, Event, Filter, Origin, OriginId, Proof, Pusher, RepositoryName, SecretId,
-        Subscription, Timestamp, Verification, VerifiedDelivery,
+        Body, BranchName, Correlation, DeliveryId, Event, Origin, OriginId, Proof, Pusher,
+        RepositoryName, SecretId, Timestamp, Verification, VerifiedDelivery,
     };
-    use memory_outbox::MemoryHandover;
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -594,45 +510,6 @@ mod tests {
     /// The chain a generated correlation uses, so a test can recognise it.
     const GENERATED_TRACE: &str = "99999999999999999999999999999999";
 
-    /// Fails for the Destinations named, and records the rest.
-    struct Recorder {
-        sent: Mutex<Vec<String>>,
-        failing: Vec<&'static str>,
-    }
-
-    impl Recorder {
-        fn new(failing: Vec<&'static str>) -> Arc<Self> {
-            Arc::new(Self {
-                sent: Mutex::new(Vec::new()),
-                failing,
-            })
-        }
-
-        fn sent(&self) -> Vec<String> {
-            self.sent.lock().expect("not poisoned").clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Dispatcher for Recorder {
-        async fn dispatch(
-            &self,
-            _delivery: &DeliveryId,
-            _events: &[Event],
-            destination: &Destination,
-            _attempt: Attempt,
-            _correlation: &Correlation,
-        ) -> Result<(), DispatchFailed> {
-            let id = destination.id().as_str().to_owned();
-            if self.failing.contains(&id.as_str()) {
-                // Carries the kind of failure, never the URL that produced it.
-                return Err(DispatchFailed::Unreachable);
-            }
-            self.sent.lock().expect("not poisoned").push(id);
-            Ok(())
-        }
-    }
-
     /// Collects log output in memory so a test can assert on what was written.
     #[derive(Clone)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -713,29 +590,14 @@ mod tests {
         TenantId::new("a-tenant").expect("a namespace name")
     }
 
-    fn to_rooms(ids: &[&str]) -> Vec<Subscription> {
-        ids.iter()
-            .map(|id| {
-                Subscription::new(
-                    Destination::new(
-                        DestinationId::new(id).expect("a non-blank id"),
-                        DestinationKind::ChatRoom,
-                    ),
-                    Filter::Everything,
-                )
-            })
-            .collect()
-    }
-
     struct Wired {
         app: Router,
         inbound: Inbound,
         sigs: Arc<Sigs>,
-        dispatcher: Arc<Recorder>,
         ids: Arc<CountingIds>,
     }
 
-    /// An outbox for these tests, which can be told to refuse.
+    /// Somewhere to owe a Delivery, which can be told to refuse.
     ///
     /// Its storing behaviour is proved against the real in-memory adapter in
     /// its own crate; adapters may not depend on each other, and what these
@@ -745,108 +607,70 @@ mod tests {
     }
 
     #[async_trait]
-    impl Outbox for Store {
-        async fn accept(
-            &self,
-            dispatches: &[domain::Dispatch],
-            at: Timestamp,
-        ) -> Result<Vec<Recorded>, StorageUnavailable> {
-            if !self.available {
-                return Err(StorageUnavailable);
+    impl Handover for Store {
+        async fn offer(&self, _offered: &Offered) -> Result<(), StorageUnavailable> {
+            if self.available {
+                Ok(())
+            } else {
+                Err(StorageUnavailable)
             }
-            Ok(dispatches
-                .iter()
-                .enumerate()
-                .map(|(offset, dispatch)| {
-                    Recorded::new(
-                        DispatchId::new(&format!("s-{}", offset + 1)).expect("non-blank"),
-                        dispatch.clone(),
-                        0,
-                        Outcome::Waiting { again_at: at },
-                        at,
-                    )
-                })
-                .collect())
         }
 
-        async fn accepted(
+        async fn outstanding(
             &self,
-            _delivery: &DeliveryId,
-        ) -> Result<Vec<Recorded>, StorageUnavailable> {
-            Ok(Vec::new())
-        }
-
-        async fn due(
-            &self,
-            _now: Timestamp,
+            _tenant: &TenantId,
             _limit: usize,
-        ) -> Result<Vec<Recorded>, StorageUnavailable> {
-            Ok(Vec::new())
+        ) -> Result<Vec<Offered>, StorageUnavailable> {
+            unreachable!("the front door never reads back")
         }
 
-        async fn delivered(
+        async fn claim(
             &self,
-            _id: &DispatchId,
-            _at: Timestamp,
-        ) -> Result<(), StorageUnavailable> {
-            Ok(())
+            _tenant: &TenantId,
+            _limit: usize,
+            _now: Timestamp,
+            _lease: core::time::Duration,
+        ) -> Result<Vec<Claimed>, StorageUnavailable> {
+            unreachable!("the front door never claims")
         }
 
-        async fn failed(
+        async fn report(
             &self,
-            _id: &DispatchId,
+            _tenant: &TenantId,
+            _delivery: &DeliveryId,
+            _report: &Report,
             _at: Timestamp,
-            _again_at: Timestamp,
-        ) -> Result<(), StorageUnavailable> {
-            Ok(())
+        ) -> Result<Discharged, StorageUnavailable> {
+            unreachable!("the front door never reports")
         }
 
-        async fn abandoned(
+        async fn reoffer(&self, _delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
+            unreachable!("the front door never re-offers")
+        }
+
+        async fn sweep(&self, _accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {
+            unreachable!("the front door never sweeps")
+        }
+
+        async fn behind(
             &self,
-            _id: &DispatchId,
-            _at: Timestamp,
-        ) -> Result<(), StorageUnavailable> {
-            Ok(())
+            _accepted_before: Timestamp,
+        ) -> Result<Vec<Behind>, StorageUnavailable> {
+            unreachable!("the front door never asks after a backlog")
         }
     }
 
-    /// Always try again, so a test about routing is not also a test about a
-    /// retry budget.
-    fn generous() -> Retry {
-        Retry::new(
-            core::time::Duration::from_secs(1),
-            core::time::Duration::from_mins(1),
-            5,
-        )
-    }
-
-    fn wire(
-        sigs: Arc<Sigs>,
-        says: Result<Vec<Event>, Untranslatable>,
-        failing: Vec<&'static str>,
-        rooms: &[&str],
-        max_body: usize,
-    ) -> Wired {
-        wire_with(
-            sigs,
-            says,
-            failing,
-            rooms,
-            max_body,
-            Store { available: true },
-        )
+    fn wire(sigs: Arc<Sigs>, says: Result<Vec<Event>, Untranslatable>, max_body: usize) -> Wired {
+        wire_with(sigs, says, max_body, Store { available: true })
     }
 
     /// The same, with an outbox the test chooses.
     fn wire_with(
         sigs: Arc<Sigs>,
         says: Result<Vec<Event>, Untranslatable>,
-        failing: Vec<&'static str>,
-        rooms: &[&str],
         max_body: usize,
         store: Store,
     ) -> Wired {
-        let dispatcher = Recorder::new(failing);
         let ids = Arc::new(CountingIds(Mutex::new(0)));
         let (name, origin) = an_origin();
         let inbound = Inbound::new(
@@ -860,33 +684,26 @@ mod tests {
                     presented: SIGNATURE_HEADER,
                 },
             )]),
-            dispatcher.clone(),
             Arc::new(store),
-            Arc::new(MemoryHandover::new()),
             Arc::new(FixedClock),
             ids.clone(),
-            to_rooms(rooms),
-            generous(),
-            Arc::new(Tally::new()),
         );
 
         Wired {
             app: router(inbound.clone(), max_body),
             inbound,
             sigs,
-            dispatcher,
             ids,
         }
     }
 
-    fn a_push_to(rooms: &[&str]) -> Wired {
-        wire(
-            Sigs::matching(),
-            Ok(vec![a_push()]),
-            vec![],
-            rooms,
-            64 * 1024,
-        )
+    /// A wired front door that accepts a signed push.
+    ///
+    /// No rooms, because this adapter knows none: it verifies and owes the
+    /// Delivery to a tenant, and which rooms hear about it is decided in
+    /// another namespace by another binary (bead gc-72e.3.2).
+    fn a_push_request() -> Wired {
+        wire(Sigs::matching(), Ok(vec![a_push()]), 64 * 1024)
     }
 
     async fn post(app: Router, path: &str, signature: Option<&str>, body: &[u8]) -> StatusCode {
@@ -927,7 +744,7 @@ mod tests {
         // SAK.29, and more usefully an accurate refusal: a hook configured with
         // form encoding used to fail as Untranslatable, which reads like a
         // payload problem rather than a setup problem.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let status = post_typed(
             wired.app,
             "/webhook/github",
@@ -945,7 +762,7 @@ mod tests {
         // The rule names a missing header alongside an unexpected one, and the
         // reason is the same: this service translates one format, and a request
         // that does not say what it is cannot be taken at its word.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let status = post_typed(wired.app, "/webhook/github", Some("ok:abc"), None, BODY).await;
 
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -957,7 +774,7 @@ mod tests {
         // in its webhook settings, and somebody will pick the other one. 415
         // tells them to change the setting; 400 told them their payload was bad,
         // which it was not.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let status = post_typed(
             wired.app,
             "/webhook/github",
@@ -976,7 +793,7 @@ mod tests {
         // The ordering is the point of this bead. A caller with no credential
         // learns nothing about what this service accepts: it gets the same 401
         // whatever content type it sent, so the check cannot be used to probe.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let status = post_typed(wired.app, "/webhook/github", None, Some("text/plain"), BODY).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -988,7 +805,7 @@ mod tests {
         // anything is read, so an oversized body in the wrong content type is
         // still 413. Pinned because the two refusals are easy to reorder by
         // accident when either one moves.
-        let wired = wire(Sigs::matching(), Ok(vec![a_push()]), vec![], &["room"], 8);
+        let wired = wire(Sigs::matching(), Ok(vec![a_push()]), 8);
         let status = post_typed(
             wired.app,
             "/webhook/github",
@@ -1047,7 +864,7 @@ mod tests {
     async fn a_caller_that_sent_a_chain_is_answered_in_the_same_chain() {
         // SPA.02 and SPA.04: the chain is accepted and reported back, so a
         // sender can put the same trace in its own log and the two ends join up.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let answered = post_traced(wired.app, Some(CALLERS), None).await;
 
         assert_eq!(answered.status(), StatusCode::ACCEPTED);
@@ -1063,7 +880,7 @@ mod tests {
     async fn a_caller_that_sent_no_chain_is_given_one_rather_than_refused() {
         // The header is never required. A sender with no tracing at all is a
         // sender, not a problem.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let answered = post_traced(wired.app, None, None).await;
 
         assert_eq!(answered.status(), StatusCode::ACCEPTED);
@@ -1086,7 +903,7 @@ mod tests {
             "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
         ] {
-            let wired = a_push_to(&["room"]);
+            let wired = a_push_request();
             let answered = post_traced(wired.app, Some(nonsense), None).await;
 
             assert_eq!(
@@ -1110,7 +927,7 @@ mod tests {
     async fn state_a_caller_sent_comes_back_unchanged() {
         // Opaque, and belonging to whoever set it. Reading or rewriting it would
         // make this proxy a participant in somebody else's convention.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
         let answered = post_traced(wired.app, Some(CALLERS), Some("congo=t61rcWkgMzE")).await;
 
         assert_eq!(
@@ -1124,12 +941,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_signed_push_is_accepted() {
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
 
         let status = post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(wired.dispatcher.sent(), vec!["room"]);
     }
 
     #[tokio::test]
@@ -1137,7 +953,7 @@ mod tests {
         // The defect this guards against is re-encoding the body on the way in:
         // it passes every happy-path test and fails the first time a payload
         // round-trips differently.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
 
         post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
@@ -1146,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_identity_is_minted_through_the_ids_port() {
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
 
         post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
@@ -1155,18 +971,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_mismatched_signature_is_unauthorised_and_dispatches_nothing() {
-        let wired = wire(
-            Sigs::mismatching(),
-            Ok(vec![a_push()]),
-            vec![],
-            &["room"],
-            64 * 1024,
-        );
+        let wired = wire(Sigs::mismatching(), Ok(vec![a_push()]), 64 * 1024);
 
         let status = post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(wired.dispatcher.sent().is_empty());
     }
 
     #[tokio::test]
@@ -1174,82 +983,64 @@ mod tests {
         // There is no configuration under which this succeeds. This proxy is the
         // authentication boundary; an unsigned request is the thing it exists to
         // refuse.
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
 
         let status = post(wired.app, "/webhook/github", None, BODY).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(wired.dispatcher.sent().is_empty());
         assert!(wired.sigs.seen().is_empty(), "nothing should be computed");
     }
 
     #[tokio::test]
     async fn an_unreadable_signature_header_is_refused() {
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
 
         let status = post(wired.app, "/webhook/github", Some("garbage"), BODY).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(wired.dispatcher.sent().is_empty());
     }
 
     #[tokio::test]
     async fn an_origin_we_hold_no_secret_for_is_refused_never_forwarded() {
-        let wired = a_push_to(&["room"]);
+        let wired = a_push_request();
 
         let status = post(wired.app, "/webhook/gitlab", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(wired.dispatcher.sent().is_empty());
     }
 
     #[tokio::test]
     async fn an_unusable_secret_is_our_fault_and_says_so() {
         // Distinct from a mismatch on purpose: a misconfigured deployment must
         // not hide behind what looks like an attack.
-        let wired = wire(
-            Sigs::secretless(),
-            Ok(vec![a_push()]),
-            vec![],
-            &["room"],
-            64 * 1024,
-        );
+        let wired = wire(Sigs::secretless(), Ok(vec![a_push()]), 64 * 1024);
 
         let status = post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(wired.dispatcher.sent().is_empty());
     }
 
     #[tokio::test]
     async fn a_payload_we_cannot_read_is_a_bad_request() {
-        let wired = wire(
-            Sigs::matching(),
-            Err(Untranslatable),
-            vec![],
-            &["room"],
-            64 * 1024,
-        );
+        let wired = wire(Sigs::matching(), Err(Untranslatable), 64 * 1024);
 
         let status = post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(wired.dispatcher.sent().is_empty());
     }
 
     #[tokio::test]
     async fn a_payload_reporting_nothing_we_handle_is_still_accepted() {
-        let wired = wire(Sigs::matching(), Ok(vec![]), vec![], &["room"], 64 * 1024);
+        let wired = wire(Sigs::matching(), Ok(vec![]), 64 * 1024);
 
         let status = post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::ACCEPTED);
-        assert!(wired.dispatcher.sent().is_empty());
     }
 
     #[tokio::test]
     async fn a_body_over_the_limit_is_refused_before_anything_is_computed() {
-        let wired = wire(Sigs::matching(), Ok(vec![a_push()]), vec![], &["room"], 16);
+        let wired = wire(Sigs::matching(), Ok(vec![a_push()]), 16);
 
         let status = post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
 
@@ -1258,106 +1049,6 @@ mod tests {
             wired.sigs.seen().is_empty(),
             "the limit must bite before verification"
         );
-        assert!(wired.dispatcher.sent().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_failed_dispatch_still_accepts_and_is_not_yet_a_loss() {
-        // It used to be counted here. With an outbox it is stored and due to be
-        // tried again, so counting it would mean the loss number rises every
-        // time a room blinks — and a number that rises for things that then
-        // arrive is a number nobody can act on.
-        let wired = wire(
-            Sigs::matching(),
-            Ok(vec![a_push()]),
-            vec!["broken"],
-            &["working", "broken"],
-            64 * 1024,
-        );
-
-        let status = post(wired.app.clone(), "/webhook/github", Some("ok:abc"), BODY).await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(wired.dispatcher.sent(), vec!["working"]);
-        assert_eq!(wired.inbound.losses(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_loss_is_logged_by_identity_and_nothing_else() {
-        let logs = captured_logs();
-
-        let wired = wire(
-            Sigs::matching(),
-            Ok(vec![a_push()]),
-            vec!["devsecops-room"],
-            &["devsecops-room"],
-            64 * 1024,
-        );
-
-        post(wired.app, "/webhook/github", Some("ok:abc"), BODY).await;
-
-        let written = String::from_utf8(logs.lock().expect("not poisoned").clone())
-            .expect("log output is text");
-
-        // A loss must be recorded, and traceable to what was lost.
-        assert!(
-            written.contains("devsecops-room"),
-            "a dropped Dispatch must name its Destination: {written}"
-        );
-        assert!(
-            written.contains("Unreachable"),
-            "a dropped Dispatch must say why: {written}"
-        );
-
-        for forbidden in FORBIDDEN_IN_LOGS {
-            assert!(
-                !written.to_lowercase().contains(forbidden),
-                "`{forbidden}` reached the log: {written}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_dispatch_with_no_attempts_left_is_counted_as_the_loss_it_is() {
-        // The other half. "Logged and counted" is what makes best-effort an
-        // engineering decision rather than an excuse, and that has to keep
-        // meaning something once failures are retried: what is counted is what
-        // nobody will ever see.
-        let dispatcher = Recorder::new(vec!["broken"]);
-        let ids = Arc::new(CountingIds(Mutex::new(0)));
-        let (name, origin) = an_origin();
-        let sigs = Sigs::matching();
-        let inbound = Inbound::new(
-            HashMap::from([(
-                name,
-                Sender {
-                    origin,
-                    tenant: a_tenant(),
-                    proofs: sigs.clone(),
-                    translator: Arc::new(Says(Ok(vec![a_push()]))),
-                    presented: SIGNATURE_HEADER,
-                },
-            )]),
-            dispatcher.clone(),
-            Arc::new(Store { available: true }),
-            Arc::new(MemoryHandover::new()),
-            Arc::new(FixedClock),
-            ids,
-            to_rooms(&["working", "broken"]),
-            // One attempt, so the first failure is the last.
-            Retry::new(
-                core::time::Duration::from_secs(1),
-                core::time::Duration::from_mins(1),
-                1,
-            ),
-            Arc::new(Tally::new()),
-        );
-        let app = router(inbound.clone(), 64 * 1024);
-
-        let status = post(app, "/webhook/github", Some("ok:abc"), BODY).await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(inbound.losses(), 1);
     }
 
     #[tokio::test]
@@ -1369,8 +1060,6 @@ mod tests {
         let wired = wire_with(
             Sigs::matching(),
             Ok(vec![a_push()]),
-            vec![],
-            &["working"],
             64 * 1024,
             Store { available: false },
         );
@@ -1378,14 +1067,13 @@ mod tests {
         let status = post(wired.app.clone(), "/webhook/github", Some("ok:abc"), BODY).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            wired.dispatcher.sent().is_empty(),
-            "a Notice was sent that nothing had promised to retry"
-        );
-        // Counted as a refusal and deliberately not as a loss: the sender was
-        // told, which is the promise working rather than failing.
+        // Counted as a refusal, which is the promise working rather than
+        // failing: the sender was told, and nothing was accepted that will not
+        // be offered. There is no loss count here to compare it against any
+        // more — a loss now happens in a tenant's agent, is logged there, and
+        // the only kind this service can see is an alert nobody collected
+        // (bead gc-wcw.3).
         assert_eq!(wired.inbound.refusals(), 1);
-        assert_eq!(wired.inbound.losses(), 0);
     }
 
     #[tokio::test]
@@ -1396,8 +1084,6 @@ mod tests {
         let wired = wire_with(
             Sigs::matching(),
             Ok(vec![a_push()]),
-            vec![],
-            &["working"],
             64 * 1024,
             Store { available: false },
         );
@@ -1426,88 +1112,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_each_room_was_sent_is_counted_apart_from_what_it_was_not() {
-        // The question this answers is "which room is being flooded", and a
-        // flooded room is one that received a lot — not one that lost a lot.
-        // Before this, nothing in the product could answer it, and the first
-        // signal of alert fatigue was somebody muting the channel.
-        let wired = wire(
+    async fn nothing_this_adapter_logs_carries_a_secret() {
+        // The loss line this used to check moved to the tenant's agent with the
+        // delivering (bead gc-72e.3.2), and the property did not move with it:
+        // what is left here still writes to a log an operator pastes into a
+        // chat window — a store outage and a recovery — and neither may carry a
+        // credential.
+        //
+        // Kept rather than deleted along with its old subject, because the
+        // harness exists and the risk did not go anywhere: the next line
+        // somebody adds to this file is the one this catches.
+        let logs = captured_logs();
+        let before = logs.lock().expect("not poisoned").len();
+
+        // Down, then up: both transitions, which are the only two lines this
+        // adapter writes.
+        let refusing = wire_with(
             Sigs::matching(),
             Ok(vec![a_push()]),
-            vec!["broken"],
-            &["working", "broken"],
             64 * 1024,
+            Store { available: false },
         );
+        let _ = post(
+            refusing.app.clone(),
+            "/webhook/github",
+            Some("ok:abc"),
+            BODY,
+        )
+        .await;
 
-        let status = post(wired.app.clone(), "/webhook/github", Some("ok:abc"), BODY).await;
+        let working = a_push_request();
+        let _ = post(working.app.clone(), "/webhook/github", Some("ok:abc"), BODY).await;
 
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let tally = wired.inbound.tally();
-        assert_eq!(
-            tally
-                .counts(&DestinationId::new("working").expect("a non-blank id"))
-                .delivered,
-            1
+        let written =
+            String::from_utf8_lossy(&logs.lock().expect("not poisoned")[before..]).into_owned();
+
+        assert!(
+            !written.is_empty(),
+            "nothing was logged, so nothing was checked"
         );
-        // The one that failed is counted as retrying, and not as delivered:
-        // nobody in that room has seen anything.
-        let broken = tally.counts(&DestinationId::new("broken").expect("a non-blank id"));
-        assert_eq!(broken.delivered, 0);
-        assert_eq!(broken.retrying, 1);
-        assert_eq!(broken.abandoned, 0);
-    }
-
-    #[tokio::test]
-    async fn a_dispatch_given_up_on_is_counted_against_the_room_that_lost_it() {
-        // "Logged and counted" is what makes best-effort an engineering
-        // decision rather than an excuse, and it has to say WHICH room: a total
-        // tells an operator something was lost and leaves them to find out
-        // where.
-        let dispatcher = Recorder::new(vec!["broken"]);
-        let ids = Arc::new(CountingIds(Mutex::new(0)));
-        let (name, origin) = an_origin();
-        let sigs = Sigs::matching();
-        let tally = Arc::new(Tally::new());
-        let inbound = Inbound::new(
-            HashMap::from([(
-                name,
-                Sender {
-                    origin,
-                    tenant: a_tenant(),
-                    proofs: sigs.clone(),
-                    translator: Arc::new(Says(Ok(vec![a_push()]))),
-                    presented: SIGNATURE_HEADER,
-                },
-            )]),
-            dispatcher.clone(),
-            Arc::new(Store { available: true }),
-            Arc::new(MemoryHandover::new()),
-            Arc::new(FixedClock),
-            ids,
-            to_rooms(&["working", "broken"]),
-            // One attempt, so the first failure is the last.
-            Retry::new(
-                core::time::Duration::from_secs(1),
-                core::time::Duration::from_mins(1),
-                1,
-            ),
-            Arc::clone(&tally),
-        );
-        let app = router(inbound.clone(), 64 * 1024);
-
-        post(app, "/webhook/github", Some("ok:abc"), BODY).await;
-
-        let broken = tally.counts(&DestinationId::new("broken").expect("a non-blank id"));
-        assert_eq!(broken.abandoned, 1);
-        assert_eq!(broken.delivered, 0);
-        // And the room that was reached is untouched by the other's failure.
-        assert_eq!(
-            tally
-                .counts(&DestinationId::new("working").expect("a non-blank id"))
-                .delivered,
-            1
-        );
-        // The old total still means what it meant: losses are the abandoned.
-        assert_eq!(inbound.losses(), 1);
+        for forbidden in FORBIDDEN_IN_LOGS {
+            assert!(
+                !written.contains(forbidden),
+                "{forbidden:?} reached a log line: {written}"
+            );
+        }
     }
 }
