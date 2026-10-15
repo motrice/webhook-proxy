@@ -79,6 +79,9 @@ pub struct Declared {
 /// Everything the composition root needs in order to start.
 #[derive(Clone)]
 pub struct Configuration {
+    /// The rooms, their rules and the secret values behind both. Shared with a
+    /// tenant's configuration because it is the same reading.
+    rooms: Rooms,
     /// Every tenant this deployment serves, as the file lists them.
     ///
     /// LISTED, NEVER INFERRED from the Origins that mention them (bead gc-nkb).
@@ -87,9 +90,6 @@ pub struct Configuration {
     /// for — stored, offered to nobody, and eventually swept.
     tenants: BTreeSet<TenantId>,
     origins: HashMap<String, Declared>,
-    subscriptions: Vec<Subscription>,
-    secrets: HashMap<String, String>,
-    webhooks: HashMap<String, String>,
 }
 
 /// Counts, never contents.
@@ -105,9 +105,9 @@ impl fmt::Debug for Configuration {
             "Configuration({} tenants, {} origins, {} destinations, {} rules, {} secrets loaded)",
             self.tenants.len(),
             self.origins.len(),
-            self.webhooks.len(),
-            self.subscriptions.len(),
-            self.secrets.len()
+            self.rooms.webhooks.len(),
+            self.rooms.subscriptions.len(),
+            self.rooms.secrets.len()
         )
     }
 }
@@ -164,6 +164,35 @@ struct Document {
     origins: Vec<OriginEntry>,
     destinations: Vec<DestinationEntry>,
     subscriptions: Vec<SubscriptionEntry>,
+}
+
+/// The tenant's half of the file, which is a different document.
+///
+/// Two documents rather than one with optional halves, and the omissions are
+/// the whole point (bead gc-g9x): NEITHER HALF CAN NAME THE OTHER'S SECRETS,
+/// which is the property that makes the split worth having. A single document
+/// with everything optional would let a tenant's file hold a sender's verify
+/// secret and a platform's file hold a room URL, and nothing would say so.
+///
+/// The four fields below exist only to be refused. `deny_unknown_fields`
+/// already makes a mistyped key an error, but these are not typos — they are
+/// the keys somebody copies across from the platform's file by habit, and each
+/// deserves a sentence saying why a tenant does not have one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantDocument {
+    version: u8,
+    destinations: Vec<DestinationEntry>,
+    subscriptions: Vec<SubscriptionEntry>,
+
+    #[serde(default)]
+    origins: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    tenants: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    tenant: Option<serde_yaml_ng::Value>,
+    #[serde(default)]
+    verify: Option<serde_yaml_ng::Value>,
 }
 
 #[derive(Deserialize)]
@@ -235,181 +264,21 @@ struct SubscriptionEntry {
     everything: Option<bool>,
 }
 
-impl Configuration {
-    /// Reads the file, and the secrets it names, or says exactly what is wrong.
-    ///
-    /// # Errors
-    ///
-    /// [`Unusable`] for anything that would make the deployment behave
-    /// differently from what the file appears to say — a field that cannot be
-    /// read, a rule naming a Destination nobody declared, a secret with no value
-    /// behind it. Every one names the file and the path.
-    pub fn read(file: &Path, secrets: &Path) -> Result<Self, Unusable> {
-        let text = std::fs::read_to_string(file)
-            .map_err(|e| Unusable::at(file, "", format!("cannot be read: {e}")))?;
+/// The rooms half of either file: where each room is reached, which rules select
+/// it, and the secret values behind both.
+///
+/// Shared by the platform's configuration and a tenant's, because it is
+/// literally the same reading — and because the secret-name validation below is
+/// the kind of rule that must exist once. Two copies of it would be two places
+/// for a name that walks up the directory tree to stop being refused.
+#[derive(Clone, Default)]
+struct Rooms {
+    subscriptions: Vec<Subscription>,
+    secrets: HashMap<String, String>,
+    webhooks: HashMap<String, String>,
+}
 
-        let document: Document = serde_yaml_ng::from_str(&text)
-            .map_err(|e| Unusable::at(file, "", format!("cannot be parsed: {e}")))?;
-
-        if document.version != VERSION {
-            return Err(Unusable::at(
-                file,
-                "version",
-                format!("is {}, and this build reads {VERSION}", document.version),
-            ));
-        }
-
-        let mut config = Self {
-            tenants: BTreeSet::new(),
-            origins: HashMap::new(),
-            subscriptions: Vec::new(),
-            secrets: HashMap::new(),
-            webhooks: HashMap::new(),
-        };
-
-        // Before the Origins, because an Origin is checked against this list.
-        config.read_tenants(file, &document.tenants)?;
-        config.read_origins(file, secrets, &document.origins)?;
-        let declared = config.read_destinations(file, secrets, &document.destinations)?;
-        config.read_subscriptions(file, &declared, &document.subscriptions)?;
-
-        Ok(config)
-    }
-
-    /// The tenants this deployment serves.
-    ///
-    /// An empty list is refused. A platform serving nobody is a file somebody
-    /// is halfway through writing, and every Origin below would fail anyway —
-    /// with a message about the Origin rather than about the omission.
-    fn read_tenants(&mut self, file: &Path, entries: &[String]) -> Result<(), Unusable> {
-        if entries.is_empty() {
-            return Err(Unusable::at(
-                file,
-                "tenants",
-                "lists none; every Origin must name a tenant, so a deployment \
-                 with no tenants can serve no sender",
-            ));
-        }
-
-        for (index, entry) in entries.iter().enumerate() {
-            let tenant = TenantId::new(entry)
-                .map_err(|why| Unusable::at(file, format!("tenants[{index}]"), why.to_string()))?;
-            if !self.tenants.insert(tenant) {
-                return Err(Unusable::at(
-                    file,
-                    format!("tenants[{index}]"),
-                    "is listed twice; a tenant is a namespace and there is only \
-                     one of each",
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn read_origins(
-        &mut self,
-        file: &Path,
-        secrets: &Path,
-        entries: &[OriginEntry],
-    ) -> Result<(), Unusable> {
-        for (index, entry) in entries.iter().enumerate() {
-            let at = |field: &str| format!("origins[{index}].{field}");
-
-            let id = OriginId::new(&entry.id)
-                .map_err(|blank| Unusable::at(file, at("id"), blank.to_string()))?;
-
-            if self.origins.contains_key(id.as_str()) {
-                return Err(Unusable::at(
-                    file,
-                    at("id"),
-                    "is declared twice; an Origin's identity decides which secret \
-                     checks it, so two would be ambiguous",
-                ));
-            }
-
-            // Exactly one, so that an Origin declaring none and an Origin
-            // declaring two are each refused with a sentence that says which.
-            let mut declared = entry.verify.iter();
-            let (mechanism, holder) = declared.next().ok_or_else(|| {
-                Unusable::at(
-                    file,
-                    at("verify"),
-                    format!(
-                        "declares no mechanism; write {SIGNED} for a sender that \
-                         signs the body, or {SHARED} for one that presents a shared \
-                         value"
-                    ),
-                )
-            })?;
-            if declared.next().is_some() {
-                return Err(Unusable::at(
-                    file,
-                    at("verify"),
-                    "declares more than one mechanism; an Origin proves itself one \
-                     way, and the mechanism is never chosen by the request",
-                ));
-            }
-
-            let secret = self.read_secret(file, secrets, &at("verify"), &holder.secret)?;
-            let verify = match mechanism.as_str() {
-                SIGNED => Verification::Signed { secret },
-                SHARED => Verification::Shared { secret },
-                other => {
-                    return Err(Unusable::at(
-                        file,
-                        at("verify"),
-                        format!(
-                            "names {other:?}, which this build does not know; \
-                                 it reads {SIGNED} and {SHARED}"
-                        ),
-                    ));
-                }
-            };
-
-            let speaks = match entry.speaks {
-                SpeaksEntry::Github => Speaks::Github,
-                SpeaksEntry::Alertmanager => Speaks::Alertmanager,
-                SpeaksEntry::Grafana => Speaks::Grafana,
-            };
-
-            // A STARTUP ERROR, not a request-time refusal, and bead gc-nkb says
-            // why: `webhook-proxy check` runs on every change to this file in
-            // the operations repository, so a tenant that does not exist is
-            // caught before anything deploys and request handling never meets
-            // one. The alternative — accepting it and finding out later — makes
-            // a mistake in the platform's own configuration look like a sender
-            // problem, and the alert is already lost by then.
-            let tenant = TenantId::new(&entry.tenant)
-                .map_err(|why| Unusable::at(file, at("tenant"), why.to_string()))?;
-            if !self.tenants.contains(&tenant) {
-                let listed: Vec<&str> = self.tenants.iter().map(TenantId::as_str).collect();
-                return Err(Unusable::at(
-                    file,
-                    at("tenant"),
-                    format!(
-                        "names {tenant:?}, which `tenants` does not list. \
-                         Listed: {}. A tenant is listed rather than created by \
-                         being mentioned, so that a typo here is this message \
-                         rather than an alert filed under a tenant nobody has \
-                         an agent for",
-                        listed.join(", ")
-                    ),
-                ));
-            }
-
-            self.origins.insert(
-                entry.id.trim().to_owned(),
-                Declared {
-                    origin: Origin::new(id, verify),
-                    speaks,
-                    tenant,
-                },
-            );
-        }
-        Ok(())
-    }
-
+impl Rooms {
     fn read_destinations(
         &mut self,
         file: &Path,
@@ -584,6 +453,186 @@ impl Configuration {
 
         Ok(id)
     }
+}
+
+impl Configuration {
+    /// Reads the file, and the secrets it names, or says exactly what is wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`Unusable`] for anything that would make the deployment behave
+    /// differently from what the file appears to say — a field that cannot be
+    /// read, a rule naming a Destination nobody declared, a secret with no value
+    /// behind it. Every one names the file and the path.
+    pub fn read(file: &Path, secrets: &Path) -> Result<Self, Unusable> {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| Unusable::at(file, "", format!("cannot be read: {e}")))?;
+
+        let document: Document = serde_yaml_ng::from_str(&text)
+            .map_err(|e| Unusable::at(file, "", format!("cannot be parsed: {e}")))?;
+
+        if document.version != VERSION {
+            return Err(Unusable::at(
+                file,
+                "version",
+                format!("is {}, and this build reads {VERSION}", document.version),
+            ));
+        }
+
+        let mut config = Self {
+            rooms: Rooms::default(),
+            tenants: BTreeSet::new(),
+            origins: HashMap::new(),
+        };
+
+        // Before the Origins, because an Origin is checked against this list.
+        config.read_tenants(file, &document.tenants)?;
+        config.read_origins(file, secrets, &document.origins)?;
+        let declared = config
+            .rooms
+            .read_destinations(file, secrets, &document.destinations)?;
+        config
+            .rooms
+            .read_subscriptions(file, &declared, &document.subscriptions)?;
+
+        Ok(config)
+    }
+
+    /// The tenants this deployment serves.
+    ///
+    /// An empty list is refused. A platform serving nobody is a file somebody
+    /// is halfway through writing, and every Origin below would fail anyway —
+    /// with a message about the Origin rather than about the omission.
+    fn read_tenants(&mut self, file: &Path, entries: &[String]) -> Result<(), Unusable> {
+        if entries.is_empty() {
+            return Err(Unusable::at(
+                file,
+                "tenants",
+                "lists none; every Origin must name a tenant, so a deployment \
+                 with no tenants can serve no sender",
+            ));
+        }
+
+        for (index, entry) in entries.iter().enumerate() {
+            let tenant = TenantId::new(entry)
+                .map_err(|why| Unusable::at(file, format!("tenants[{index}]"), why.to_string()))?;
+            if !self.tenants.insert(tenant) {
+                return Err(Unusable::at(
+                    file,
+                    format!("tenants[{index}]"),
+                    "is listed twice; a tenant is a namespace and there is only \
+                     one of each",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_origins(
+        &mut self,
+        file: &Path,
+        secrets: &Path,
+        entries: &[OriginEntry],
+    ) -> Result<(), Unusable> {
+        for (index, entry) in entries.iter().enumerate() {
+            let at = |field: &str| format!("origins[{index}].{field}");
+
+            let id = OriginId::new(&entry.id)
+                .map_err(|blank| Unusable::at(file, at("id"), blank.to_string()))?;
+
+            if self.origins.contains_key(id.as_str()) {
+                return Err(Unusable::at(
+                    file,
+                    at("id"),
+                    "is declared twice; an Origin's identity decides which secret \
+                     checks it, so two would be ambiguous",
+                ));
+            }
+
+            // Exactly one, so that an Origin declaring none and an Origin
+            // declaring two are each refused with a sentence that says which.
+            let mut declared = entry.verify.iter();
+            let (mechanism, holder) = declared.next().ok_or_else(|| {
+                Unusable::at(
+                    file,
+                    at("verify"),
+                    format!(
+                        "declares no mechanism; write {SIGNED} for a sender that \
+                         signs the body, or {SHARED} for one that presents a shared \
+                         value"
+                    ),
+                )
+            })?;
+            if declared.next().is_some() {
+                return Err(Unusable::at(
+                    file,
+                    at("verify"),
+                    "declares more than one mechanism; an Origin proves itself one \
+                     way, and the mechanism is never chosen by the request",
+                ));
+            }
+
+            let secret = self
+                .rooms
+                .read_secret(file, secrets, &at("verify"), &holder.secret)?;
+            let verify = match mechanism.as_str() {
+                SIGNED => Verification::Signed { secret },
+                SHARED => Verification::Shared { secret },
+                other => {
+                    return Err(Unusable::at(
+                        file,
+                        at("verify"),
+                        format!(
+                            "names {other:?}, which this build does not know; \
+                                 it reads {SIGNED} and {SHARED}"
+                        ),
+                    ));
+                }
+            };
+
+            let speaks = match entry.speaks {
+                SpeaksEntry::Github => Speaks::Github,
+                SpeaksEntry::Alertmanager => Speaks::Alertmanager,
+                SpeaksEntry::Grafana => Speaks::Grafana,
+            };
+
+            // A STARTUP ERROR, not a request-time refusal, and bead gc-nkb says
+            // why: `webhook-proxy check` runs on every change to this file in
+            // the operations repository, so a tenant that does not exist is
+            // caught before anything deploys and request handling never meets
+            // one. The alternative — accepting it and finding out later — makes
+            // a mistake in the platform's own configuration look like a sender
+            // problem, and the alert is already lost by then.
+            let tenant = TenantId::new(&entry.tenant)
+                .map_err(|why| Unusable::at(file, at("tenant"), why.to_string()))?;
+            if !self.tenants.contains(&tenant) {
+                let listed: Vec<&str> = self.tenants.iter().map(TenantId::as_str).collect();
+                return Err(Unusable::at(
+                    file,
+                    at("tenant"),
+                    format!(
+                        "names {tenant:?}, which `tenants` does not list. \
+                         Listed: {}. A tenant is listed rather than created by \
+                         being mentioned, so that a typo here is this message \
+                         rather than an alert filed under a tenant nobody has \
+                         an agent for",
+                        listed.join(", ")
+                    ),
+                ));
+            }
+
+            self.origins.insert(
+                entry.id.trim().to_owned(),
+                Declared {
+                    origin: Origin::new(id, verify),
+                    speaks,
+                    tenant,
+                },
+            );
+        }
+        Ok(())
+    }
 
     /// The routing this file actually produces, for a person to read.
     ///
@@ -638,12 +687,12 @@ impl Configuration {
         }
 
         out.push_str("\nrooms  (* marks a label only a sender can supply)\n");
-        let mut rooms: Vec<&String> = self.webhooks.keys().collect();
+        let mut rooms: Vec<&String> = self.rooms.webhooks.keys().collect();
         rooms.sort();
         for room in rooms {
             let _ = writeln!(out, "  {room}");
             let mut selected = 0usize;
-            for subscription in &self.subscriptions {
+            for subscription in &self.rooms.subscriptions {
                 if subscription.destination().id().as_str() != room {
                     continue;
                 }
@@ -661,9 +710,9 @@ impl Configuration {
             "\n{} tenant(s), {} sender(s), {} room(s), {} rule(s), {} secret(s) present",
             self.tenants.len(),
             self.origins.len(),
-            self.webhooks.len(),
-            self.subscriptions.len(),
-            self.secrets.len()
+            self.rooms.webhooks.len(),
+            self.rooms.subscriptions.len(),
+            self.rooms.secrets.len()
         );
 
         out
@@ -684,19 +733,198 @@ impl Configuration {
     /// Every rule, in the order the file gave them.
     #[must_use]
     pub fn subscriptions(&self) -> &[Subscription] {
-        &self.subscriptions
+        &self.rooms.subscriptions
     }
 
     /// Every secret value, by the name the file used.
     #[must_use]
     pub fn secrets(&self) -> &HashMap<String, String> {
-        &self.secrets
+        &self.rooms.secrets
     }
 
     /// Where each Destination is reached, by its identity.
     #[must_use]
     pub fn webhooks(&self) -> &HashMap<String, String> {
-        &self.webhooks
+        &self.rooms.webhooks
+    }
+}
+
+/// Everything a tenant's agent needs in order to deliver.
+///
+/// Its rooms and its rules, and nothing else. No Origin, because the platform
+/// authenticates senders and a tenant holds no sender's secret. No tenant name
+/// either, and that absence is bead gc-nkb's: the agent does not determine its
+/// own tenant — the platform derives it from the Origin at acceptance and from
+/// the caller's mTLS identity at claim time — so a tenant name here would be a
+/// value nothing checks against anything.
+#[derive(Clone)]
+pub struct TenantConfiguration {
+    rooms: Rooms,
+}
+
+/// Counts, never contents, for the reason [`Configuration`] gives: this holds
+/// every room URL the agent uses, and a room URL is itself a credential.
+impl fmt::Debug for TenantConfiguration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "TenantConfiguration({} rooms, {} rules, {} secrets loaded)",
+            self.rooms.webhooks.len(),
+            self.rooms.subscriptions.len(),
+            self.rooms.secrets.len()
+        )
+    }
+}
+
+impl TenantConfiguration {
+    /// Reads the file, and the room URLs it names, or says exactly what is
+    /// wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`Unusable`] for anything that would make the agent behave differently
+    /// from what the file appears to say, and for any of the four keys that
+    /// belong to the platform's half rather than this one. Every one names the
+    /// file and the path.
+    pub fn read(file: &Path, secrets: &Path) -> Result<Self, Unusable> {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| Unusable::at(file, "", format!("cannot be read: {e}")))?;
+
+        let document: TenantDocument = serde_yaml_ng::from_str(&text)
+            .map_err(|e| Unusable::at(file, "", format!("cannot be parsed: {e}")))?;
+
+        if document.version != VERSION {
+            return Err(Unusable::at(
+                file,
+                "version",
+                format!("is {}, and this build reads {VERSION}", document.version),
+            ));
+        }
+
+        // Refused with a reason rather than ignored. Each of these is a key a
+        // reader would reasonably expect to work, having seen the platform's
+        // file, and each means something different is wrong.
+        for (present, field, why) in [
+            (
+                document.origins.is_some(),
+                "origins",
+                "belongs to the platform's configuration, not a tenant's: the \
+                 platform authenticates senders, and an agent holds no sender's \
+                 secret and could not check one",
+            ),
+            (
+                document.verify.is_some(),
+                "verify",
+                "belongs to an Origin, and a tenant declares none. Nothing here \
+                 verifies a sender; what reaches this agent has already been \
+                 verified by the platform",
+            ),
+            (
+                document.tenants.is_some(),
+                "tenants",
+                "belongs to the platform's configuration: which tenants exist is \
+                 the platform's to list, and an agent serves exactly one",
+            ),
+            (
+                document.tenant.is_some(),
+                "tenant",
+                "is not an agent's to state. The platform derives the tenant from \
+                 the Origin's registration and from the caller's identity, so a \
+                 name written here would be checked against nothing — see bead \
+                 gc-nkb",
+            ),
+        ] {
+            if present {
+                return Err(Unusable::at(file, field, why));
+            }
+        }
+
+        let mut config = Self {
+            rooms: Rooms::default(),
+        };
+
+        // The same two readers the platform uses, on the same entry types. A
+        // second implementation would be a second place for the secret-name
+        // validation to drift, which is what that validation exists to stop.
+        let declared = config
+            .rooms
+            .read_destinations(file, secrets, &document.destinations)?;
+        config
+            .rooms
+            .read_subscriptions(file, &declared, &document.subscriptions)?;
+
+        Ok(config)
+    }
+
+    /// The routing this file actually produces, for a person to read.
+    ///
+    /// The same honest-consequence reporting [`Configuration::routing_table`]
+    /// does, and for the same reason: a typo in a label name cannot be
+    /// validated against anything, so what is shown is the consequence. A room
+    /// with no rules, or a rule every one of whose names only a sender can
+    /// supply, is obvious to somebody reading a pull request.
+    #[must_use]
+    pub fn routing_table(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str("rooms  (* marks a label only a sender can supply)\n");
+        let mut rooms: Vec<&String> = self.rooms.webhooks.keys().collect();
+        rooms.sort();
+        for room in rooms {
+            let _ = writeln!(out, "  {room}");
+            let mut selected = 0usize;
+            for subscription in &self.rooms.subscriptions {
+                if subscription.destination().id().as_str() != room {
+                    continue;
+                }
+                selected += 1;
+                let _ = writeln!(out, "    - {}", describe(subscription.filter()));
+            }
+            if selected == 0 {
+                out.push_str("    (nothing selects this room)\n");
+            }
+        }
+
+        // THE MISTAKE THIS LINE EXISTS FOR, and it is the likeliest one in a
+        // tenant's first file. Under bead gc-nkb a shared sender is registered
+        // once per tenant, so what arrives is `alertmanager-wallet-hsm-prod`
+        // rather than `alertmanager` — and a rule matching the short name
+        // matches nothing, silently, forever. Nothing can validate an origin
+        // name here: this agent never sees the platform's list.
+        let _ = writeln!(
+            out,
+            "\norigin names are the platform's, and are longer than you expect:\n  \
+             a shared sender is registered once per tenant, so a rule wants\n  \
+             `origin: alertmanager-<your-namespace>` and not `origin: alertmanager`"
+        );
+
+        let _ = writeln!(
+            out,
+            "\n{} room(s), {} rule(s), {} secret(s) present",
+            self.rooms.webhooks.len(),
+            self.rooms.subscriptions.len(),
+            self.rooms.secrets.len()
+        );
+
+        out
+    }
+
+    /// Every rule, in the order the file gave them.
+    #[must_use]
+    pub fn subscriptions(&self) -> &[Subscription] {
+        &self.rooms.subscriptions
+    }
+
+    /// Every secret value, by the name the file used.
+    #[must_use]
+    pub fn secrets(&self) -> &HashMap<String, String> {
+        &self.rooms.secrets
+    }
+
+    /// Where each room is reached, by its identity.
+    #[must_use]
+    pub fn webhooks(&self) -> &HashMap<String, String> {
+        &self.rooms.webhooks
     }
 }
 
@@ -1345,5 +1573,252 @@ subscriptions:
 
         assert!(e.to_string().contains("absent.yaml"), "{e}");
         assert!(e.to_string().contains("cannot be read"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::TenantConfiguration;
+
+    /// The published tenant example, and deliberately the real file: nothing
+    /// else parses it, so a structural mistake in it would sit undetected until
+    /// a tenant deployed it.
+    const EXAMPLE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../deploy/alert-agent/config.example.yaml"
+    );
+
+    fn written(dir: &Path, yaml: &str) -> std::path::PathBuf {
+        let file = dir.join("config.yaml");
+        fs::write(&file, yaml).expect("writable");
+        file
+    }
+
+    /// A minimal tenant file that parses, so each test can break one thing.
+    fn sound() -> String {
+        "
+version: 1
+destinations:
+  - id: a-room
+    kind: chat_room
+    webhook:
+      secret: a-url
+subscriptions:
+  - destination: a-room
+    match:
+      origin: a-forge-a-tenant
+"
+        .to_owned()
+    }
+
+    fn sound_secrets(dir: &Path) {
+        fs::write(
+            dir.join("a-url"),
+            "https://rooms.example/hook/SUPERSECRETHOOKID",
+        )
+        .expect("writable");
+    }
+
+    fn refused(yaml: &str) -> super::Unusable {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        let file = written(dir.path(), yaml);
+        TenantConfiguration::read(&file, dir.path()).expect_err("this file must be refused")
+    }
+
+    /// Every secret the example names, read out of the file rather than listed
+    /// here — a list is a second place to keep in step.
+    fn secrets_for_the_example(dir: &Path) {
+        for name in secret_names(EXAMPLE) {
+            fs::write(dir.join(&name), "https://rooms.example/hook/NOTAREALHOOK")
+                .expect("writable");
+        }
+    }
+
+    /// Every secret name a YAML file mentions, however deeply.
+    ///
+    /// Read out of the file rather than listed here: a list is a second place to
+    /// keep in step, and it fails for the wrong reason the day an example gains
+    /// a room. It is also what lets the test below assert that the two halves
+    /// of the configuration name no secret in common.
+    fn secret_names(file: &str) -> std::collections::BTreeSet<String> {
+        fn walk(node: &serde_yaml_ng::Value, found: &mut std::collections::BTreeSet<String>) {
+            match node {
+                serde_yaml_ng::Value::Mapping(entries) => {
+                    for (key, value) in entries {
+                        if key.as_str() == Some("secret")
+                            && let Some(name) = value.as_str()
+                        {
+                            found.insert(name.to_owned());
+                        }
+                        walk(value, found);
+                    }
+                }
+                serde_yaml_ng::Value::Sequence(items) => {
+                    for item in items {
+                        walk(item, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let text = fs::read_to_string(file).expect("the file is readable");
+        let parsed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&text).expect("the file parses as YAML");
+        let mut found = std::collections::BTreeSet::new();
+        walk(&parsed, &mut found);
+        found
+    }
+
+    #[test]
+    fn the_published_example_produces_the_routing_it_describes() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        secrets_for_the_example(dir.path());
+
+        let config = TenantConfiguration::read(Path::new(EXAMPLE), dir.path())
+            .unwrap_or_else(|e| panic!("the published tenant example must parse: {e}"));
+
+        assert_eq!(config.webhooks().len(), 2);
+        assert_eq!(config.subscriptions().len(), 3);
+        assert_eq!(config.secrets().len(), 2);
+    }
+
+    // ---- what a tenant's file may not contain ----------------------------
+    //
+    // Four keys, each refused BY NAME with a reason. `deny_unknown_fields`
+    // already makes a mistyped key an error, so these tests are not about
+    // typos: they are about the keys somebody reaches for having read the
+    // platform's file, where a serde "unknown field" would be true and useless.
+
+    #[test]
+    fn a_tenant_file_naming_origins_is_refused_and_told_why() {
+        let bad = sound().replace(
+            "destinations:",
+            "origins:\n  - id: a-forge\n    tenant: a-tenant\n    speaks: github\ndestinations:",
+        );
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "origins");
+        assert!(e.to_string().contains("authenticates senders"), "{e}");
+    }
+
+    #[test]
+    fn a_tenant_file_naming_a_verify_block_is_refused_and_told_why() {
+        let bad = sound().replace(
+            "destinations:",
+            "verify:\n  hmac_sha256:\n    secret: a-secret\ndestinations:",
+        );
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "verify");
+        assert!(e.to_string().contains("already been verified"), "{e}");
+    }
+
+    #[test]
+    fn a_tenant_file_listing_tenants_is_refused_and_told_why() {
+        let bad = sound().replace("destinations:", "tenants:\n  - a-tenant\ndestinations:");
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "tenants");
+        assert!(e.to_string().contains("serves exactly one"), "{e}");
+    }
+
+    #[test]
+    fn a_tenant_file_naming_its_own_tenant_is_refused_and_told_why() {
+        // The one that matters most (gc-nkb). A tenant name here is not merely
+        // redundant: it is a value nothing checks against anything, and the
+        // next reader would reasonably assume it was load-bearing.
+        let bad = sound().replace("destinations:", "tenant: a-tenant\ndestinations:");
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "tenant");
+        assert!(e.to_string().contains("checked against nothing"), "{e}");
+        assert!(e.to_string().contains("gc-nkb"), "{e}");
+    }
+
+    #[test]
+    fn neither_half_of_the_configuration_can_name_the_others_secrets() {
+        // The property gc-g9x said makes the split worth having, as a test
+        // rather than a reading of two files. The platform's example names
+        // sender secrets and a database; the tenant's names room URLs. An
+        // overlap would mean one side held a credential it has no business
+        // holding, and nothing would say so.
+        let platform = secret_names(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../deploy/webhook-proxy/config.example.yaml"
+        ));
+        let tenant = secret_names(EXAMPLE);
+
+        assert!(
+            !platform.is_empty(),
+            "the platform example names no secrets"
+        );
+        assert!(!tenant.is_empty(), "the tenant example names no secrets");
+        let shared: Vec<&String> = platform.intersection(&tenant).collect();
+        assert!(
+            shared.is_empty(),
+            "both halves of the configuration name {shared:?}, so one of them \
+             holds a credential it has no business holding"
+        );
+    }
+
+    #[test]
+    fn the_table_warns_about_origin_names_unconditionally() {
+        // Nothing here can validate an origin name — this agent never sees the
+        // platform's list, which is the same separation that stops it seeing
+        // another tenant's alerts. So the warning is printed always, rather
+        // than when something looks wrong, because nothing ever looks wrong.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        let file = written(dir.path(), &sound());
+        let config = TenantConfiguration::read(&file, dir.path()).expect("it parses");
+
+        let table = config.routing_table();
+
+        assert!(table.contains("longer than you expect"), "{table}");
+        assert!(
+            table.contains("origin: alertmanager-<your-namespace>"),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn a_room_nothing_selects_says_so() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        fs::write(dir.path().join("b-url"), "https://rooms.example/hook/B").expect("writable");
+        let file = written(
+            dir.path(),
+            &sound().replace(
+                "subscriptions:",
+                "  - id: forgotten-room\n    kind: chat_room\n    webhook:\n      secret: b-url\nsubscriptions:",
+            ),
+        );
+        let config = TenantConfiguration::read(&file, dir.path()).expect("it parses");
+
+        assert!(
+            config
+                .routing_table()
+                .contains("(nothing selects this room)"),
+            "{}",
+            config.routing_table()
+        );
+    }
+
+    #[test]
+    fn no_room_url_appears_in_the_table_or_the_debug_output() {
+        // A room URL is itself a credential (gc-o61), and these are the two
+        // strings most likely to be pasted into a chat window.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        sound_secrets(dir.path());
+        let file = written(dir.path(), &sound());
+        let config = TenantConfiguration::read(&file, dir.path()).expect("it parses");
+
+        assert!(!config.routing_table().contains("SUPERSECRETHOOKID"));
+        assert!(!format!("{config:?}").contains("SUPERSECRETHOOKID"));
     }
 }

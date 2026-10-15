@@ -1,0 +1,30 @@
+[package]
+name = "agent"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A second composition root, for a second deployment. It wires adapters, which
+# is what makes a crate this layer, and `crates/architecture/tests/boundaries.rs`
+# holds the App layer to a named list so a third cannot appear by accident.
+#
+# Named for what it is in a tenant's namespace, not for the crate: the service
+# account the platform's AuthorizationPolicy expects is `alert-agent`, and a
+# container whose entrypoint disagreed with the identity it presents would be
+# one more thing to work out at three in the morning.
+[[bin]]
+name = "alert-agent"
+path = "src/main.rs"
+
+[dependencies]
+yaml-config = { path = "../adapters/yaml-config" }
+
+[dev-dependencies]
+# The acceptance test writes its own routing file and secrets directory.
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+
+[lints]
+workspace = true

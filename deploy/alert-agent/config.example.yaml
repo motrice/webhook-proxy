@@ -1,0 +1,81 @@
+# alert-agent routing, as a file. The tenant's half.
+#
+# This is a published interface with a schema, reviewed as a diff in the
+# TENANT'S OWN repository — which is the point of the split: changing which
+# alerts reach which room needs nobody outside the team. Bead gc-g9x settled
+# what each side owns.
+#
+# Two rules govern what belongs here, the same two the platform's file follows:
+#
+#   * This file holds POLICY — who hears what.
+#   * The environment holds what the process needs to RUN.
+#
+# Secrets are in neither. This file names one per room; the value is read from a
+# file in the secrets directory, rendered there by an agent beside this process.
+# No secret value ever appears here, not even as a placeholder.
+
+# Bumped only when the shape changes incompatibly, so an old binary meeting a
+# new file fails with something better than a parse error.
+version: 1
+
+# WHAT IS DELIBERATELY ABSENT, because each is a key somebody will reach for
+# having seen the platform's file, and each is refused by name with a reason:
+#
+#   origins:   the platform authenticates senders. This agent holds no sender's
+#              secret and could not check one.
+#   verify:    belongs to an Origin, and a tenant declares none. What reaches
+#              this agent has already been verified.
+#   tenants:   which tenants exist is the platform's to list. This agent serves
+#              exactly one.
+#   tenant:    not this agent's to state. The platform derives it from the
+#              Origin's registration and from this agent's own identity, so a
+#              name written here would be checked against nothing — bead gc-nkb.
+
+# Every room this team wants told. The address is named, never written:
+# possession of a room's webhook URL is the only credential it has, so putting
+# it here would publish it to everyone who can read this repository.
+destinations:
+  - id: team-room
+    kind: chat_room
+    webhook:
+      secret: team-room-url
+
+  - id: oncall-room
+    kind: chat_room
+    webhook:
+      secret: oncall-room-url
+
+# Which room hears which alerts.
+#
+# A rule names labels a fact must carry; values are compared for equality and
+# nothing else. No negation and no regular expressions.
+#
+# `origin` is a reserved label: the platform sets it from the verified delivery
+# and a sender cannot, so a rule naming it is trustworthy even though every
+# other label an alert carries comes from whoever can deploy a workload.
+#
+# THE ORIGIN NAMES ARE LONGER THAN YOU EXPECT, and this is the likeliest mistake
+# in a first version of this file. The platform registers a shared sender ONCE
+# PER TENANT (bead gc-nkb), so what arrives is `alertmanager-<your-namespace>`
+# and not `alertmanager`. A rule matching the short name matches nothing,
+# silently and forever — and nothing here can catch it, because this agent never
+# sees the platform's list of senders. `alert-agent check` prints the warning;
+# the platform's own `webhook-proxy check` prints the real names.
+subscriptions:
+  # Everything this team's monitoring says is critical.
+  - destination: oncall-room
+    match:
+      origin: alertmanager-example-tenant
+      severity: critical
+
+  # One namespace, at any severity.
+  - destination: team-room
+    match:
+      origin: alertmanager-example-tenant
+      namespace: example-tenant
+
+  # Pushes to the team's own repository.
+  - destination: team-room
+    match:
+      origin: github-example-tenant
+      branch: main

@@ -9,6 +9,7 @@
 resolver = "3"
 members = [
     "crates/domain",
+    "crates/agent",
     "crates/application",
     "crates/adapters/alertmanager-payload",
     "crates/adapters/element-notices",

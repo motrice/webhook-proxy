@@ -67,7 +67,12 @@ fn classify(name: &str, manifest_path: &str) -> Layer {
         "domain" => Layer::Domain,
         "application" => Layer::Application,
         "architecture" => Layer::Architecture,
-        "app" => Layer::App,
+        // Two composition roots, because there are two deployments: the
+        // platform service and the tenant agent (bead gc-72e). Both wire
+        // adapters, which is the thing that makes a crate this layer, and
+        // neither may depend on the other — the test below holds them to a
+        // named list so a third does not appear by accident.
+        "app" | "agent" => Layer::App,
         other => panic!(
             "crate `{other}` at {manifest_path} is in no layer.\n\
              Put adapters under crates/adapters/, or add the crate to \
@@ -172,13 +177,59 @@ fn domain_has_no_dependencies() {
     );
 }
 
-/// Catches the classic drift where someone adds a crate outside `crates/`,
-/// or an adapter that is secretly a second composition root.
+/// Catches the classic drift where someone adds a crate outside `crates/`, or
+/// an adapter that is secretly a composition root.
+///
+/// The App layer holds a NAMED LIST rather than a count, and that is the
+/// difference bead gc-72e made: there are two deployments now — the platform
+/// service and the tenant agent — so two composition roots is correct, and
+/// "exactly one" was the wrong invariant rather than a violated one. A count of
+/// two would have let a third arrive without anybody deciding to, which is the
+/// drift this test is actually for.
 #[test]
-fn every_layer_is_populated_exactly_once() {
+fn every_layer_is_populated_by_exactly_what_it_should_be() {
     let crates = workspace();
-    for required in [Layer::Domain, Layer::Application, Layer::App] {
+
+    for required in [Layer::Domain, Layer::Application] {
         let n = crates.iter().filter(|c| c.layer == required).count();
         assert_eq!(n, 1, "expected exactly one {required:?} crate, found {n}");
+    }
+
+    let roots: BTreeSet<&str> = crates
+        .iter()
+        .filter(|c| c.layer == Layer::App)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        roots,
+        BTreeSet::from(["agent", "app"]),
+        "the composition roots are not the two deployments this workspace ships.          A new one is an architectural decision: add it here and to `classify`,          and say in the commit which deployment it is."
+    );
+}
+
+/// Neither deployment may reach into the other.
+///
+/// They share the domain, the use cases and the adapters, and nothing else. A
+/// dependency between them would make one of them a library with a `main` in
+/// it, and the two are deployed into different namespaces under different
+/// teams' control — so sharing code through the layers below is the only way
+/// they are allowed to agree about anything.
+#[test]
+fn the_two_composition_roots_do_not_depend_on_each_other() {
+    let crates = workspace();
+    let roots: Vec<&Crate> = crates.iter().filter(|c| c.layer == Layer::App).collect();
+
+    for root in &roots {
+        for other in &roots {
+            if root.name == other.name {
+                continue;
+            }
+            assert!(
+                !root.deps.contains(&other.name),
+                "{} depends on {}, which makes one composition root a library                  for the other",
+                root.name,
+                other.name
+            );
+        }
     }
 }
