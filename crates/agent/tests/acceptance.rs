@@ -133,24 +133,57 @@ subscriptions:
 }
 
 #[test]
-fn the_binary_does_not_pretend_to_deliver_yet() {
-    // The half-state this bead deliberately refuses to offer. The platform is
-    // still the thing that reaches a tenant's rooms (gc-72e.3 is the cutover),
-    // so an agent that appeared to run while delivering nothing would be the
-    // worst available outcome: everything would look fine.
+fn a_subcommand_this_build_does_not_have_is_refused_and_says_what_it_does() {
+    // `serve`, `run` and `deliver` are the names somebody would guess for the
+    // run mode, which has no name: no argument at all is the run mode, the way
+    // a container entrypoint invokes it.
     let dir = tempfile::tempdir().expect("a temporary directory");
     secrets_for_the_example(dir.path());
     let env = pointed_at(Path::new(EXAMPLE), dir.path());
 
-    for asked in [None, Some("serve"), Some("deliver"), Some("run")] {
-        let (ok, out, err) = run(asked, &env);
+    for asked in ["serve", "deliver", "run", "--help"] {
+        let (ok, out, err) = run(Some(asked), &env);
 
         assert!(!ok, "{asked:?} was accepted: {out}");
-        assert!(
-            err.contains("gc-72e.2"),
-            "the refusal should say where delivering arrives: {err}"
-        );
+        assert!(err.contains("check"), "{err}");
+        assert!(err.contains("claims, delivers and reports"), "{err}");
     }
+}
+
+#[test]
+fn the_run_mode_will_not_guess_where_the_platform_is() {
+    // The one variable with no sensible default. An agent that guessed would
+    // either reach nothing or reach somebody else's platform, and the second is
+    // worse than not starting.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    secrets_for_the_example(dir.path());
+
+    let (ok, _out, err) = run(None, &pointed_at(Path::new(EXAMPLE), dir.path()));
+
+    assert!(!ok, "it started without being told where the platform is");
+    assert!(err.contains("ALERT_AGENT_PLATFORM"), "{err}");
+}
+
+#[test]
+fn the_run_mode_refuses_a_file_it_cannot_use_before_reaching_anything() {
+    // The whole operator experience of a bad deploy, and it must happen before
+    // the first claim: an agent that started and then failed to route would
+    // look healthy while delivering nothing.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    fs::write(dir.path().join("a-url"), "https://rooms.example/hook/SHHH").expect("writable");
+    let file = dir.path().join("config.yaml");
+    fs::write(&file, "version: 1\ndestinations: []\nsubscriptions: []\n").expect("writable");
+
+    let mut env = pointed_at(&file, dir.path());
+    // A platform that could not be reached even if it tried, so a failure here
+    // can only be the file.
+    env.insert("ALERT_AGENT_PLATFORM", "http://127.0.0.1:1".to_owned());
+
+    let (ok, _out, err) = run(None, &env);
+
+    assert!(!ok);
+    assert!(err.contains("subscriptions"), "{err}");
+    assert!(!err.contains("SHHH"), "{err}");
 }
 
 #[test]

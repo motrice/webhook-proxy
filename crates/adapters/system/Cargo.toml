@@ -10,6 +10,14 @@ license.workspace = true
 domain = { path = "../../domain" }
 application = { path = "../../application" }
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+# "time" only, for the one port that waits. Nothing here schedules
+# anything or opens a socket.
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+# `start_paused` makes the one port that waits testable in no time at all.
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true

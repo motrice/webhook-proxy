@@ -1099,3 +1099,182 @@ mod offered_tests {
         assert_eq!(offered.correlation().trace(), a_correlation().trace());
     }
 }
+
+/// The platform could not be reached, or did not answer usefully.
+///
+/// Carries nothing else, for the reason [`StorageUnavailable`] carries nothing:
+/// the address and the identity are the adapter's, and an error that named them
+/// would put both in whatever log line touched it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreachable;
+
+impl core::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the platform could not be reached")
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// What the platform said about a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acknowledged {
+    /// It was outstanding for this agent, and now it is discharged.
+    Recorded,
+    /// Nothing outstanding went by that identity.
+    ///
+    /// Not an error, and worth telling apart: the likeliest cause is that this
+    /// agent's lease lapsed while it was delivering and somebody else has since
+    /// discharged the Delivery. An agent that treated it as a failure would
+    /// retry a report that will never be accepted.
+    NotOutstanding,
+}
+
+/// A Delivery as the agent receives it: what to send, and until when.
+///
+/// NOT [`Claimed`], AND THE DIFFERENCE IS A TENANT. The platform's type carries
+/// one because its store holds many tenants' work and must never mix them. What
+/// comes back over the wire carries none: the platform established the tenant
+/// from the caller's mTLS identity and has no reason to say it back, and bead
+/// gc-nkb forbids the agent holding a tenant name at all — it would be a value
+/// nothing checks against anything.
+///
+/// So the two sides of this hand-off have two types, which is honest rather
+/// than duplicative: they describe the same Delivery from either side of a
+/// trust boundary, and only one side is entitled to know whose it is. Reusing
+/// the platform's type would have meant the client inventing a placeholder
+/// tenant, which is exactly the value gc-nkb warns about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owed {
+    delivery: DeliveryId,
+    origin: OriginId,
+    events: Vec<Event>,
+    correlation: Correlation,
+    accepted_at: Timestamp,
+    lease_until: Timestamp,
+}
+
+impl Owed {
+    /// What was claimed, and until when.
+    ///
+    /// `None` when there are no Events, for the reason [`Offered::new`] gives:
+    /// there would be nothing to deliver and no room list to report, so the
+    /// platform's queue could never drain. A response carrying one is a
+    /// response this build cannot act on.
+    #[must_use]
+    pub fn new(
+        delivery: DeliveryId,
+        origin: OriginId,
+        events: Vec<Event>,
+        correlation: Correlation,
+        accepted_at: Timestamp,
+        lease_until: Timestamp,
+    ) -> Option<Self> {
+        if events.is_empty() {
+            return None;
+        }
+        Some(Self {
+            delivery,
+            origin,
+            events,
+            correlation,
+            accepted_at,
+            lease_until,
+        })
+    }
+
+    /// Which Delivery, which is how a report refers to it.
+    #[must_use]
+    pub fn delivery(&self) -> &DeliveryId {
+        &self.delivery
+    }
+
+    /// Who sent it, as a name. What a rule matching `origin` compares against.
+    #[must_use]
+    pub fn origin(&self) -> &OriginId {
+        &self.origin
+    }
+
+    /// What it reported, together and in the sender's order.
+    #[must_use]
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// The chain it arrived on, to be continued rather than restarted.
+    #[must_use]
+    pub fn correlation(&self) -> &Correlation {
+        &self.correlation
+    }
+
+    /// When the sender was answered.
+    #[must_use]
+    pub fn accepted_at(&self) -> Timestamp {
+        self.accepted_at
+    }
+
+    /// When this claim lapses and the Delivery is offered again.
+    ///
+    /// The platform's number, read rather than assumed (bead gc-81d).
+    #[must_use]
+    pub fn lease_until(&self) -> Timestamp {
+        self.lease_until
+    }
+}
+
+/// What a tenant's agent needs from the platform.
+///
+/// THE PORT WITH NO TENANT IN IT, and that absence is the whole design rather
+/// than an omission. Compare [`Handover`], the platform's own storage port,
+/// where every method takes a `&TenantId` because it serves many. An agent
+/// serves one, and which one is established by its mTLS identity at the other
+/// end — so a tenant in any of these signatures would be a value the agent
+/// asserts rather than a fact about who is calling, and bead gc-nkb refused
+/// exactly that. An interface that accepted one would invite somebody to trust
+/// it.
+///
+/// That difference is why the agent could not simply reuse `Handover`, which is
+/// what bead gc-72e expected: two ports, because the two sides are not
+/// symmetrical.
+#[async_trait]
+pub trait Offers: Send + Sync {
+    /// Everything this agent is owed, leased to it.
+    ///
+    /// No bound and no lease length in the signature: both are the platform's
+    /// to decide, and the expiry comes back on each [`Claimed`]. An agent that
+    /// assumed a duration would be wrong the day the platform changed its mind
+    /// (bead gc-81d).
+    ///
+    /// # Errors
+    ///
+    /// [`Unreachable`] if the platform could not be asked. Nothing is claimed
+    /// then, so the next pass simply asks again.
+    async fn claim(&self) -> Result<Vec<Owed>, Unreachable>;
+
+    /// The terminal statement about one Delivery.
+    ///
+    /// # Errors
+    ///
+    /// [`Unreachable`] if the platform could not be told. The work was still
+    /// done; what is lost is the record of it, and the Delivery will be offered
+    /// again when the lease lapses — which is the duplicate bead gc-81d
+    /// accepted knowingly.
+    async fn report(
+        &self,
+        delivery: &DeliveryId,
+        report: &Report,
+    ) -> Result<Acknowledged, Unreachable>;
+}
+
+/// Somewhere to wait.
+///
+/// A port because sleeping is an effect, and the application layer is allowed
+/// `thiserror` and `async-trait` and nothing else — so it could not reach a
+/// runtime even if it wanted to. That restriction is doing its job here: the
+/// agent's retry budget is a policy decision, and a test that had to wait
+/// thirty-one real seconds to prove it would be a test nobody runs.
+#[async_trait]
+pub trait Pause: Send + Sync {
+    /// Wait this long, then carry on.
+    async fn rest(&self, how_long: core::time::Duration);
+}

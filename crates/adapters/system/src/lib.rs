@@ -1,4 +1,4 @@
-//! The clock and the source of identities.
+//! The clock, the source of identities, and somewhere to wait.
 //!
 //! Small, but adapters nonetheless: reading the time and inventing an identity
 //! are effects, and `purity` fails the build if the domain tries either. Putting
@@ -7,7 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use application::ports::{Clock, Ids};
+use application::ports::{Clock, Ids, Pause};
 use domain::{Correlation, DeliveryId, Timestamp};
 
 /// The machine's clock.
@@ -132,5 +132,46 @@ mod tests {
     #[test]
     fn an_identity_is_long_enough_to_be_worth_logging() {
         assert_eq!(RandomIds.next_delivery_id().as_str().len(), 36);
+    }
+}
+
+/// Waiting, on the runtime.
+///
+/// An adapter for the same reason the clock is one: sleeping is an effect, and
+/// the application layer is allowed `thiserror` and `async-trait` and nothing
+/// else, so it could not reach a runtime even if a use case wanted to. That
+/// restriction is what lets a test prove a thirty-one second retry budget in
+/// no time at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Resting;
+
+#[async_trait::async_trait]
+impl Pause for Resting {
+    async fn rest(&self, how_long: core::time::Duration) {
+        tokio::time::sleep(how_long).await;
+    }
+}
+
+#[cfg(test)]
+mod waiting {
+    use application::ports::Pause;
+
+    use super::Resting;
+
+    /// Waiting waits, which sounds too obvious to test until you notice that
+    /// the retry budget is five of these and that a `Pause` which returned
+    /// immediately would turn a thirty-one second budget into five attempts in
+    /// a row against a room that is down.
+    ///
+    /// `start_paused` makes the clock a value rather than a wall: the sleep
+    /// below is instant, and the assertion is still about the time that was
+    /// meant to pass.
+    #[tokio::test(start_paused = true)]
+    async fn resting_waits_as_long_as_it_was_asked_to() {
+        let began = tokio::time::Instant::now();
+
+        Resting.rest(core::time::Duration::from_secs(30)).await;
+
+        assert!(began.elapsed() >= core::time::Duration::from_secs(30));
     }
 }

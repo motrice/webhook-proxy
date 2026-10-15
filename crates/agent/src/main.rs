@@ -10,18 +10,24 @@
 //! agent's own mTLS identity at claim time, so a name here would be checked
 //! against nothing (bead gc-nkb). No database: it pulls, and it is stateless.
 //!
-//! NOTHING HERE DELIVERS YET. This binary reads its configuration and says what
-//! it would route; claiming, delivering and reporting arrive in bead gc-72e.2,
-//! and the cutover that stops the platform delivering is gc-72e.3. It refuses
-//! to do anything else rather than offering a command that looks like it serves
-//! — an agent that appeared to run while delivering nothing is the worst of the
-//! available half-states, because the platform is still delivering and
-//! everything would look fine.
+//! IT RUNS, AND NOTHING STARTS IT YET. Claiming, delivering and reporting are
+//! here; the cutover that stops the platform delivering is bead gc-72e.3, and
+//! until that lands THE PLATFORM IS STILL DELIVERING TOO. Running this now
+//! means every room hears everything twice, so the run mode says so on the way
+//! up — loudly, because the only person who can reach it is someone starting it
+//! by hand, and that is exactly who needs telling.
+
+mod platform;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use application::{Deliver, Retry, idle_for};
+use element_notices::ElementNotices;
+use system::{RandomIds, Resting, SystemClock};
 use yaml_config::TenantConfiguration;
+
+use crate::platform::Platform;
 
 /// Where the agent reads its rules and its rooms from.
 ///
@@ -32,11 +38,38 @@ use yaml_config::TenantConfiguration;
 const CONFIG: &str = "ALERT_AGENT_CONFIG";
 const SECRETS: &str = "ALERT_AGENT_SECRETS_DIR";
 
+/// Where the platform answers. In the environment because it is where this
+/// process runs, not what it is allowed to do — the same line bead gc-ast.3
+/// drew for the proxy.
+const PLATFORM: &str = "ALERT_AGENT_PLATFORM";
+
+/// How long to wait for the platform, and for a room.
+///
+/// Well inside the five-minute lease either way. Not configurable: a timeout
+/// long enough to matter would be a timeout long enough to outlive the claim,
+/// and then the agent would deliver work it no longer holds.
+const TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// The budget for one room: five attempts, a second doubling to thirty.
+///
+/// About thirty-one seconds all told, which is what makes a five-minute lease
+/// comfortable rather than tight (bead gc-81d). Spent in process, because the
+/// agent has no store to come back to it from.
+fn budget() -> Retry {
+    Retry::new(
+        core::time::Duration::from_secs(1),
+        core::time::Duration::from_secs(30),
+        5,
+    )
+}
+
 /// What the agent was asked for, and could not do.
 enum Unstartable {
     /// The configuration cannot be used. Carries the file and the field.
     Configuration(String),
-    /// Something other than `check` was asked for.
+    /// A variable the run mode cannot default.
+    Missing(&'static str),
+    /// Something this build does not do was asked for.
     Unknown(String),
 }
 
@@ -44,11 +77,17 @@ impl std::fmt::Display for Unstartable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration(why) => write!(f, "{why}"),
+            Self::Missing(name) => write!(
+                f,
+                "{name} is not set, and there is nothing sensible to default it \
+                 to: an agent that guessed where the platform is would either \
+                 reach nothing or reach somebody else's"
+            ),
             Self::Unknown(what) => write!(
                 f,
-                "{what:?} is not something this build does. It reads `check`, \
-                 which validates {CONFIG} against {SECRETS} and prints what \
-                 would be routed. Delivering arrives in bead gc-72e.2"
+                "{what:?} is not something this build does. With no argument it \
+                 claims, delivers and reports; `check` validates {CONFIG} \
+                 against {SECRETS} and prints what would be routed"
             ),
         }
     }
@@ -60,6 +99,103 @@ impl std::fmt::Display for Unstartable {
 /// runs on every change to the file. It opens no socket and reaches no network,
 /// so it is safe anywhere — including a pipeline with no cluster access.
 fn check() -> Result<String, Unstartable> {
+    configured().map(|config| config.routing_table())
+}
+
+/// Claim, deliver, report, repeat.
+///
+/// No socket and no listener: it pulls, which is most of what "thin" means.
+/// There is nothing to shut down gracefully either — a pass is either finished
+/// or has not been reported, and an unreported pass comes back when the lease
+/// lapses, which is the duplicate bead gc-81d accepted knowingly.
+async fn serve() -> Result<(), Unstartable> {
+    let where_platform = std::env::var(PLATFORM).map_err(|_| Unstartable::Missing(PLATFORM))?;
+    let routing = configured()?;
+
+    // LOUD, AND ON THE WAY UP. Until bead gc-72e.3 the platform delivers too,
+    // so anything started here duplicates every message. The only person who
+    // can see this is somebody starting it by hand, which is exactly who needs
+    // telling — and a warning that waited for the first delivery would arrive
+    // after the first duplicate.
+    tracing::warn!(
+        "the platform is still delivering to rooms as well (bead gc-72e.3 is \
+         the cutover), so every message this agent sends is a second copy"
+    );
+
+    let platform = Platform::at(&where_platform, TIMEOUT)
+        .map_err(|why| Unstartable::Configuration(why.to_string()))?;
+    let rooms = ElementNotices::new(routing.webhooks().clone(), TIMEOUT)
+        .map_err(|_| Unstartable::Configuration("no HTTP client could be built".to_owned()))?;
+
+    let subscriptions = routing.subscriptions().to_vec();
+    let clock = SystemClock;
+    let deliver = Deliver::new(
+        &platform,
+        &rooms,
+        &clock,
+        &RandomIds,
+        &Resting,
+        &subscriptions,
+        budget(),
+    );
+
+    tracing::info!(
+        rooms = routing.webhooks().len(),
+        rules = subscriptions.len(),
+        "alert-agent started"
+    );
+
+    loop {
+        match deliver.once().await {
+            Ok(done) if !done.quiet() => {
+                // ONE LINE PER LOST ROOM, not a count. In this version it is
+                // the only way anybody learns a room never got something
+                // (bead gc-g9x), so a summary would make a loss a number with
+                // nothing to trace back to the push that caused it.
+                for (delivery, room, why, spent) in &done.lost {
+                    tracing::error!(
+                        delivery = %delivery.as_str(),
+                        room = %room.as_str(),
+                        reason = ?why,
+                        attempts = spent,
+                        "gave up telling a room"
+                    );
+                }
+                for delivery in &done.unreported {
+                    tracing::warn!(
+                        delivery = %delivery.as_str(),
+                        "delivered but could not be reported, so it will be \
+                         offered again and a room will see it twice"
+                    );
+                }
+                for delivery in &done.lapsed {
+                    tracing::warn!(
+                        delivery = %delivery.as_str(),
+                        "the claim lapsed before this was finished; it was not \
+                         reported, because it may now be somebody else's"
+                    );
+                }
+                tracing::info!(
+                    reached = done.reached.len(),
+                    lost = done.lost.len(),
+                    routed_to_nothing = done.routed_to_nothing.len(),
+                    "delivered what was claimed"
+                );
+            }
+            // Nothing claimed, so nothing to say and nothing to wait for but
+            // the next alert.
+            Ok(_) => tokio::time::sleep(idle_for()).await,
+            Err(why) => {
+                // No address and no identity: Unreachable carries neither.
+                tracing::error!(%why, "cannot reach the platform");
+                tokio::time::sleep(idle_for()).await;
+            }
+        }
+    }
+}
+
+/// The tenant's own file, read the way both modes read it.
+fn configured() -> Result<TenantConfiguration, Unstartable> {
     let file = PathBuf::from(
         std::env::var(CONFIG).unwrap_or_else(|_| "/etc/alert-agent/routing/config.yaml".to_owned()),
     );
@@ -68,19 +204,28 @@ fn check() -> Result<String, Unstartable> {
     );
 
     TenantConfiguration::read(&file, &secrets)
-        .map(|config| config.routing_table())
         .map_err(|why| Unstartable::Configuration(why.to_string()))
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // One argument, and only one, so there is no argument parser to go wrong.
     // The platform's binary reads its subcommand the same way.
     let asked = std::env::args().nth(1);
 
     let outcome = match asked.as_deref() {
         Some("check") => check(),
+        // The run mode never returns Ok: it loops until the pod is stopped, so
+        // anything it hands back is a reason it could not start at all.
+        None => serve().await.map(|()| String::new()),
         Some(other) => Err(Unstartable::Unknown(other.to_owned())),
-        None => Err(Unstartable::Unknown(String::new())),
     };
 
     match outcome {

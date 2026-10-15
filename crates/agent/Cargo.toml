@@ -19,7 +19,21 @@ name = "alert-agent"
 path = "src/main.rs"
 
 [dependencies]
+application = { path = "../application" }
+domain = { path = "../domain" }
+element-notices = { path = "../adapters/element-notices" }
+# For the Event JSON codec, which both ends of the hand-off share. An adapter
+# may not depend on another adapter, so the two clients of that codec are the
+# two composition roots — see src/platform.rs.
+postgres-outbox = { path = "../adapters/postgres-outbox" }
+system = { path = "../adapters/system" }
 yaml-config = { path = "../adapters/yaml-config" }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 # The acceptance test writes its own routing file and secrets directory.
