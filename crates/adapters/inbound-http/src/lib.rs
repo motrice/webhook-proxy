@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use application::ports::{Clock, Dispatcher, Ids, Outbox, Proofs, Translator};
+use application::ports::{Clock, Dispatcher, Handover, Ids, Outbox, Proofs, TenantId, Translator};
 use application::{Refused, Relay, Retry, Tally};
 use axum::Router;
 use axum::body::Bytes;
@@ -54,6 +54,15 @@ pub const AUTHORIZATION_HEADER: Presented = Presented::Header("authorization");
 pub struct Sender {
     /// Who this is, and what it must prove.
     pub origin: Origin,
+    /// Whose alerts this sender's are.
+    ///
+    /// On the sender rather than taken from the request, which is the whole of
+    /// bead gc-nkb: the Origin's own secret proves the Origin, so a tenant read
+    /// from its registration is derived from something already authenticated.
+    /// Read from a path, a body or a header it would be a claim, and a deployer
+    /// who can write an alert's labels could file it under somebody else's
+    /// tenant.
+    pub tenant: TenantId,
     /// What checks it.
     pub proofs: Arc<dyn Proofs>,
     /// What reads its payload, once verified.
@@ -94,6 +103,8 @@ pub struct Inbound {
     ids: Arc<dyn Ids>,
     subscriptions: Arc<Vec<Subscription>>,
     outbox: Arc<dyn Outbox>,
+    /// Where a Delivery waits for the tenant it belongs to.
+    handover: Arc<dyn Handover>,
     retry: Retry,
     /// What each room has been sent, shared with the worker.
     ///
@@ -134,6 +145,7 @@ impl Inbound {
         senders: HashMap<String, Sender>,
         dispatcher: Arc<dyn Dispatcher>,
         outbox: Arc<dyn Outbox>,
+        handover: Arc<dyn Handover>,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn Ids>,
         subscriptions: Vec<Subscription>,
@@ -144,6 +156,7 @@ impl Inbound {
             senders: Arc::new(senders),
             dispatcher,
             outbox,
+            handover,
             retry,
             clock,
             ids,
@@ -347,6 +360,7 @@ async fn receive(
         sender.translator.as_ref(),
         inbound.dispatcher.as_ref(),
         inbound.outbox.as_ref(),
+        inbound.handover.as_ref(),
         inbound.clock.as_ref(),
         inbound.ids.as_ref(),
         inbound.subscriptions.as_slice(),
@@ -363,6 +377,7 @@ async fn receive(
     match relay
         .relay(
             &sender.origin,
+            &sender.tenant,
             Body::from_bytes(body.to_vec()),
             &claimed,
             carried.clone(),
@@ -459,9 +474,12 @@ mod tests {
 
     use application::ports::{
         Attempt, Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs,
-        Recorded, SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
+        Recorded, SecretUnavailable, StorageUnavailable, TenantId, Translator, Untranslatable,
     };
     use application::{Retry, Tally};
+    // The real in-memory adapter rather than a fake. These tests are about the
+    // front door, and what the hand-off store does is proved in its own crate;
+    // a fake here would be a second implementation to keep honest.
     use async_trait::async_trait;
     use axum::Router;
     use axum::body::Body as AxumBody;
@@ -471,6 +489,7 @@ mod tests {
         DispatchId, Event, Filter, Origin, OriginId, Proof, Pusher, RepositoryName, SecretId,
         Subscription, Timestamp, Verification, VerifiedDelivery,
     };
+    use memory_outbox::MemoryHandover;
     use tower::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -687,6 +706,13 @@ mod tests {
         }
     }
 
+    /// Whose the alerts in these tests are. One tenant, because nothing here is
+    /// about isolation between two — that is bead gc-wcw.2's test, over HTTP
+    /// against a caller's identity rather than against a field.
+    fn a_tenant() -> TenantId {
+        TenantId::new("a-tenant").expect("a namespace name")
+    }
+
     fn to_rooms(ids: &[&str]) -> Vec<Subscription> {
         ids.iter()
             .map(|id| {
@@ -828,6 +854,7 @@ mod tests {
                 name,
                 Sender {
                     origin,
+                    tenant: a_tenant(),
                     proofs: sigs.clone(),
                     translator: Arc::new(Says(says)),
                     presented: SIGNATURE_HEADER,
@@ -835,6 +862,7 @@ mod tests {
             )]),
             dispatcher.clone(),
             Arc::new(store),
+            Arc::new(MemoryHandover::new()),
             Arc::new(FixedClock),
             ids.clone(),
             to_rooms(rooms),
@@ -1304,6 +1332,7 @@ mod tests {
                 name,
                 Sender {
                     origin,
+                    tenant: a_tenant(),
                     proofs: sigs.clone(),
                     translator: Arc::new(Says(Ok(vec![a_push()]))),
                     presented: SIGNATURE_HEADER,
@@ -1311,6 +1340,7 @@ mod tests {
             )]),
             dispatcher.clone(),
             Arc::new(Store { available: true }),
+            Arc::new(MemoryHandover::new()),
             Arc::new(FixedClock),
             ids,
             to_rooms(&["working", "broken"]),
@@ -1443,6 +1473,7 @@ mod tests {
                 name,
                 Sender {
                     origin,
+                    tenant: a_tenant(),
                     proofs: sigs.clone(),
                     translator: Arc::new(Says(Ok(vec![a_push()]))),
                     presented: SIGNATURE_HEADER,
@@ -1450,6 +1481,7 @@ mod tests {
             )]),
             dispatcher.clone(),
             Arc::new(Store { available: true }),
+            Arc::new(MemoryHandover::new()),
             Arc::new(FixedClock),
             ids,
             to_rooms(&["working", "broken"]),

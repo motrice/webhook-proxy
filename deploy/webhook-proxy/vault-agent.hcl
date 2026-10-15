@@ -54,10 +54,20 @@ template {
   contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.github_webhook_secret }}{{ end }}"
 }
 
+# One Alertmanager credential per tenant, which is bead gc-nkb's decision rather
+# than an oversight: the alternative was one Origin with the tenant read off an
+# alert's label, and a label is written by whoever can deploy a workload.
+# Rotating one of these tells the other nothing.
 template {
-  destination = "/vault/secrets/alertmanager-token"
+  destination = "/vault/secrets/alertmanager-devsecops-token"
   perms       = "0440"
-  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.alertmanager_token }}{{ end }}"
+  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.alertmanager_devsecops_token }}{{ end }}"
+}
+
+template {
+  destination = "/vault/secrets/alertmanager-platform-token"
+  perms       = "0440"
+  contents    = "{{ with secret \"kv/data/webhook-proxy\" }}{{ .Data.data.alertmanager_platform_token }}{{ end }}"
 }
 
 template {

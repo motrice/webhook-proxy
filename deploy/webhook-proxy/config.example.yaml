@@ -23,6 +23,21 @@
 # file fails with something better than a parse error.
 version: 1
 
+# Every tenant this deployment serves.
+#
+# A tenant is a namespace here, which is why these are spelled as namespace
+# names and refused if they could not be one — see bead gc-81d, which records
+# that coupling as a fact about this platform rather than a convenience.
+#
+# LISTED, NEVER INFERRED from the Origins below. If a tenant came into being by
+# being mentioned, a typo in one Origin's `tenant` would create a tenant nobody
+# has an agent for: the alerts would be accepted, stored, offered to nobody, and
+# eventually swept. Listed, the same typo is a startup error that `webhook-proxy
+# check` reports before anything deploys. Bead gc-nkb.
+tenants:
+  - devsecops
+  - platform
+
 # Every system permitted to send to this proxy, and how each proves it is
 # genuine. An Origin with no verify block is a startup error: there is no third
 # state and nothing to default to.
@@ -30,9 +45,28 @@ version: 1
 # The mechanism is read from here, never from the request. A request arriving at
 # an hmac_sha256 Origin bearing a token is refused, not retried as a token —
 # otherwise configuration could be talked into a downgrade. See bead gc-ast.2.
+#
+# ONE ORIGIN SERVES ONE TENANT, and the two Alertmanager senders below are not
+# duplication — they are the shape bead gc-nkb decided. A shared Alertmanager
+# sends for every tenant and labels each alert with the namespace it came from,
+# so the tempting arrangement is one `alertmanager` Origin with the tenant read
+# off that label. It is refused: a label comes from a workload annotation,
+# written by whoever can deploy, so a label as the tenant would let a deployer
+# file their alert under somebody else's. A LABEL IS ROUTING INPUT AND NEVER AN
+# AUTHORISATION BOUNDARY.
+#
+# What it costs, named here rather than discovered: Alertmanager's own
+# configuration grows a receiver and a credential per tenant. What it buys is
+# that tenant selection happens in Alertmanager's routing, where routing already
+# lives, instead of in this proxy's authorisation boundary where it would be a
+# hole. GitHub needs no equivalent — a repository already belongs to one team.
 origins:
   # Signs the body, so the proof is bound to what was sent.
   - id: github
+    # Whose alerts these are. Read from here and never from the request: the
+    # Origin's own secret is what proves the Origin, so the tenant is derived
+    # from something already authenticated and a sender cannot assert it.
+    tenant: devsecops
     # Which vocabulary this sender speaks, so the right translation is applied.
     # Separate from `verify` on purpose: how a sender proves itself and what
     # shape it sends are independent, and a sender that signed an Alertmanager
@@ -45,16 +79,29 @@ origins:
   # Cannot sign a body, so the proof is possession of a shared value and says
   # nothing about the payload. Weaker, deliberately accepted, and the cost is
   # written down in gc-ast.2.
-  - id: alertmanager
+  - id: alertmanager-devsecops
+    tenant: devsecops
     speaks: alertmanager
     verify:
       bearer:
-        secret: alertmanager-token
+        secret: alertmanager-devsecops-token
 
-  # A second alerting sender with its own credential, so one can be rotated or
+  # The same sender, for the other tenant, with its own credential. Rotating or
+  # withdrawing one tells the other nothing, which is the point: these are two
+  # senders as far as this proxy is concerned, because they speak for two
+  # different teams.
+  - id: alertmanager-platform
+    tenant: platform
+    speaks: alertmanager
+    verify:
+      bearer:
+        secret: alertmanager-platform-token
+
+  # A second alerting product with its own credential, so one can be rotated or
   # withdrawn without touching the other — and so a rule naming `origin: grafana`
   # means what it says. Both speak about alerts; neither can sign.
   - id: grafana
+    tenant: platform
     speaks: grafana
     verify:
       bearer:
@@ -110,13 +157,13 @@ subscriptions:
   # And critical alerts, wherever in the cluster they come from.
   - destination: devsecops-room
     match:
-      origin: alertmanager
+      origin: alertmanager-devsecops
       severity: critical
 
   # One team's namespace, at any severity.
   - destination: platform-room
     match:
-      origin: alertmanager
+      origin: alertmanager-platform
       namespace: platform
 
   # Grafana puts the rule's folder on every alert it sends, which makes the

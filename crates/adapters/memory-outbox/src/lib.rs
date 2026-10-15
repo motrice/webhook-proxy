@@ -16,7 +16,10 @@
 
 use std::sync::Mutex;
 
-use application::ports::{Archive, Outbox, Outcome, Page, Recorded, StorageUnavailable, Window};
+use application::ports::{
+    Archive, Handover, Offered, Outbox, Outcome, Page, Recorded, StorageUnavailable, TenantId,
+    Window,
+};
 use async_trait::async_trait;
 use domain::{DeliveryId, DestinationId, Dispatch, DispatchId, Timestamp};
 
@@ -909,5 +912,211 @@ mod archive_tests {
                 "a query answer carries {forbidden:?}: {printed}"
             );
         }
+    }
+}
+
+/// Deliveries held for their tenants, in memory.
+///
+/// A second store beside [`MemoryOutbox`] rather than a column on it, because
+/// [`Handover`] holds a different unit — a Delivery, not a Dispatch — and owes
+/// it to somebody else. See the port for why the platform cannot store a
+/// Dispatch for work a tenant routes.
+///
+/// IN THIS CRATE DESPITE ITS NAME, and the Postgres side is the reason. An
+/// adapter may not depend on another adapter, so a separate handover crate
+/// could not share `postgres-outbox`'s connection pool or its migrations — and
+/// two pools against one database is a worse thing to own than one slightly
+/// misnamed crate. The in-memory side follows the same shape so the two
+/// implementations of the port stay comparable.
+#[derive(Default)]
+pub struct MemoryHandover {
+    /// In the order offered, which is the order it should be collected in.
+    offered: Mutex<Vec<Offered>>,
+}
+
+impl MemoryHandover {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many Deliveries are outstanding, across every tenant.
+    ///
+    /// For a test and for a count; not a way around the port's tenant scoping,
+    /// which is why it answers a number and never a record.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.offered.lock().map_or(0, |offered| offered.len())
+    }
+}
+
+/// Counts, never contents — an `Offered` carries Events, which are other
+/// people's words.
+impl core::fmt::Debug for MemoryHandover {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "MemoryHandover({} outstanding)", self.held())
+    }
+}
+
+#[async_trait]
+impl Handover for MemoryHandover {
+    async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
+        let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
+        held.push(offered.clone());
+        Ok(())
+    }
+
+    async fn outstanding(
+        &self,
+        tenant: &TenantId,
+        limit: usize,
+    ) -> Result<Vec<Offered>, StorageUnavailable> {
+        let held = self.offered.lock().map_err(|_| StorageUnavailable)?;
+        Ok(held
+            .iter()
+            .filter(|offered| offered.tenant() == tenant)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod handover_tests {
+    use application::ports::{Handover, Offered, TenantId};
+    use domain::{
+        BranchName, Correlation, DeliveryId, Event, OriginId, Pusher, RepositoryName, Timestamp,
+    };
+
+    use super::MemoryHandover;
+
+    fn at(millis: i64) -> Timestamp {
+        Timestamp::from_millis_since_epoch(1_759_000_000_000 + millis)
+    }
+
+    fn tenant(id: &str) -> TenantId {
+        TenantId::new(id).expect("a namespace name")
+    }
+
+    fn offered(delivery: &str, whose: &str, when: i64) -> Offered {
+        Offered::new(
+            DeliveryId::new(delivery).expect("a non-blank id"),
+            tenant(whose),
+            OriginId::new("alertmanager").expect("a non-blank id"),
+            vec![Event::PushedCommits {
+                repository: RepositoryName::new("motrice/webhook-proxy").expect("a name"),
+                branch: BranchName::new("main").expect("a name"),
+                pusher: Pusher::new("bjornmolin").expect("a name"),
+                commits: vec![],
+                permalink: None,
+            }],
+            Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+                .expect("a well formed correlation"),
+            at(when),
+        )
+        .expect("at least one event")
+    }
+
+    #[tokio::test]
+    async fn a_tenant_is_offered_only_its_own() {
+        // THE PROPERTY THE WHOLE SPLIT EXISTS FOR, at the lowest level it can be
+        // stated. gc-wcw.2 proves it again over HTTP against a caller's
+        // identity; this proves the store itself does not hand one tenant
+        // another's work, so a leak there cannot be blamed on the endpoint.
+        let store = MemoryHandover::new();
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1))
+            .await
+            .expect("stored");
+        store
+            .offer(&offered("d-2", "wallet-hsm-prod", 2))
+            .await
+            .expect("stored");
+
+        let theirs = store
+            .outstanding(&tenant("wallet-lab-prod"), 10)
+            .await
+            .expect("asked");
+
+        assert_eq!(theirs.len(), 1, "one tenant's work came back as two");
+        assert_eq!(theirs[0].delivery().as_str(), "d-1");
+        assert_eq!(theirs[0].tenant().as_str(), "wallet-lab-prod");
+        // And the positive oracle, so this cannot pass by returning nothing:
+        // the store does hold the other one, for the other tenant.
+        assert_eq!(store.held(), 2);
+        assert_eq!(
+            store
+                .outstanding(&tenant("wallet-hsm-prod"), 10)
+                .await
+                .expect("asked")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_with_nothing_outstanding_is_not_an_error() {
+        // A tenant whose agent has kept up looks exactly like a tenant that
+        // does not exist, and must: this port is asked by an authenticated
+        // caller, and a distinguishable answer would say whether another
+        // namespace is a tenant here.
+        let store = MemoryHandover::new();
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1))
+            .await
+            .expect("stored");
+
+        assert!(
+            store
+                .outstanding(&tenant("wallet-hsm-prod"), 10)
+                .await
+                .expect("asked")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_oldest_is_offered_first_and_no_more_than_asked_for() {
+        // Oldest first because that is the order it should be collected in; and
+        // bounded, because this queue grows without limit precisely when nobody
+        // is collecting, which is the case it has to survive being asked about.
+        let store = MemoryHandover::new();
+        for (id, when) in [("d-1", 1), ("d-2", 2), ("d-3", 3)] {
+            store
+                .offer(&offered(id, "wallet-lab-prod", when))
+                .await
+                .expect("stored");
+        }
+
+        let first_two = store
+            .outstanding(&tenant("wallet-lab-prod"), 2)
+            .await
+            .expect("asked");
+
+        assert_eq!(
+            first_two
+                .iter()
+                .map(|o| o.delivery().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["d-1", "d-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_lost_between_being_offered_and_being_read_back() {
+        // The Events arrive together, which is what gc-smz's grouping needs, and
+        // the correlation arrives with them, which is what keeps a room message
+        // traceable back to the sender's push across the hand-off.
+        let store = MemoryHandover::new();
+        let one = offered("d-1", "wallet-lab-prod", 1);
+        store.offer(&one).await.expect("stored");
+
+        let read_back = store
+            .outstanding(&tenant("wallet-lab-prod"), 10)
+            .await
+            .expect("asked");
+
+        assert_eq!(read_back, vec![one]);
     }
 }

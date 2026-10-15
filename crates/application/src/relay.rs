@@ -7,7 +7,10 @@ use domain::{
     Proof, Subscription, destinations_for,
 };
 
-use crate::ports::{Attempt, Clock, DispatchFailed, Dispatcher, Ids, Outbox, Proofs, Translator};
+use crate::ports::{
+    Attempt, Clock, DispatchFailed, Dispatcher, Handover, Ids, Offered, Outbox, Proofs, TenantId,
+    Translator,
+};
 
 /// Why a Delivery was not accepted at all.
 ///
@@ -158,6 +161,7 @@ pub struct Relay<'a> {
     translator: &'a dyn Translator,
     dispatcher: &'a dyn Dispatcher,
     outbox: &'a dyn Outbox,
+    handover: &'a dyn Handover,
     clock: &'a dyn Clock,
     ids: &'a dyn Ids,
     subscriptions: &'a [Subscription],
@@ -176,6 +180,7 @@ impl<'a> Relay<'a> {
         translator: &'a dyn Translator,
         dispatcher: &'a dyn Dispatcher,
         outbox: &'a dyn Outbox,
+        handover: &'a dyn Handover,
         clock: &'a dyn Clock,
         ids: &'a dyn Ids,
         subscriptions: &'a [Subscription],
@@ -186,6 +191,7 @@ impl<'a> Relay<'a> {
             translator,
             dispatcher,
             outbox,
+            handover,
             clock,
             ids,
             subscriptions,
@@ -212,6 +218,7 @@ impl<'a> Relay<'a> {
     pub async fn relay(
         &self,
         origin: &Origin,
+        tenant: &TenantId,
         body: Body,
         claimed: &Proof,
         carried: Option<Correlation>,
@@ -290,6 +297,33 @@ impl<'a> Relay<'a> {
                 )
             })
             .collect();
+
+        // Owed to its tenant before anything else is written, because that
+        // record is what a 202 now promises: stored, and will be offered to its
+        // tenant (bead gc-g9x restating gc-mbr). The two writes are not one
+        // transaction and cannot be while two stores exist — a crash between
+        // them refuses the sender, who sends again, and the duplicate lands in
+        // whichever store got there first. This order puts that duplicate in the
+        // store nothing reads yet rather than in the one that would send a
+        // second message to a room today. Bead gc-wcw.1 names it; it stops
+        // being possible when the outbox below leaves this service.
+        //
+        // No Destination appears here, and that is the split: the platform does
+        // not know this tenant's rooms. Compare the `planned` Dispatches above,
+        // which are the routing this service still does for itself.
+        if let Some(offered) = Offered::new(
+            verified.id().clone(),
+            tenant.clone(),
+            verified.origin().clone(),
+            events.clone(),
+            correlation.clone(),
+            self.clock.now(),
+        ) {
+            self.handover
+                .offer(&offered)
+                .await
+                .map_err(|_| Refused::StorageUnavailable)?;
+        }
 
         // Stored before the sender is told anything, which is what a 202 now
         // means. Refused rather than sent-without-storing: see gc-mbr.
@@ -387,8 +421,9 @@ mod tests {
 
     use super::{Refused, Relay, Retry};
     use crate::ports::{
-        Attempt, Clock, DispatchFailed, Dispatcher, Ids, MalformedProof, Outbox, Outcome, Proofs,
-        Recorded, SecretUnavailable, StorageUnavailable, Translator, Untranslatable,
+        Attempt, Clock, DispatchFailed, Dispatcher, Handover, Ids, MalformedProof, Offered, Outbox,
+        Outcome, Proofs, Recorded, SecretUnavailable, StorageUnavailable, TenantId, Translator,
+        Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
@@ -517,6 +552,75 @@ mod tests {
 
     fn signature() -> Proof {
         Proof::from_bytes(SIGNATURE)
+    }
+
+    /// Somewhere to hand a Delivery over to its tenant, for the tests that are
+    /// about something else.
+    ///
+    /// Separate from `Held` rather than one fake implementing both ports,
+    /// because the use case now writes to two stores and a test has to be able
+    /// to make exactly one of them fail. A single fake would have made "the
+    /// outbox is down" and "the handover is down" the same case, which is the
+    /// one distinction these tests are here to keep.
+    struct Owed {
+        offered: Mutex<Vec<Offered>>,
+        available: bool,
+    }
+
+    impl Owed {
+        fn available() -> Self {
+            Self {
+                offered: Mutex::new(Vec::new()),
+                available: true,
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                available: false,
+                ..Self::available()
+            }
+        }
+
+        /// What was handed over, in order.
+        fn offered(&self) -> Vec<Offered> {
+            self.offered.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Handover for Owed {
+        async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
+            if !self.available {
+                return Err(StorageUnavailable);
+            }
+            self.offered
+                .lock()
+                .expect("not poisoned")
+                .push(offered.clone());
+            Ok(())
+        }
+
+        async fn outstanding(
+            &self,
+            tenant: &TenantId,
+            limit: usize,
+        ) -> Result<Vec<Offered>, StorageUnavailable> {
+            if !self.available {
+                return Err(StorageUnavailable);
+            }
+            Ok(self
+                .offered()
+                .into_iter()
+                .filter(|offered| offered.tenant() == tenant)
+                .take(limit)
+                .collect())
+        }
+    }
+
+    /// Whose the alerts in these tests are.
+    fn a_tenant() -> TenantId {
+        TenantId::new("wallet-lab-prod").expect("a namespace name")
     }
 
     /// An outbox a test can watch, and can make refuse.
@@ -649,11 +753,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first", "second"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -663,6 +769,7 @@ mod tests {
         let relayed = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -684,11 +791,13 @@ mod tests {
         let dispatcher = Recorder::new(vec!["second"]);
         let subscriptions = everything_to(&["first", "second", "third"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -698,6 +807,7 @@ mod tests {
         let relayed = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -730,11 +840,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -744,6 +856,7 @@ mod tests {
         let refused = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -765,11 +878,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -779,6 +894,7 @@ mod tests {
         let refused = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -797,11 +913,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -811,6 +929,7 @@ mod tests {
         let refused = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -838,11 +957,13 @@ mod tests {
             )),
         )];
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -852,6 +973,7 @@ mod tests {
         let relayed = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -872,11 +994,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -886,6 +1010,7 @@ mod tests {
         let relayed = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -910,11 +1035,13 @@ mod tests {
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first", "second"]);
         let outbox = Held::unavailable();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -924,6 +1051,7 @@ mod tests {
         let outcome = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -938,17 +1066,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn everything_is_stored_before_anything_is_sent() {
+    async fn a_delivery_that_cannot_be_owed_to_its_tenant_is_refused() {
+        // The same promise as the test above, for the store that now carries it.
+        // A 202 means stored and WILL BE OFFERED TO ITS TENANT (bead gc-g9x), so
+        // a handover that cannot take it must refuse the sender rather than
+        // accept something no agent will ever be told about. The outbox is
+        // available here, which is the point: this is a distinct failure and not
+        // a second spelling of the one above.
         let secret = Secret(Ok(signature()));
         let says = Says(Ok(vec![a_push()]));
         let dispatcher = Recorder::new(vec![]);
         let subscriptions = everything_to(&["first", "second"]);
         let outbox = Held::available();
+        let owed = Owed::unavailable();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
+            &FixedClock,
+            &OneId,
+            &subscriptions,
+            generous(),
+        );
+
+        let outcome = relay
+            .relay(
+                &an_origin(),
+                &a_tenant(),
+                Body::from_bytes(b"payload".to_vec()),
+                &signature(),
+                None,
+            )
+            .await;
+
+        assert_eq!(outcome, Err(Refused::StorageUnavailable));
+        assert!(
+            dispatcher.sent().is_empty(),
+            "a Notice was sent for a Delivery no tenant was ever told about"
+        );
+        assert!(
+            outbox.settled().is_empty(),
+            "the outbox settled something for a Delivery that was never owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_is_owed_is_the_delivery_whole_and_says_whose_it_is() {
+        // The hand-off record, checked against what gc-81d says a claim must
+        // return: the Events TOGETHER, the Origin, the correlation, and the
+        // tenant. Two rooms subscribe here and the handover still holds exactly
+        // one record — the platform stores a Delivery, not a Dispatch per room,
+        // because it does not know a tenant's rooms at all.
+        let secret = Secret(Ok(signature()));
+        let says = Says(Ok(vec![a_push(), a_push()]));
+        let dispatcher = Recorder::new(vec![]);
+        let subscriptions = everything_to(&["first", "second"]);
+        let outbox = Held::available();
+        let owed = Owed::available();
+        let relay = Relay::new(
+            &secret,
+            &says,
+            &dispatcher,
+            &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -958,6 +1140,91 @@ mod tests {
         relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
+                Body::from_bytes(b"payload".to_vec()),
+                &signature(),
+                None,
+            )
+            .await
+            .expect("a matching signature is accepted");
+
+        let owed = owed.offered();
+        assert_eq!(
+            owed.len(),
+            1,
+            "two rooms subscribed and the tenant was owed one record per room;              the platform does not know the rooms"
+        );
+        assert_eq!(owed[0].tenant(), &a_tenant());
+        assert_eq!(owed[0].origin(), an_origin().id());
+        assert_eq!(
+            owed[0].events().len(),
+            2,
+            "a sender grouped two facts into one notification and they were              handed over separately, which undoes gc-smz's grouping before the              agent can honour it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_reporting_nothing_owes_its_tenant_nothing() {
+        // Success, and nothing handed over. A sender telling us about something
+        // we do not care about must not leave a row its tenant can never
+        // discharge: there are no facts to deliver, so there is no room list to
+        // report and the queue would never drain.
+        let secret = Secret(Ok(signature()));
+        let says = Says(Ok(vec![]));
+        let dispatcher = Recorder::new(vec![]);
+        let subscriptions = everything_to(&["first"]);
+        let outbox = Held::available();
+        let owed = Owed::available();
+        let relay = Relay::new(
+            &secret,
+            &says,
+            &dispatcher,
+            &outbox,
+            &owed,
+            &FixedClock,
+            &OneId,
+            &subscriptions,
+            generous(),
+        );
+
+        relay
+            .relay(
+                &an_origin(),
+                &a_tenant(),
+                Body::from_bytes(b"payload".to_vec()),
+                &signature(),
+                None,
+            )
+            .await
+            .expect("a Delivery reporting nothing is not an error");
+
+        assert!(owed.offered().is_empty());
+    }
+
+    #[tokio::test]
+    async fn everything_is_stored_before_anything_is_sent() {
+        let secret = Secret(Ok(signature()));
+        let says = Says(Ok(vec![a_push()]));
+        let dispatcher = Recorder::new(vec![]);
+        let subscriptions = everything_to(&["first", "second"]);
+        let outbox = Held::available();
+        let owed = Owed::available();
+        let relay = Relay::new(
+            &secret,
+            &says,
+            &dispatcher,
+            &outbox,
+            &owed,
+            &FixedClock,
+            &OneId,
+            &subscriptions,
+            generous(),
+        );
+
+        relay
+            .relay(
+                &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -988,11 +1255,13 @@ mod tests {
         let dispatcher = Recorder::new(vec!["first"]);
         let subscriptions = everything_to(&["first"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -1002,6 +1271,7 @@ mod tests {
         let relayed = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,
@@ -1024,11 +1294,13 @@ mod tests {
         let dispatcher = Recorder::new(vec!["first"]);
         let subscriptions = everything_to(&["first"]);
         let outbox = Held::available();
+        let owed = Owed::available();
         let relay = Relay::new(
             &secret,
             &says,
             &dispatcher,
             &outbox,
+            &owed,
             &FixedClock,
             &OneId,
             &subscriptions,
@@ -1038,6 +1310,7 @@ mod tests {
         let relayed = relay
             .relay(
                 &an_origin(),
+                &a_tenant(),
                 Body::from_bytes(b"payload".to_vec()),
                 &signature(),
                 None,

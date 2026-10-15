@@ -237,8 +237,11 @@ fn a_usable_configuration() -> (tempfile::TempDir, String, String) {
     fs::write(
         &file,
         "version: 1
+tenants:
+  - a-tenant
 origins:
   - id: a-forge
+    tenant: a-tenant
     speaks: github
     verify:
       hmac_sha256:

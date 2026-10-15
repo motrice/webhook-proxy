@@ -250,23 +250,45 @@ It performs exactly the read the process does at start-up, then prints what the
 file would actually route:
 
 ```text
+tenants  (* marks one no sender files alerts for)
+  devsecops
+  platform
+
 senders
-  /webhook/alertmanager  presents a shared value, speaks alertmanager
-  /webhook/github  signs its body, speaks github
-  /webhook/grafana  presents a shared value, speaks grafana
+  /webhook/alertmanager-devsecops  presents a shared value, speaks alertmanager, for tenant devsecops
+  /webhook/alertmanager-platform  presents a shared value, speaks alertmanager, for tenant platform
+  /webhook/github  signs its body, speaks github, for tenant devsecops
+  /webhook/grafana  presents a shared value, speaks grafana, for tenant platform
 
 rooms  (* marks a label only a sender can supply)
   audit-room
     - everything
   devsecops-room
     - branch=main origin=github repository=motrice/webhook-proxy
-    - origin=alertmanager severity=critical
+    - origin=alertmanager-devsecops severity=critical
   platform-room
-    - namespace*=platform origin=alertmanager
+    - namespace*=platform origin=alertmanager-platform
     - grafana_folder*=Platform origin=grafana
 
-3 sender(s), 3 room(s), 5 rule(s), 6 secret(s) present
+2 tenant(s), 4 sender(s), 3 room(s), 5 rule(s), 7 secret(s) present
 ```
+
+Two Alertmanager senders for one Alertmanager, because **one Origin serves one
+tenant** (bead `gc-nkb`). A shared Alertmanager labels each alert with the
+namespace it came from, so the tempting arrangement is one `alertmanager` Origin
+with the tenant read off that label — and that is refused: a label comes from a
+workload annotation, written by whoever can deploy, so a label as the tenant
+would let a deployer file their alert under somebody else's. A label is routing
+*input*; it is never an authorisation boundary. The cost is a receiver and a
+credential per tenant in Alertmanager's own configuration, and the compensation
+is that tenant selection happens in Alertmanager's routing rather than in this
+proxy's authorisation boundary.
+
+An Origin naming a tenant that `tenants:` does not list is a **startup error**,
+not a request-time refusal, so request handling never meets an unknown tenant.
+Tenants are listed rather than created by being mentioned, because inferring
+them would make a one-letter typo produce a tenant nobody has an agent for —
+with every step from verification to storage reporting success.
 
 A past delivery can be sent again, by identity:
 

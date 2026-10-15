@@ -14,11 +14,13 @@
 //! start-up log always says what was actually loaded — see bead gc-ast.3.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use application::ports::TenantId;
 use domain::{
     Destination, DestinationId, DestinationKind, Filter, LabelName, LabelValue, Labels, Origin,
     OriginId, SecretId, Subscription, Verification,
@@ -64,11 +66,26 @@ pub struct Declared {
     pub origin: Origin,
     /// What shape it sends.
     pub speaks: Speaks,
+    /// Whose alerts these are.
+    ///
+    /// HERE RATHER THAN ON `Origin`, which is a domain value and gains nothing
+    /// (bead gc-g9x). The tenant is read from this file, so a reviewer can see
+    /// in a diff who an incoming alert will be filed under — and because it is
+    /// read from the registration rather than from the request, the Origin's
+    /// own secret is what proves it. A caller cannot assert it (bead gc-nkb).
+    pub tenant: TenantId,
 }
 
 /// Everything the composition root needs in order to start.
 #[derive(Clone)]
 pub struct Configuration {
+    /// Every tenant this deployment serves, as the file lists them.
+    ///
+    /// LISTED, NEVER INFERRED from the Origins that mention them (bead gc-nkb).
+    /// Inferring would make a typo in one Origin create a tenant silently, and
+    /// the symptom would be an alert filed under a tenant nobody has an agent
+    /// for — stored, offered to nobody, and eventually swept.
+    tenants: BTreeSet<TenantId>,
     origins: HashMap<String, Declared>,
     subscriptions: Vec<Subscription>,
     secrets: HashMap<String, String>,
@@ -85,7 +102,8 @@ impl fmt::Debug for Configuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Configuration({} origins, {} destinations, {} rules, {} secrets loaded)",
+            "Configuration({} tenants, {} origins, {} destinations, {} rules, {} secrets loaded)",
+            self.tenants.len(),
             self.origins.len(),
             self.webhooks.len(),
             self.subscriptions.len(),
@@ -142,6 +160,7 @@ impl std::error::Error for Unusable {}
 #[serde(deny_unknown_fields)]
 struct Document {
     version: u8,
+    tenants: Vec<String>,
     origins: Vec<OriginEntry>,
     destinations: Vec<DestinationEntry>,
     subscriptions: Vec<SubscriptionEntry>,
@@ -151,6 +170,9 @@ struct Document {
 #[serde(deny_unknown_fields)]
 struct OriginEntry {
     id: String,
+    /// Which tenant this sender's alerts belong to. One Origin serves one
+    /// tenant (bead gc-nkb), so this is a field and not a list.
+    tenant: String,
     speaks: SpeaksEntry,
     /// A map of exactly one entry, not an enum.
     ///
@@ -238,17 +260,51 @@ impl Configuration {
         }
 
         let mut config = Self {
+            tenants: BTreeSet::new(),
             origins: HashMap::new(),
             subscriptions: Vec::new(),
             secrets: HashMap::new(),
             webhooks: HashMap::new(),
         };
 
+        // Before the Origins, because an Origin is checked against this list.
+        config.read_tenants(file, &document.tenants)?;
         config.read_origins(file, secrets, &document.origins)?;
         let declared = config.read_destinations(file, secrets, &document.destinations)?;
         config.read_subscriptions(file, &declared, &document.subscriptions)?;
 
         Ok(config)
+    }
+
+    /// The tenants this deployment serves.
+    ///
+    /// An empty list is refused. A platform serving nobody is a file somebody
+    /// is halfway through writing, and every Origin below would fail anyway —
+    /// with a message about the Origin rather than about the omission.
+    fn read_tenants(&mut self, file: &Path, entries: &[String]) -> Result<(), Unusable> {
+        if entries.is_empty() {
+            return Err(Unusable::at(
+                file,
+                "tenants",
+                "lists none; every Origin must name a tenant, so a deployment \
+                 with no tenants can serve no sender",
+            ));
+        }
+
+        for (index, entry) in entries.iter().enumerate() {
+            let tenant = TenantId::new(entry)
+                .map_err(|why| Unusable::at(file, format!("tenants[{index}]"), why.to_string()))?;
+            if !self.tenants.insert(tenant) {
+                return Err(Unusable::at(
+                    file,
+                    format!("tenants[{index}]"),
+                    "is listed twice; a tenant is a namespace and there is only \
+                     one of each",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn read_origins(
@@ -316,11 +372,38 @@ impl Configuration {
                 SpeaksEntry::Alertmanager => Speaks::Alertmanager,
                 SpeaksEntry::Grafana => Speaks::Grafana,
             };
+
+            // A STARTUP ERROR, not a request-time refusal, and bead gc-nkb says
+            // why: `webhook-proxy check` runs on every change to this file in
+            // the operations repository, so a tenant that does not exist is
+            // caught before anything deploys and request handling never meets
+            // one. The alternative — accepting it and finding out later — makes
+            // a mistake in the platform's own configuration look like a sender
+            // problem, and the alert is already lost by then.
+            let tenant = TenantId::new(&entry.tenant)
+                .map_err(|why| Unusable::at(file, at("tenant"), why.to_string()))?;
+            if !self.tenants.contains(&tenant) {
+                let listed: Vec<&str> = self.tenants.iter().map(TenantId::as_str).collect();
+                return Err(Unusable::at(
+                    file,
+                    at("tenant"),
+                    format!(
+                        "names {tenant:?}, which `tenants` does not list. \
+                         Listed: {}. A tenant is listed rather than created by \
+                         being mentioned, so that a typo here is this message \
+                         rather than an alert filed under a tenant nobody has \
+                         an agent for",
+                        listed.join(", ")
+                    ),
+                ));
+            }
+
             self.origins.insert(
                 entry.id.trim().to_owned(),
                 Declared {
                     origin: Origin::new(id, verify),
                     speaks,
+                    tenant,
                 },
             );
         }
@@ -520,7 +603,21 @@ impl Configuration {
     pub fn routing_table(&self) -> String {
         let mut out = String::new();
 
-        out.push_str("senders\n");
+        out.push_str("tenants  (* marks one no sender files alerts for)\n");
+        for tenant in &self.tenants {
+            let named = self
+                .origins
+                .values()
+                .any(|declared| &declared.tenant == tenant);
+            // The same honest-consequence reporting the rooms block below does.
+            // A tenant nothing names is not an error — a team may be listed
+            // before its first sender is registered — but it is worth seeing,
+            // because the other way to arrive at it is a `tenants` entry
+            // somebody added and then misspelled under an Origin.
+            let _ = writeln!(out, "  {tenant}{}", if named { "" } else { "  *" });
+        }
+
+        out.push_str("\nsenders\n");
         let mut senders: Vec<_> = self.origins.iter().collect();
         senders.sort_by_key(|(path, _)| path.as_str());
         for (path, declared) in senders {
@@ -533,7 +630,11 @@ impl Configuration {
                 Speaks::Alertmanager => "alertmanager",
                 Speaks::Grafana => "grafana",
             };
-            let _ = writeln!(out, "  /webhook/{path}  {how}, speaks {speaks}");
+            let _ = writeln!(
+                out,
+                "  /webhook/{path}  {how}, speaks {speaks}, for tenant {}",
+                declared.tenant
+            );
         }
 
         out.push_str("\nrooms  (* marks a label only a sender can supply)\n");
@@ -557,7 +658,8 @@ impl Configuration {
 
         let _ = writeln!(
             out,
-            "\n{} sender(s), {} room(s), {} rule(s), {} secret(s) present",
+            "\n{} tenant(s), {} sender(s), {} room(s), {} rule(s), {} secret(s) present",
+            self.tenants.len(),
             self.origins.len(),
             self.webhooks.len(),
             self.subscriptions.len(),
@@ -565,6 +667,12 @@ impl Configuration {
         );
 
         out
+    }
+
+    /// Every tenant this deployment serves.
+    #[must_use]
+    pub fn tenants(&self) -> &BTreeSet<TenantId> {
+        &self.tenants
     }
 
     /// Every Origin, by the identity a request names.
@@ -696,8 +804,11 @@ mod tests {
     fn sound() -> String {
         "
 version: 1
+tenants:
+  - a-tenant
 origins:
   - id: a-forge
+    tenant: a-tenant
     speaks: github
     verify:
       hmac_sha256:
@@ -772,7 +883,11 @@ subscriptions:
         let config = Configuration::read(Path::new(EXAMPLE), dir.path())
             .unwrap_or_else(|e| panic!("the published example must parse: {e}"));
 
-        assert_eq!(config.origins().len(), 3);
+        // Four senders for three products, because one Alertmanager serving two
+        // tenants is two Origins here (bead gc-nkb). That is the shape, not an
+        // accident, so the count is asserted rather than left to drift.
+        assert_eq!(config.tenants().len(), 2);
+        assert_eq!(config.origins().len(), 4);
         assert_eq!(config.webhooks().len(), 3);
         assert_eq!(config.subscriptions().len(), 5);
 
@@ -799,7 +914,7 @@ subscriptions:
         assert_eq!(
             reached(
                 &config,
-                "alertmanager",
+                "alertmanager-devsecops",
                 &alert_labelled(&[("severity", "critical")])
             ),
             vec!["devsecops-room", "audit-room"]
@@ -809,10 +924,25 @@ subscriptions:
         assert_eq!(
             reached(
                 &config,
-                "alertmanager",
+                "alertmanager-platform",
                 &alert_labelled(&[("namespace", "platform")])
             ),
             vec!["platform-room", "audit-room"]
+        );
+
+        // THE RULES ARE PER ORIGIN AND THE ORIGINS ARE PER TENANT, so one
+        // tenant's Alertmanager cannot reach the other's room by sending the
+        // other's label. That is bead gc-nkb's whole argument made executable:
+        // `namespace: platform` on an alert from the devsecops credential
+        // selects nothing but the room that takes everything, because the rule
+        // naming that room also names which Origin it trusts.
+        assert_eq!(
+            reached(
+                &config,
+                "alertmanager-devsecops",
+                &alert_labelled(&[("namespace", "platform")])
+            ),
+            vec!["audit-room"]
         );
 
         // A sender cannot reach a room by claiming to be the other Origin: the
@@ -838,14 +968,14 @@ subscriptions:
             Verification::Signed { .. }
         ));
         assert!(matches!(
-            config.origins()["alertmanager"].origin.verify(),
+            config.origins()["alertmanager-devsecops"].origin.verify(),
             Verification::Shared { .. }
         ));
 
         // And what each speaks, which is independent of how it proves itself.
         assert_eq!(config.origins()["github"].speaks, super::Speaks::Github);
         assert_eq!(
-            config.origins()["alertmanager"].speaks,
+            config.origins()["alertmanager-devsecops"].speaks,
             super::Speaks::Alertmanager
         );
     }
@@ -880,9 +1010,21 @@ subscriptions:
             "{table}"
         );
         assert!(
-            table.contains("/webhook/alertmanager  presents a shared value, speaks alertmanager"),
+            table.contains(
+                "/webhook/alertmanager-devsecops  presents a shared value, \
+                 speaks alertmanager, for tenant devsecops"
+            ),
             "{table}"
         );
+
+        // Whose each sender's alerts are, which is the thing a reviewer of this
+        // file most needs to see and cannot infer: the tenant decides which
+        // agent is ever offered the alert, and it is read from here.
+        assert!(table.contains("for tenant platform"), "{table}");
+        // And the tenants themselves, listed, with nothing marked — every one of
+        // them has a sender in this example.
+        assert!(table.contains("tenants  (*"), "{table}");
+        assert!(!table.contains("platform  *"), "{table}");
 
         // Each room with the rules that select it.
         assert!(table.contains("devsecops-room"), "{table}");
@@ -895,7 +1037,7 @@ subscriptions:
         assert!(table.contains("everything"), "{table}");
 
         assert!(
-            table.contains("3 sender(s), 3 room(s), 5 rule(s), 6 secret(s) present"),
+            table.contains("2 tenant(s), 4 sender(s), 3 room(s), 5 rule(s), 7 secret(s) present"),
             "{table}"
         );
     }
@@ -1068,11 +1210,78 @@ subscriptions:
         assert!(e.to_string().contains("reporting healthy"), "{e}");
     }
 
+    // ---- tenants ---------------------------------------------------------
+
+    #[test]
+    fn an_origin_naming_a_tenant_nobody_listed_is_refused_at_startup() {
+        // THE FAILURE BEAD gc-nkb EXISTS TO PREVENT. If a tenant came into
+        // being by being mentioned, this typo would create one: the alerts
+        // would verify, be accepted, be stored, be offered to nobody, and
+        // eventually be swept — every step reporting success. Listed, the typo
+        // is this message, before anything deploys.
+        let bad = sound().replace("tenant: a-tenant\n", "tenant: a-tennant\n");
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "origins[0].tenant");
+        assert!(e.to_string().contains("a-tennant"), "{e}");
+        assert!(
+            e.to_string().contains("a-tenant"),
+            "the refusal must say what IS listed, or the reader has to go and \
+             look: {e}"
+        );
+    }
+
+    #[test]
+    fn a_tenant_that_could_not_be_a_namespace_is_refused() {
+        // A tenant is a namespace here (gc-81d), and the tenant in this file is
+        // compared against the namespace in a caller's identity. `Platform`
+        // would authenticate an agent successfully and offer it nothing, with
+        // every part reporting success — which is the hardest failure in this
+        // design to diagnose and the cheapest one to refuse.
+        let bad = sound().replace("  - a-tenant\n", "  - A-Tenant\n");
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "tenants[0]");
+        assert!(e.to_string().contains("namespace"), "{e}");
+    }
+
+    #[test]
+    fn a_tenant_listed_twice_is_refused() {
+        let bad = sound().replace("  - a-tenant\n", "  - a-tenant\n  - a-tenant\n");
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "tenants[1]");
+        assert!(e.to_string().contains("listed twice"), "{e}");
+    }
+
+    #[test]
+    fn a_file_listing_no_tenants_is_refused_rather_than_serving_nobody() {
+        let bad = sound().replace("tenants:\n  - a-tenant\n", "tenants: []\n");
+        let e = refused(&bad);
+
+        assert_eq!(e.path(), "tenants");
+        assert!(e.to_string().contains("lists none"), "{e}");
+    }
+
+    #[test]
+    fn an_origin_with_no_tenant_is_refused() {
+        // The same house rule as a missing verify block: there is no third state
+        // and nothing to default to. A default tenant would be the worst
+        // possible one — every unlabelled sender filed under somebody.
+        let bad = sound().replace("    tenant: a-tenant\n", "");
+        let e = refused(&bad);
+
+        assert!(
+            e.to_string().contains("tenant"),
+            "a file whose Origin names no tenant must say so: {e}"
+        );
+    }
+
     #[test]
     fn two_origins_with_one_identity_are_refused() {
         let bad = sound().replace(
             "destinations:",
-            "  - id: a-forge\n    speaks: github\n    verify:\n      bearer:\n        secret: a-secret\ndestinations:",
+            "  - id: a-forge\n    tenant: a-tenant\n    speaks: github\n    verify:\n      bearer:\n        secret: a-secret\ndestinations:",
         );
         let e = refused(&bad);
 

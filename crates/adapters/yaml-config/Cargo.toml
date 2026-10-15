@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# For TenantId. An adapter may depend on the application layer, and this is
+# the reason to: bead gc-g9x put tenancy there rather than in the domain, and
+# reading the tenant out of the file as its own type means one validation
+# rather than a string here and a parse somewhere else.
+application = { path = "../../application" }
 domain = { path = "../../domain" }
 serde = { version = "1", features = ["derive"] }
 # serde_yaml was archived in 2024. serde_yaml_ng is its maintained continuation

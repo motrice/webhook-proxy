@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use domain::{
     Body, Correlation, DeliveryId, Destination, DestinationId, Dispatch, DispatchId, Event, Origin,
-    Proof, Timestamp, VerifiedDelivery,
+    OriginId, Proof, Timestamp, VerifiedDelivery,
 };
 
 /// The signature an Origin's secret produces over a body.
@@ -517,4 +517,353 @@ pub trait Ids: Send + Sync {
     /// would make this proxy look like the origin of every call that passes
     /// through it.
     fn next_hop_in(&self, chain: &Correlation) -> Correlation;
+}
+
+/// Which tenant an alert belongs to, and therefore whose agent may collect it.
+///
+/// HERE AND NOT IN THE DOMAIN, by bead gc-g9x's decision. The domain models
+/// facts a sender reported and where they should go; a tenant is about who may
+/// claim what, which is authorisation. Putting it in `domain` would have made
+/// every domain value carry a notion of ownership forever, and would have put
+/// an authorisation concept in the one crate with no dependencies and no way to
+/// check one.
+///
+/// A DNS LABEL, not any string, and the restriction earns its place rather than
+/// being tidiness. In this platform a tenant *is* a namespace (bead gc-81d), so
+/// the value in the configuration file is compared against the namespace in a
+/// caller's identity. `Platform` and `platform` would then be two tenants that
+/// look like one, and the symptom would be an agent that authenticates
+/// successfully and is offered nothing — the hardest failure in this design to
+/// diagnose, because every part of it reports success. Refusing the spelling
+/// that cannot match is the cheapest place to stop it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantId(String);
+
+impl TenantId {
+    /// Names a tenant.
+    ///
+    /// # Errors
+    ///
+    /// [`NotATenant`] if this is not a name a namespace could have, and so not
+    /// a name a caller's identity could ever present.
+    pub fn new(id: &str) -> Result<Self, NotATenant> {
+        if id.is_empty() {
+            return Err(NotATenant::Blank);
+        }
+        // 63 is the limit on a DNS label, which is what a namespace name is.
+        if id.len() > 63 {
+            return Err(NotATenant::TooLong);
+        }
+        let labelled = id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !labelled || id.starts_with('-') || id.ends_with('-') {
+            return Err(NotATenant::NotALabel);
+        }
+        Ok(Self(id.to_owned()))
+    }
+
+    /// The name as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TenantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why a name cannot be a tenant's.
+///
+/// Three variants rather than one, because each is a different mistake and the
+/// configuration error naming the field is the whole operator experience of a
+/// bad deploy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotATenant {
+    /// Nothing was written.
+    Blank,
+    /// Not a name a namespace could have.
+    NotALabel,
+    /// Longer than a DNS label may be.
+    TooLong,
+}
+
+impl std::fmt::Display for NotATenant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blank => f.write_str("is empty"),
+            Self::NotALabel => f.write_str(
+                "is not a name a namespace could have; a tenant is a namespace here, \
+                 so it is lowercase letters, digits and dashes, not starting or \
+                 ending with a dash",
+            ),
+            Self::TooLong => {
+                f.write_str("is longer than the 63 characters a namespace name may be")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotATenant {}
+
+/// A verified Delivery waiting for its tenant to collect it.
+///
+/// THE UNIT IS A DELIVERY AND NOT AN EVENT, which bead gc-g9x found was forced
+/// rather than chosen: gc-lhh and gc-smz decided that a sender grouping twenty
+/// alerts into one notification gets one message per room, and whoever delivers
+/// can only honour that if it receives the Events of one Delivery together.
+///
+/// NO DESTINATION, and this is the shape of the whole split. The platform
+/// cannot know a tenant's rooms — routing is the tenant's, in its own
+/// repository — so what is stored is what arrived and whose it is, never where
+/// it is going. Compare [`Recorded`], which carries a Dispatch and therefore a
+/// Destination: that is the model the platform keeps for its own delivery loop,
+/// and this is the model it keeps for somebody else's.
+///
+/// WHAT THIS CANNOT CARRY IS STRUCTURAL RATHER THAN CAREFUL. It holds an
+/// `OriginId`, a name, and not an `Origin`, which carries the `Verification`
+/// that holds a sender's secret. Bead gc-81d forbids this interface returning a
+/// secret value *or a secret name*, and the way to keep that true is for the
+/// type handed over to have no field one could be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offered {
+    delivery: DeliveryId,
+    tenant: TenantId,
+    origin: OriginId,
+    events: Vec<Event>,
+    correlation: Correlation,
+    accepted_at: Timestamp,
+}
+
+impl Offered {
+    /// What arrived, and whose it is.
+    ///
+    /// `None` when there are no Events, for the reason [`Dispatch::new`] gives:
+    /// a Delivery that translated to nothing is not an error and is not a
+    /// failure to report, it is simply nothing to hand over. A sender telling us
+    /// about something we do not care about must not leave a row its tenant can
+    /// never discharge.
+    #[must_use]
+    pub fn new(
+        delivery: DeliveryId,
+        tenant: TenantId,
+        origin: OriginId,
+        events: Vec<Event>,
+        correlation: Correlation,
+        accepted_at: Timestamp,
+    ) -> Option<Self> {
+        if events.is_empty() {
+            return None;
+        }
+        Some(Self {
+            delivery,
+            tenant,
+            origin,
+            events,
+            correlation,
+            accepted_at,
+        })
+    }
+
+    /// Which Delivery this was, which is how a report refers to it.
+    #[must_use]
+    pub fn delivery(&self) -> &DeliveryId {
+        &self.delivery
+    }
+
+    /// Whose it is.
+    #[must_use]
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Who sent it, as a name.
+    #[must_use]
+    pub fn origin(&self) -> &OriginId {
+        &self.origin
+    }
+
+    /// What it reported, together and in the order the sender reported them.
+    #[must_use]
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// The chain it arrived on, so whoever delivers continues it rather than
+    /// starting a new one.
+    #[must_use]
+    pub fn correlation(&self) -> &Correlation {
+        &self.correlation
+    }
+
+    /// When the store took it, which is when the sender was answered.
+    #[must_use]
+    pub fn accepted_at(&self) -> Timestamp {
+        self.accepted_at
+    }
+}
+
+/// Where a verified Delivery waits for the tenant it belongs to.
+///
+/// Named for the thing that is actually new: a hand-off across a trust
+/// boundary. [`Outbox`] is where this service's own delivery loop keeps work it
+/// will attempt itself; this is where it keeps work somebody else will attempt,
+/// in another namespace, under another team's control, possibly never. The two
+/// are not the same port with a different column, because the unit differs — a
+/// Dispatch there, a Delivery here — and so does who is owed.
+///
+/// WHAT IS NOT HERE YET, deliberately. There is no claim, no lease and no
+/// report: bead gc-wcw.1 builds the record and bead gc-wcw.2 builds the
+/// interface to it. `outstanding` exists so that what was written can be read
+/// back and tested, and because the count it answers is what bead gc-wcw.3 will
+/// need in order to log a tenant that has stopped collecting.
+///
+/// EVERY METHOD IS SCOPED BY TENANT, for the reason [`Archive`] is scoped by
+/// room: a port that answered everything and left the filtering to its caller
+/// would put an authorisation decision in an adapter, where forgetting it is a
+/// leak with no test to catch it. Here it would be the exact leak this whole
+/// split exists to prevent.
+#[async_trait]
+pub trait Handover: Send + Sync {
+    /// Records one Delivery as owed to its tenant.
+    ///
+    /// Before the sender is told anything, so a `202` means what bead gc-g9x
+    /// restated it to mean: stored, and will be offered to its tenant.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if nothing was stored. The caller refuses the
+    /// sender rather than accepting something it cannot hand over.
+    async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable>;
+
+    /// What this tenant has not yet discharged, oldest first, at most `limit`.
+    ///
+    /// Oldest first because that is the order it should be collected in, and
+    /// `limit` because an outstanding queue grows without bound when nobody
+    /// collects — which is precisely the case this has to survive reporting on.
+    ///
+    /// Not a claim. Nothing is leased, nothing is hidden from a second caller,
+    /// and two callers asking at once get the same answer. The claim that must
+    /// not do that is bead gc-wcw.2's.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked. A tenant that
+    /// has nothing outstanding is not an error; it is an empty answer.
+    async fn outstanding(
+        &self,
+        tenant: &TenantId,
+        limit: usize,
+    ) -> Result<Vec<Offered>, StorageUnavailable>;
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::{NotATenant, TenantId};
+
+    #[test]
+    fn a_namespace_name_is_a_tenant() {
+        // The names this platform actually uses, from its own terraform.tfvars.
+        for name in ["wallet-lab-prod", "wallet-hsm-prod", "platform", "t7"] {
+            assert_eq!(
+                TenantId::new(name).map(|id| id.as_str().to_owned()),
+                Ok(name.to_owned()),
+                "{name} is a namespace name and must be a usable tenant"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spelling_no_namespace_could_have_is_refused() {
+        // Each of these authenticates fine and is offered nothing, because the
+        // namespace in a caller's identity can never equal it. Refusing it in
+        // the configuration file is the only place the mistake is cheap.
+        assert_eq!(TenantId::new(""), Err(NotATenant::Blank));
+        assert_eq!(TenantId::new("Platform"), Err(NotATenant::NotALabel));
+        assert_eq!(TenantId::new("wallet_lab_prod"), Err(NotATenant::NotALabel));
+        assert_eq!(TenantId::new("wallet lab"), Err(NotATenant::NotALabel));
+        assert_eq!(TenantId::new("-lab"), Err(NotATenant::NotALabel));
+        assert_eq!(TenantId::new("lab-"), Err(NotATenant::NotALabel));
+        assert_eq!(TenantId::new(&"a".repeat(64)), Err(NotATenant::TooLong));
+        assert!(TenantId::new(&"a".repeat(63)).is_ok(), "63 is the limit");
+    }
+
+    #[test]
+    fn each_refusal_says_which_mistake_it_was() {
+        // The message is the operator experience of a bad deploy, so it is worth
+        // a test that it says something specific rather than something true.
+        assert!(
+            NotATenant::NotALabel.to_string().contains("namespace"),
+            "a refusal that does not say a tenant is a namespace leaves the \
+             reader to guess what spelling is wanted: {}",
+            NotATenant::NotALabel
+        );
+        assert!(NotATenant::TooLong.to_string().contains("63"));
+    }
+}
+
+#[cfg(test)]
+mod offered_tests {
+    use super::{Offered, TenantId};
+    use domain::{
+        BranchName, Correlation, DeliveryId, Event, OriginId, Pusher, RepositoryName, Timestamp,
+    };
+
+    fn an_event() -> Event {
+        Event::PushedCommits {
+            repository: RepositoryName::new("webhook-proxy").expect("a name"),
+            branch: BranchName::new("main").expect("a name"),
+            pusher: Pusher::new("bjorn").expect("a name"),
+            commits: vec![],
+            permalink: None,
+        }
+    }
+
+    fn a_correlation() -> Correlation {
+        Correlation::new("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", None)
+            .expect("a chain")
+    }
+
+    #[test]
+    fn a_delivery_that_reported_nothing_is_not_offered() {
+        // The counterpart of Dispatch::new's refusal. A sender telling us about
+        // something we do not care about is success, and it must not leave a row
+        // behind that its tenant can never discharge: nobody can report rooms
+        // for a Delivery with no facts in it, so the queue would never drain.
+        assert_eq!(
+            Offered::new(
+                DeliveryId::new("d-1").expect("an identity"),
+                TenantId::new("platform").expect("a tenant"),
+                OriginId::new("github").expect("a name"),
+                Vec::new(),
+                a_correlation(),
+                Timestamp::from_millis_since_epoch(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn what_is_offered_is_what_arrived_and_whose_it_is() {
+        let offered = Offered::new(
+            DeliveryId::new("d-1").expect("an identity"),
+            TenantId::new("wallet-lab-prod").expect("a tenant"),
+            OriginId::new("alertmanager").expect("a name"),
+            vec![an_event()],
+            a_correlation(),
+            Timestamp::from_millis_since_epoch(7),
+        )
+        .expect("one event is enough");
+
+        assert_eq!(offered.tenant().as_str(), "wallet-lab-prod");
+        assert_eq!(offered.origin().as_str(), "alertmanager");
+        assert_eq!(offered.events().len(), 1);
+        assert_eq!(offered.accepted_at(), Timestamp::from_millis_since_epoch(7));
+        // The chain arrives with it, so whoever delivers continues it rather
+        // than starting one and breaking the trace at the hand-off.
+        assert_eq!(offered.correlation().trace(), a_correlation().trace());
+    }
 }

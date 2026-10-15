@@ -175,18 +175,24 @@ fn configured(base: &str) -> (tempfile::TempDir, HashMap<&'static str, String>) 
         &file,
         format!(
             "version: 1
+tenants:
+  - devsecops
+  - platform
 origins:
   - id: github
+    tenant: devsecops
     speaks: github
     verify:
       hmac_sha256:
         secret: github-webhook-secret
   - id: alertmanager
+    tenant: devsecops
     speaks: alertmanager
     verify:
       bearer:
         secret: alertmanager-token
   - id: grafana
+    tenant: platform
     speaks: grafana
     verify:
       bearer:
@@ -536,6 +542,91 @@ async fn health_answers_without_asking_the_destination() {
 }
 
 #[tokio::test]
+async fn an_origin_naming_a_tenant_nobody_listed_stops_the_process() {
+    // The failure bead gc-nkb exists to prevent, proved against the binary
+    // rather than against the parser. If a tenant came into being by being
+    // mentioned, this typo would create one: every alert from that sender would
+    // verify, be accepted, be stored, be owed to a tenant nobody has an agent
+    // for, and eventually be swept — with every step reporting success.
+    //
+    // It must happen BEFORE the socket is bound, which is why this is an
+    // acceptance test and not a unit one: a deployment that is wrong this way
+    // must never look healthy, and `webhook-proxy check` runs on every change
+    // to this file in the operations repository, so nobody should reach here.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let file = dir.path().join("config.yaml");
+    fs::write(
+        &file,
+        "version: 1
+tenants:
+  - wallet-lab-prod
+origins:
+  - id: a-forge
+    tenant: wallet-lab-prd
+    speaks: github
+    verify:
+      hmac_sha256:
+        secret: a-secret
+destinations:
+  - id: a-room
+    kind: chat_room
+    webhook:
+      secret: a-url
+subscriptions:
+  - destination: a-room
+    match:
+      origin: a-forge
+",
+    )
+    .expect("writable");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir(&secrets).expect("writable");
+    fs::write(secrets.join("a-secret"), "shhh").expect("writable");
+    fs::write(secrets.join("a-url"), "http://127.0.0.1:1/hook").expect("writable");
+
+    let env = HashMap::from([
+        (
+            "WEBHOOK_PROXY_CONFIG",
+            file.to_str().expect("a utf-8 path").to_owned(),
+        ),
+        (
+            "WEBHOOK_PROXY_SECRETS_DIR",
+            secrets.to_str().expect("a utf-8 path").to_owned(),
+        ),
+    ]);
+
+    let why = start(env).await.expect_err("it must refuse to start");
+
+    assert!(why.contains("origins[0].tenant"), "{why}");
+    assert!(why.contains("wallet-lab-prd"), "{why}");
+    // And what IS listed, so the reader does not have to go and look for the
+    // difference between two names that differ by one letter.
+    assert!(why.contains("wallet-lab-prod"), "{why}");
+    assert!(!why.contains("shhh"), "{why}");
+}
+
+#[test]
+fn check_says_which_tenant_each_sender_files_under() {
+    // The tenant decides which agent is ever offered an alert, and it cannot be
+    // inferred from anything else in the file — so the one thing a reviewer of
+    // a routing change most needs to see is exactly the thing `check` has to
+    // print. This is the pipeline's view of it.
+    let (_dir, env) = configured("http://127.0.0.1:1");
+
+    let (ok, out, err) = check(&env);
+
+    assert!(ok, "{err}{out}");
+    assert!(
+        out.contains("/webhook/github  signs its body, speaks github, for tenant devsecops"),
+        "{out}"
+    );
+    assert!(out.contains("speaks grafana, for tenant platform"), "{out}");
+    // The tenants themselves, listed, and the count — because a tenant listed
+    // and then misspelled under every Origin would otherwise show as nothing.
+    assert!(out.contains("2 tenant(s),"), "{out}");
+}
+
+#[tokio::test]
 async fn a_routing_file_that_cannot_be_used_stops_the_process_and_says_where() {
     // The whole operator experience of a bad deploy. It must happen before the
     // socket is bound, so a broken deployment never looks healthy.
@@ -544,8 +635,11 @@ async fn a_routing_file_that_cannot_be_used_stops_the_process_and_says_where() {
     fs::write(
         &file,
         "version: 1
+tenants:
+  - a-tenant
 origins:
   - id: a-forge
+    tenant: a-tenant
     speaks: github
     verify:
       hmac_sha256:
@@ -699,8 +793,11 @@ fn check_refuses_a_file_the_process_would_refuse_and_says_where() {
     fs::write(
         &file,
         "version: 1
+tenants:
+  - a-tenant
 origins:
   - id: a-forge
+    tenant: a-tenant
     speaks: github
     verify:
       hmac_sha256:
@@ -749,8 +846,11 @@ fn check_shows_a_room_that_a_typo_left_unreachable() {
     fs::write(
         &file,
         "version: 1
+tenants:
+  - a-tenant
 origins:
   - id: a-forge
+    tenant: a-tenant
     speaks: github
     verify:
       hmac_sha256:

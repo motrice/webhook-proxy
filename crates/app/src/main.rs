@@ -13,7 +13,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
-use application::ports::{Dispatcher, Outbox, Proofs, Translator};
+use application::ports::{Dispatcher, Handover, Outbox, Proofs, Translator};
 use application::{Counts, Replay, Retries, Retry, Tally};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
@@ -22,8 +22,8 @@ use github_payload::GithubPayload;
 use github_signatures::GithubSignatures;
 use grafana_payload::GrafanaPayload;
 use inbound_http::{AUTHORIZATION_HEADER, Inbound, SIGNATURE_HEADER, Sender, router};
-use memory_outbox::MemoryOutbox;
-use postgres_outbox::PostgresOutbox;
+use memory_outbox::{MemoryHandover, MemoryOutbox};
+use postgres_outbox::{PostgresHandover, PostgresOutbox};
 use shared_values::SharedValues;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -233,9 +233,26 @@ const DATABASE_CONNECTIONS: u32 = 8;
 /// so an outage of the store refuses traffic that the memory outbox would have
 /// accepted and probably delivered. That is the trade gc-vfz accepted, with the
 /// reasoning recorded there rather than argued again in a comment.
-async fn stored(config: &Config) -> Result<Arc<dyn Outbox>, Unstartable> {
+/// The two durable stores, which stand or fall together.
+///
+/// Returned as a pair rather than fetched separately because they share one
+/// connection pool, and because a deployment holding one and not the other is
+/// not a state worth being able to reach: a 202 means stored AND owed to a
+/// tenant (bead gc-g9x), so a process that could write only one of them would
+/// be promising something it cannot keep.
+struct Stores {
+    /// What this service delivers from itself.
+    outbox: Arc<dyn Outbox>,
+    /// What a tenant's agent collects from.
+    handover: Arc<dyn Handover>,
+}
+
+async fn stored(config: &Config) -> Result<Stores, Unstartable> {
     let Some(name) = config.database.as_deref() else {
-        return Ok(Arc::new(MemoryOutbox::new()));
+        return Ok(Stores {
+            outbox: Arc::new(MemoryOutbox::new()),
+            handover: Arc::new(MemoryHandover::new()),
+        });
     };
 
     // Read from the mounted directory like every other secret, and never from
@@ -259,7 +276,15 @@ async fn stored(config: &Config) -> Result<Arc<dyn Outbox>, Unstartable> {
     let mut said = false;
     loop {
         match PostgresOutbox::connect(url, DATABASE_CONNECTIONS).await {
-            Ok(outbox) => return Ok(Arc::new(outbox)),
+            Ok(outbox) => {
+                // One pool for both stores, so there is one migrator and one
+                // advisory lock at start-up rather than two of each racing.
+                let handover = PostgresHandover::using(outbox.pool().clone());
+                return Ok(Stores {
+                    outbox: Arc::new(outbox),
+                    handover: Arc::new(handover),
+                });
+            }
             Err(why) if Instant::now() < deadline => {
                 if !said {
                     // No address and no password: StorageUnavailable carries
@@ -288,7 +313,10 @@ async fn replay(id: &str) -> Result<String, Unstartable> {
 
     let dispatcher = ElementNotices::new(routing.webhooks().clone(), config.timeout)
         .map_err(|_| Unstartable::NoClient)?;
-    let outbox = stored(&config).await?;
+    // Only the outbox. A replay re-sends what this service already routed for
+    // itself; it owes a tenant nothing new, and offering the Delivery again
+    // would hand its agent a second copy of something already handed over.
+    let outbox = stored(&config).await?.outbox;
     let clock = SystemClock;
 
     let replay = Replay::new(
@@ -664,6 +692,7 @@ async fn run() -> Result<(), Unstartable> {
                 path.clone(),
                 Sender {
                     origin: declared.origin.clone(),
+                    tenant: declared.tenant.clone(),
                     proofs,
                     translator,
                     presented,
@@ -672,7 +701,7 @@ async fn run() -> Result<(), Unstartable> {
         })
         .collect();
 
-    let outbox = stored(&config).await?;
+    let Stores { outbox, handover } = stored(&config).await?;
 
     // One tally, shared: the request path sends immediately and the worker comes
     // back to whatever failed, so a count held by either alone would be wrong.
@@ -682,6 +711,7 @@ async fn run() -> Result<(), Unstartable> {
         senders,
         Arc::clone(&dispatcher),
         Arc::clone(&outbox),
+        Arc::clone(&handover),
         Arc::new(SystemClock),
         Arc::new(RandomIds),
         routing.subscriptions().to_vec(),

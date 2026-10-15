@@ -150,18 +150,40 @@ wrong conventions.
 
 ```yaml
 receivers:
-  - name: webhook-proxy
+  - name: webhook-proxy-devsecops
     webhook_configs:
-      - url: https://<host>/webhook/alertmanager
+      - url: https://<host>/webhook/alertmanager-devsecops
         send_resolved: true
         http_config:
           authorization:
             type: Bearer
-            credentials_file: /etc/alertmanager/secrets/webhook-proxy-token
+            credentials_file: /etc/alertmanager/secrets/webhook-proxy-devsecops-token
 ```
 
 Reference the credential from a file rather than inlining it, so the value is not
 in the repository that holds the rules.
+
+**One receiver per team, each with its own credential**, and the shape of that
+URL is the reason. Every sender this proxy serves belongs to exactly one team,
+decided when the sender is registered and proved by the sender's own credential
+— so one Alertmanager sending for several teams registers as several senders,
+and chooses between them in its own `route` tree:
+
+```yaml
+route:
+  routes:
+    - matchers: [namespace =~ "devsecops-.*"]
+      receiver: webhook-proxy-devsecops
+    - matchers: [namespace =~ "platform-.*"]
+      receiver: webhook-proxy-platform
+```
+
+That costs a receiver and a credential per team. What it buys is that the
+decision is made here, in the routing you already own and can see, rather than
+from a label on the alert — and a label is written by whoever can deploy the
+workload that fires it, so a label deciding which team an alert belongs to would
+let one team's deployer file alerts as another's. Bead `gc-nkb` records the
+reasoning. A label is routing *input*; it is never an authorisation boundary.
 
 Per alert, the proxy **requires**:
 
@@ -258,8 +280,8 @@ read — `severity` and `status` — and one it sets itself:
 
 **`origin` is reserved.** The proxy sets it from the verified request, and a
 sender cannot. A label named `origin` in your payload is dropped before routing.
-That is what makes a rule saying `origin: alertmanager` trustworthy: an alert
-from somewhere else cannot claim it, however it is annotated.
+That is what makes a rule saying `origin: alertmanager-devsecops` trustworthy: an
+alert from somewhere else cannot claim it, however it is annotated.
 
 Values are compared for equality. There is no negation and no pattern matching —
 a regular expression over text written by whoever can deploy a workload is a

@@ -14,6 +14,11 @@ tracing = "0.1"
 
 [dev-dependencies]
 async-trait = "0.1"
+# The real hand-off store, not a fake. An adapter may not depend on another
+# adapter, but a DEV-dependency may — boundaries.rs says so deliberately, so a
+# test can prove the production path — and a second in-memory Handover written
+# here would be a second implementation to keep honest.
+memory-outbox = { path = "../memory-outbox" }
 tokio = { version = "1", features = ["macros", "rt"] }
 # Drives the router without binding a socket.
 tower = { version = "0.5", features = ["util"] }

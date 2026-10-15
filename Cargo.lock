@@ -1302,6 +1302,7 @@ dependencies = [
  "async-trait",
  "axum",
  "domain",
+ "memory-outbox",
  "tokio",
  "tower",
  "tracing",
@@ -3715,6 +3716,7 @@ dependencies = [
 name = "yaml-config"
 version = "0.0.0"
 dependencies = [
+ "application",
  "domain",
  "serde",
  "serde_yaml_ng",
