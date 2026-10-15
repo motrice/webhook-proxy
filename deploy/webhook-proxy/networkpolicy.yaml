@@ -50,6 +50,30 @@ spec:
         # mistake would not show, which is exactly why this says which one it is.
         - protocol: TCP
           port: 8080
+    # A tenant's agent, collecting what it is owed. It reaches the pod port
+    # directly through the mesh — there is no gateway in front of this path and
+    # the HTTPRoute does not publish it (bead gc-wcw.2).
+    #
+    # By a LABEL rather than by naming each tenant's namespace, and that is a
+    # decision: the list of tenants already lives in `config.example.yaml`, and
+    # a second copy here would be a second place to keep in step — with the
+    # failure mode that an agent authenticates successfully and times out,
+    # which is slow to diagnose. The label says "this namespace runs an agent";
+    # which tenants exist stays in one place.
+    #
+    # This grants reachability and not authorisation. What decides whose work a
+    # caller is handed is the identity in its certificate, which it cannot
+    # choose — see istio/authorizationpolicy.yaml and
+    # crates/app/src/collecting.rs.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # REPLACE: the label the platform puts on a namespace that runs a
+              # tenant agent.
+              webhook-proxy.motrice.se/agent: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
     # The metrics scraper. Nothing scrapes /metrics today; this is here because
     # under default-deny the first thing to try will fail by timing out against
     # a Ready pod, and that failure is expensive to diagnose and cheap to

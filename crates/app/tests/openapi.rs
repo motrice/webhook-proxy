@@ -20,6 +20,38 @@ const INBOUND: &str = include_str!("../../adapters/inbound-http/src/lib.rs");
 /// Where the two operational paths are added to the router.
 const APP: &str = include_str!("../src/main.rs");
 
+/// Where the hand-off to a tenant's agent is added to the router.
+const COLLECTING: &str = include_str!("../src/collecting.rs");
+
+/// The mesh policy that is the actual boundary on the internal paths.
+const POLICY: &str = include_str!("../../../deploy/webhook-proxy/istio/authorizationpolicy.yaml");
+
+/// Paths this specification deliberately does not describe, and why each.
+///
+/// A NAMED LIST AND NEVER A PATTERN, which bead gc-81d insisted on. A rule like
+/// "anything under /deliveries" would absorb the next internal path somebody
+/// adds without anybody deciding to exclude it — the same failure as the
+/// line-based route scan that missed `/metrics` in gc-4oo.3, where the test was
+/// green because it was comparing two sets that agreed about everything it had
+/// managed to find. Adding a path here is an edit a reviewer sees.
+///
+/// `docs/openapi.yaml` describes the interface a SENDER may call. These are the
+/// interface a tenant's agent calls: in-cluster machinery, authenticated by the
+/// service mesh rather than by a sender's credential, and not bound by the
+/// national REST API-profil — which gc-81d decided explicitly, because
+/// gc-4oo.2's MOG, AME, FNS and FEL verdicts would otherwise reactivate the
+/// moment a JSON body existed.
+const INTERNAL: &[(&str, &str)] = &[
+    (
+        "/deliveries/claim",
+        "a tenant's agent claims its own undelivered Deliveries. Not a sender's          interface: authenticated by the caller's mTLS identity, and not          published by the HTTPRoute at all. Bead gc-wcw.2.",
+    ),
+    (
+        "/deliveries/{delivery}/report",
+        "a tenant's agent states terminally what each of its rooms did with one          Delivery. Internal for the same reasons as the claim above.",
+    ),
+];
+
 /// The routing file this deployment ships, which names the mechanisms in use.
 const ROUTING: &str = include_str!("../../../deploy/webhook-proxy/config.example.yaml");
 
@@ -49,7 +81,7 @@ fn routed_paths() -> std::collections::BTreeSet<String> {
     // point: the test then compared two sets that agreed about everything it had
     // managed to find. Fixed here rather than by reformatting main.rs to suit
     // the test, which would have left the next multi-line route invisible again.
-    [INBOUND, APP]
+    [INBOUND, APP, COLLECTING]
         .iter()
         .flat_map(|source| {
             source.match_indices(".route(").filter_map(|(at, marker)| {
@@ -65,12 +97,48 @@ fn routed_paths() -> std::collections::BTreeSet<String> {
 }
 
 #[test]
-fn the_specification_describes_every_path_the_code_routes_and_no_others() {
+fn the_specification_describes_every_public_path_the_code_routes_and_no_others() {
+    let internal: std::collections::BTreeSet<String> = INTERNAL
+        .iter()
+        .map(|(path, _)| (*path).to_owned())
+        .collect();
+    let public: std::collections::BTreeSet<String> =
+        routed_paths().difference(&internal).cloned().collect();
+
     assert_eq!(
         documented_paths(),
-        routed_paths(),
-        "the specification and the router disagree about which paths exist"
+        public,
+        "the specification and the router disagree about which public paths exist"
     );
+}
+
+#[test]
+fn every_excluded_path_is_one_the_code_actually_routes() {
+    // The other half of the exclusion list, and the half that rots. A path
+    // renamed or removed leaves a waiver behind that now excludes nothing, and
+    // the next path to take that spelling is excluded without anybody deciding
+    // to — which is the whole failure the named list exists to prevent, arrived
+    // at from the other direction.
+    let routed = routed_paths();
+    for (path, why) in INTERNAL {
+        assert!(
+            routed.contains(*path),
+            "{path:?} is excluded from the specification, and nothing routes it.              Remove the exclusion. Its stated reason was: {why}"
+        );
+    }
+}
+
+#[test]
+fn no_excluded_path_is_also_documented() {
+    // Belt and braces, and cheap: a path in both lists would make the exclusion
+    // meaningless while looking deliberate from either side alone.
+    let documented = documented_paths();
+    for (path, _) in INTERNAL {
+        assert!(
+            !documented.contains(*path),
+            "{path:?} is both documented as public and excluded as internal"
+        );
+    }
 }
 
 /// Every status the webhook handler can answer with.
@@ -234,4 +302,56 @@ fn each_scheme_names_the_header_the_code_actually_reads() {
              does not say so: {described}"
         );
     }
+}
+
+/// A router path as a mesh policy spells it: `{delivery}` becomes `*`.
+fn as_a_policy_spells_it(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.starts_with('{') && segment.ends_with('}') {
+                "*"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[test]
+fn the_mesh_policy_names_every_internal_path() {
+    // The exclusion list above says these paths are not a sender's to call. The
+    // thing that makes that true is the AuthorizationPolicy, and nothing else
+    // connects the two: a third internal path could be added, excluded from the
+    // specification with a reason, and left unprotected — with every test
+    // passing and the path reachable by anything in the mesh.
+    //
+    // Checked against the policy's own text rather than by parsing its rules,
+    // because what matters is that the path is named somewhere in it, and a
+    // structural read would have to model Istio's rule semantics to be any
+    // stricter.
+    for (path, why) in INTERNAL {
+        let spelled = as_a_policy_spells_it(path);
+        assert!(
+            POLICY.contains(&spelled),
+            "{path:?} is internal and deploy/webhook-proxy/istio/authorizationpolicy.yaml \
+             does not name it (as {spelled:?}), so nothing restricts who may call it. \
+             Its stated reason for being internal was: {why}"
+        );
+    }
+}
+
+#[test]
+fn the_mesh_policy_allows_rather_than_denies() {
+    // The property that makes the policy safe to forget to update: a path
+    // nobody wrote a rule for is refused. A DENY list would publish every path
+    // added afterwards, which is the same failure as a pattern in the exclusion
+    // list above, one layer down.
+    let policy: Value = serde_yaml_ng::from_str(POLICY).expect("the policy parses");
+    assert_eq!(
+        policy["spec"]["action"].as_str(),
+        Some("ALLOW"),
+        "the mesh policy denies named paths instead of allowing named ones, so a \
+         path added later is reachable by anything in the mesh"
+    );
 }

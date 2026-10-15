@@ -240,6 +240,21 @@ document and the code is findable rather than a matter of opinion. It is also
 the input to the OpenAPI specification in `gc-4oo.3` — that bead describes this
 same interface formally rather than describing it a second time.
 
+### The hand-off to a tenant's agent
+
+A second interface, and deliberately not part of the one above:
+[docs/tenant-agent-api.md](docs/tenant-agent-api.md). Two operations — claim a
+Delivery whole, report its rooms terminally — called by an agent in a tenant's
+own namespace, authenticated by the caller's mTLS identity rather than by a
+sender's credential. The tenant is the namespace in that identity and is never
+a parameter: a parameter would be a claim, and the identity is a fact.
+
+`docs/openapi.yaml` does not describe these two paths, and
+`crates/app/tests/openapi.rs` excludes them **by name with a reason each** —
+never by a pattern, because a pattern would absorb the next internal path
+somebody added without anyone deciding to. The same test checks that the mesh
+policy protecting them names every one.
+
 ### Checking a routing file before deploying it
 
 ```bash

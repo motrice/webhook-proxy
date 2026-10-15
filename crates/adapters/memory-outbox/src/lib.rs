@@ -17,8 +17,8 @@
 use std::sync::Mutex;
 
 use application::ports::{
-    Archive, Handover, Offered, Outbox, Outcome, Page, Recorded, StorageUnavailable, TenantId,
-    Window,
+    Archive, Claimed, Discharged, Handover, Offered, Outbox, Outcome, Page, Recorded, Report,
+    StorageUnavailable, TenantId, Window,
 };
 use async_trait::async_trait;
 use domain::{DeliveryId, DestinationId, Dispatch, DispatchId, Timestamp};
@@ -931,7 +931,16 @@ mod archive_tests {
 #[derive(Default)]
 pub struct MemoryHandover {
     /// In the order offered, which is the order it should be collected in.
-    offered: Mutex<Vec<Offered>>,
+    offered: Mutex<Vec<Owed>>,
+}
+
+/// One Delivery owed, and whether somebody is holding it.
+struct Owed {
+    offered: Offered,
+    /// When the current claim lapses, if there is one. `None` means nobody
+    /// holds it; a moment in the past means a claim that lapsed and has not
+    /// been noticed yet, which reads the same to every query here.
+    claimed_until: Option<Timestamp>,
 }
 
 impl MemoryHandover {
@@ -963,7 +972,10 @@ impl core::fmt::Debug for MemoryHandover {
 impl Handover for MemoryHandover {
     async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
         let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
-        held.push(offered.clone());
+        held.push(Owed {
+            offered: offered.clone(),
+            claimed_until: None,
+        });
         Ok(())
     }
 
@@ -975,16 +987,74 @@ impl Handover for MemoryHandover {
         let held = self.offered.lock().map_err(|_| StorageUnavailable)?;
         Ok(held
             .iter()
-            .filter(|offered| offered.tenant() == tenant)
+            .filter(|owed| owed.offered.tenant() == tenant)
             .take(limit)
-            .cloned()
+            .map(|owed| owed.offered.clone())
             .collect())
+    }
+
+    async fn claim(
+        &self,
+        tenant: &TenantId,
+        limit: usize,
+        now: Timestamp,
+        lease: core::time::Duration,
+    ) -> Result<Vec<Claimed>, StorageUnavailable> {
+        let until = now.after(lease);
+        let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
+
+        // One lock over the read and the write, which is what makes this a
+        // claim rather than a query: two callers must not be handed the same
+        // Delivery, because both would deliver it. The database does the same
+        // thing with SELECT ... FOR UPDATE SKIP LOCKED inside a transaction.
+        Ok(held
+            .iter_mut()
+            .filter(|owed| {
+                owed.offered.tenant() == tenant
+                    // Lapsed claims come back by themselves, which is why
+                    // nothing has to clean up after an agent that died
+                    // mid-delivery.
+                    && owed.claimed_until.is_none_or(|held| held <= now)
+            })
+            .take(limit)
+            .map(|owed| {
+                owed.claimed_until = Some(until);
+                Claimed::new(owed.offered.clone(), until)
+            })
+            .collect())
+    }
+
+    async fn report(
+        &self,
+        tenant: &TenantId,
+        delivery: &DeliveryId,
+        _report: &Report,
+        _at: Timestamp,
+    ) -> Result<Discharged, StorageUnavailable> {
+        let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
+        let before = held.len();
+
+        // BOTH the identity and the tenant, so one tenant reporting another's
+        // Delivery discharges nothing. The identity alone would be authorisation
+        // resting on a random number being hard to guess.
+        held.retain(|owed| owed.offered.delivery() != delivery || owed.offered.tenant() != tenant);
+
+        // Removed rather than kept with the report beside it, which is the one
+        // place this store deliberately differs from the durable one: what a
+        // report SAYS is of no use to a process that forgets everything at
+        // exit, and keeping it would be modelling a retention sweep that has
+        // nothing to sweep.
+        if held.len() == before {
+            Ok(Discharged::NotOutstanding)
+        } else {
+            Ok(Discharged::Settled)
+        }
     }
 }
 
 #[cfg(test)]
 mod handover_tests {
-    use application::ports::{Handover, Offered, TenantId};
+    use application::ports::{Discharged, Handover, Offered, Report, TenantId};
     use domain::{
         BranchName, Correlation, DeliveryId, Event, OriginId, Pusher, RepositoryName, Timestamp,
     };
@@ -998,6 +1068,10 @@ mod handover_tests {
     fn tenant(id: &str) -> TenantId {
         TenantId::new(id).expect("a namespace name")
     }
+
+    /// The lease these tests claim under. The length is the platform's choice
+    /// and arrives as an argument, so a test can step past it.
+    const FIVE_MINUTES: core::time::Duration = core::time::Duration::from_mins(5);
 
     fn offered(delivery: &str, whose: &str, when: i64) -> Offered {
         Offered::new(
@@ -1118,5 +1192,155 @@ mod handover_tests {
             .expect("asked");
 
         assert_eq!(read_back, vec![one]);
+    }
+
+    #[tokio::test]
+    async fn two_agents_are_never_handed_the_same_delivery() {
+        // What makes this a claim rather than a query. Both agents would
+        // deliver what they were handed, so a room would see it twice — and
+        // under the split the claimant is not another replica of this binary
+        // but a pod in somebody else's namespace.
+        let store = MemoryHandover::new();
+        for id in ["d-1", "d-2"] {
+            store
+                .offer(&offered(id, "wallet-lab-prod", 1))
+                .await
+                .expect("stored");
+        }
+
+        let first = store
+            .claim(&tenant("wallet-lab-prod"), 1, at(10), FIVE_MINUTES)
+            .await
+            .expect("claimed");
+        let second = store
+            .claim(&tenant("wallet-lab-prod"), 1, at(10), FIVE_MINUTES)
+            .await
+            .expect("claimed");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            first[0].offered().delivery(),
+            second[0].offered().delivery(),
+            "two agents were handed the same Delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_nobody_ever_reports_comes_back_by_itself() {
+        // The reason nothing has to clean up after an agent that died
+        // mid-delivery, and the reason the lease is the platform's: a claim
+        // lapses rather than being released, so a namespace that never comes
+        // back costs this service nothing to notice.
+        let store = MemoryHandover::new();
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1))
+            .await
+            .expect("stored");
+
+        let held = store
+            .claim(&tenant("wallet-lab-prod"), 10, at(0), FIVE_MINUTES)
+            .await
+            .expect("claimed");
+        assert_eq!(held.len(), 1);
+
+        // A moment inside the lease: still held, so nothing is offered.
+        assert!(
+            store
+                .claim(&tenant("wallet-lab-prod"), 10, at(60_000), FIVE_MINUTES)
+                .await
+                .expect("asked")
+                .is_empty(),
+            "a Delivery under an unexpired claim was offered again"
+        );
+
+        // And after it: back, with no intervention.
+        assert_eq!(
+            store
+                .claim(
+                    &tenant("wallet-lab-prod"),
+                    10,
+                    at(5 * 60_000 + 1),
+                    FIVE_MINUTES
+                )
+                .await
+                .expect("asked")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_by_one_tenant_does_not_hide_another_tenants_work() {
+        // The lease and the tenant scoping are independent, and a store that
+        // confused them would be hard to notice: one tenant collecting would
+        // quietly starve another.
+        let store = MemoryHandover::new();
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1))
+            .await
+            .expect("stored");
+        store
+            .offer(&offered("d-2", "wallet-hsm-prod", 2))
+            .await
+            .expect("stored");
+
+        store
+            .claim(&tenant("wallet-lab-prod"), 10, at(0), FIVE_MINUTES)
+            .await
+            .expect("claimed");
+
+        let theirs = store
+            .claim(&tenant("wallet-hsm-prod"), 10, at(0), FIVE_MINUTES)
+            .await
+            .expect("claimed");
+
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].offered().delivery().as_str(), "d-2");
+    }
+
+    #[tokio::test]
+    async fn a_reported_delivery_is_not_offered_again_and_a_stranger_cannot_report_it() {
+        let store = MemoryHandover::new();
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1))
+            .await
+            .expect("stored");
+        let delivery = DeliveryId::new("d-1").expect("an identity");
+
+        // Another tenant discharges nothing, and the positive oracle follows:
+        // its own tenant still can, so this did not pass by the store having
+        // lost it.
+        assert_eq!(
+            store
+                .report(
+                    &tenant("wallet-hsm-prod"),
+                    &delivery,
+                    &Report::RoutedToNothing,
+                    at(1)
+                )
+                .await
+                .expect("asked"),
+            Discharged::NotOutstanding
+        );
+        assert_eq!(
+            store
+                .report(
+                    &tenant("wallet-lab-prod"),
+                    &delivery,
+                    &Report::RoutedToNothing,
+                    at(2)
+                )
+                .await
+                .expect("asked"),
+            Discharged::Settled
+        );
+        assert!(
+            store
+                .claim(&tenant("wallet-lab-prod"), 10, at(3), FIVE_MINUTES)
+                .await
+                .expect("asked")
+                .is_empty()
+        );
     }
 }

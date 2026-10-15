@@ -706,6 +706,89 @@ impl Offered {
     }
 }
 
+/// A Delivery handed to a tenant's agent, and until when.
+///
+/// The lease belongs to the platform and is returned rather than assumed, which
+/// bead gc-81d decided for a plain reason: with two binaries that could
+/// disagree about its length, one of them has to own it. Not renewable in this
+/// version — an agent's whole retry budget is about half a minute, so five
+/// minutes covers it, and renewal would let an agent hold work indefinitely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claimed {
+    offered: Offered,
+    until: Timestamp,
+}
+
+impl Claimed {
+    /// Hands one over, leased until `until`.
+    #[must_use]
+    pub fn new(offered: Offered, until: Timestamp) -> Self {
+        Self { offered, until }
+    }
+
+    /// What was claimed.
+    #[must_use]
+    pub fn offered(&self) -> &Offered {
+        &self.offered
+    }
+
+    /// When the claim lapses and it is offered again.
+    #[must_use]
+    pub fn until(&self) -> Timestamp {
+        self.until
+    }
+}
+
+/// What one room did with a Delivery, as its tenant reports it.
+///
+/// Two states and no third, because a report is TERMINAL. There is no "still
+/// trying": an agent that has not finished has not reported, and the lease is
+/// what covers that gap. Nor is there a "give up" an agent can ask the platform
+/// for — bead gc-g9x refused to let either side abandon on the other's behalf,
+/// and a third variant here would be inventing exactly that state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomOutcome {
+    /// It arrived.
+    Delivered,
+    /// Every attempt was spent and it did not arrive. This is a loss, and the
+    /// tenant has already logged and counted it where it happened.
+    Abandoned,
+}
+
+/// The terminal statement about one Delivery, which discharges the platform's
+/// obligation to offer it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Report {
+    /// Every room this Delivery reached, and what each did.
+    Reached(Vec<(DestinationId, RoomOutcome)>),
+    /// The tenant's rules matched no room at all.
+    ///
+    /// TERMINAL AND NOT AN ERROR, which bead gc-g9x found was forced: a tenant
+    /// whose rules match nothing has nothing to report, so without this the
+    /// platform's queue never drains and a correctly-behaving tenant is
+    /// indistinguishable from a dead one.
+    ///
+    /// A variant rather than an empty [`Self::Reached`], and the difference is
+    /// the point: an agent that forgot to fill the list in is the likeliest bug
+    /// here, and an empty vector would make that bug and a genuine no-match the
+    /// same statement. This one has to be said on purpose.
+    RoutedToNothing,
+}
+
+/// Whether a report discharged anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discharged {
+    /// It was outstanding for this tenant, and now it is not.
+    Settled,
+    /// Nothing outstanding for this tenant goes by that identity.
+    ///
+    /// ONE ANSWER FOR THREE CASES, deliberately: the Delivery belongs to
+    /// another tenant, or it was already reported, or it never existed. A
+    /// caller that could tell them apart could ask after another tenant's
+    /// Delivery identities and learn which exist.
+    NotOutstanding,
+}
+
 /// Where a verified Delivery waits for the tenant it belongs to.
 ///
 /// Named for the thing that is actually new: a hand-off across a trust
@@ -738,6 +821,51 @@ pub trait Handover: Send + Sync {
     /// [`StorageUnavailable`] if nothing was stored. The caller refuses the
     /// sender rather than accepting something it cannot hand over.
     async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable>;
+
+    /// Hands this tenant up to `limit` of its own Deliveries, leased for
+    /// `lease` from `now`, oldest first.
+    ///
+    /// CLAIMED, which `outstanding` is not: two agents asking at once must not
+    /// be handed the same Delivery, because both would deliver it and a room
+    /// would see it twice. Unlike [`Outbox::due`], the claimant is not another
+    /// replica of this binary — it is a pod in somebody else's namespace that
+    /// may never come back — which is why the lease is this side's and why a
+    /// claim lapses rather than being released.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked. A tenant with
+    /// nothing to collect is not an error; it is an empty answer.
+    async fn claim(
+        &self,
+        tenant: &TenantId,
+        limit: usize,
+        now: Timestamp,
+        lease: core::time::Duration,
+    ) -> Result<Vec<Claimed>, StorageUnavailable>;
+
+    /// Records this tenant's terminal statement about one of its Deliveries.
+    ///
+    /// SCOPED BY TENANT LIKE EVERY OTHER METHOD HERE, and it would be easy to
+    /// think the identity is enough on its own: a `DeliveryId` is random, so
+    /// guessing one is not a practical attack. It is still an argument, because
+    /// authorisation that depends on an identifier being hard to guess is not
+    /// authorisation — and because the identity travels, in a trace, in a log
+    /// line, in a room message.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be told. Reporting again
+    /// is safe and answers [`Discharged::NotOutstanding`]: an agent whose
+    /// report was lost on the way back must be able to send it again, and the
+    /// alternative — an error — would make a retry look like a fault.
+    async fn report(
+        &self,
+        tenant: &TenantId,
+        delivery: &DeliveryId,
+        report: &Report,
+        at: Timestamp,
+    ) -> Result<Discharged, StorageUnavailable>;
 
     /// What this tenant has not yet discharged, oldest first, at most `limit`.
     ///

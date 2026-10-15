@@ -421,9 +421,9 @@ mod tests {
 
     use super::{Refused, Relay, Retry};
     use crate::ports::{
-        Attempt, Clock, DispatchFailed, Dispatcher, Handover, Ids, MalformedProof, Offered, Outbox,
-        Outcome, Proofs, Recorded, SecretUnavailable, StorageUnavailable, TenantId, Translator,
-        Untranslatable,
+        Attempt, Claimed, Clock, Discharged, DispatchFailed, Dispatcher, Handover, Ids,
+        MalformedProof, Offered, Outbox, Outcome, Proofs, Recorded, Report, SecretUnavailable,
+        StorageUnavailable, TenantId, Translator, Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
@@ -615,6 +615,29 @@ mod tests {
                 .filter(|offered| offered.tenant() == tenant)
                 .take(limit)
                 .collect())
+        }
+
+        // Nothing in this file claims or reports: the relay's business ends at
+        // owing the Delivery to its tenant. Collecting it is `collect.rs`, and
+        // its own fake implements these.
+        async fn claim(
+            &self,
+            _tenant: &TenantId,
+            _limit: usize,
+            _now: Timestamp,
+            _lease: core::time::Duration,
+        ) -> Result<Vec<Claimed>, StorageUnavailable> {
+            unreachable!("the relay never claims")
+        }
+
+        async fn report(
+            &self,
+            _tenant: &TenantId,
+            _delivery: &DeliveryId,
+            _report: &Report,
+            _at: Timestamp,
+        ) -> Result<Discharged, StorageUnavailable> {
+            unreachable!("the relay never reports")
         }
     }
 

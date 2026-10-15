@@ -541,6 +541,246 @@ async fn health_answers_without_asking_the_destination() {
     assert_eq!(body, "ok");
 }
 
+/// What a tenant's agent presents, as the service mesh would set it.
+///
+/// `x-forwarded-client-cert` is Envoy's header, and inside a mesh the sidecar
+/// SETS it from the verified peer certificate — replacing whatever the request
+/// carried. These tests write it themselves, which is exactly what makes the
+/// mesh load-bearing: without a sidecar in front, any caller could do this.
+/// `crates/app/src/collecting.rs` says so in the place somebody deploying this
+/// will read.
+fn as_agent_of(namespace: &str) -> String {
+    format!(
+        "By=spiffe://cluster.local/ns/webhook-proxy/sa/webhook-proxy;\
+         Hash=0000000000000000000000000000000000000000000000000000000000000000;\
+         Subject=\"\";URI=spiffe://cluster.local/ns/{namespace}/sa/alert-agent"
+    )
+}
+
+/// Claims whatever this agent is owed.
+async fn claim_as(address: &str, namespace: &str) -> (StatusCode, serde_json::Value) {
+    let answered = reqwest::Client::new()
+        .post(format!("http://{address}/deliveries/claim"))
+        .header("x-forwarded-client-cert", as_agent_of(namespace))
+        .send()
+        .await
+        .expect("the proxy answers");
+    let status = answered.status();
+    let body = answered
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+#[tokio::test]
+async fn an_agent_is_offered_none_of_another_tenants_deliveries() {
+    // THE ONE PROPERTY THE WHOLE SPLIT EXISTS TO PROVIDE, end to end against
+    // the running binary. The store proves it twice already — in memory and
+    // against the SQL — and this proves the part neither can: that the tenant
+    // actually comes from the caller's identity, and that nothing between the
+    // socket and the store substitutes a parameter for it.
+    //
+    // Two senders belonging to two tenants, per the fixture: `github` is
+    // devsecops's and `grafana` is platform's.
+    let (_dir, env) = configured("http://127.0.0.1:1");
+    let proxy = start(env).await.expect("the proxy starts");
+
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "github",
+            Credential::Signature(SIGNATURE.trim()),
+            PAYLOAD,
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "grafana",
+            Credential::Shared(GRAFANA_TOKEN),
+            GRAFANA_NOTIFICATION,
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+
+    let (status, devsecops) = claim_as(&proxy.address, "devsecops").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, platform) = claim_as(&proxy.address, "platform").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let origins = |claimed: &serde_json::Value| -> Vec<String> {
+        claimed["deliveries"]
+            .as_array()
+            .expect("a list of deliveries")
+            .iter()
+            .map(|one| one["origin"].as_str().expect("an origin").to_owned())
+            .collect()
+    };
+
+    // Each tenant sees its own sender's Delivery and only that one. Asserted
+    // both ways round, so this cannot pass by one of them being offered
+    // nothing: an empty answer for both would satisfy "sees none of the
+    // other's" while meaning the hand-off is broken.
+    assert_eq!(origins(&devsecops), vec!["github"]);
+    assert_eq!(origins(&platform), vec!["grafana"]);
+
+    // And the lease, which the platform owns and an agent must not assume.
+    assert!(
+        devsecops["lease_expires_ms"].as_i64().is_some(),
+        "a claim returned no lease: {devsecops}"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_the_mesh_did_not_identify_is_offered_nothing() {
+    // No header at all, which in production means a pod with no sidecar rather
+    // than an attacker — and is the case where answering anything at all would
+    // be the worst possible failure. 401 and not 403: nothing established who
+    // is calling, so there is nothing to authorise.
+    let (_dir, env) = configured("http://127.0.0.1:1");
+    let proxy = start(env).await.expect("the proxy starts");
+
+    let answered = reqwest::Client::new()
+        .post(format!("http://{}/deliveries/claim", proxy.address))
+        .send()
+        .await
+        .expect("the proxy answers");
+
+    assert_eq!(answered.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_caller_speaking_for_no_tenant_here_is_offered_nothing() {
+    // The case that makes the public path safe by construction rather than by
+    // routing: a request arriving through the ingress gateway carries the
+    // GATEWAY's identity, and `istio-ingress` is not a tenant. So even a
+    // deployment that published this path by mistake would hand out nothing.
+    let (_dir, env) = configured("http://127.0.0.1:1");
+    let proxy = start(env).await.expect("the proxy starts");
+
+    for namespace in ["istio-ingress", "wallet-lab-prod", "default"] {
+        let (status, body) = claim_as(&proxy.address, namespace).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a caller speaking for {namespace:?} was answered {status}: {body}"
+        );
+        // And it learns nothing about which tenants do exist.
+        let said = body.to_string();
+        for tenant in ["devsecops", "platform"] {
+            assert!(
+                !said.contains(tenant),
+                "the refusal named a tenant this deployment serves: {said}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_agent_reports_its_rooms_and_is_not_offered_it_again() {
+    // The other half of the hand-off: a report is terminal, and what it
+    // discharges is not offered to anybody again. Without this the queue never
+    // drains and every tenant looks like a tenant that has stopped collecting.
+    let (_dir, env) = configured("http://127.0.0.1:1");
+    let proxy = start(env).await.expect("the proxy starts");
+
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "github",
+            Credential::Signature(SIGNATURE.trim()),
+            PAYLOAD,
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+
+    let (_, claimed) = claim_as(&proxy.address, "devsecops").await;
+    let delivery = claimed["deliveries"][0]["delivery"]
+        .as_str()
+        .expect("a delivery identity")
+        .to_owned();
+
+    let reported = reqwest::Client::new()
+        .post(format!(
+            "http://{}/deliveries/{delivery}/report",
+            proxy.address
+        ))
+        .header("x-forwarded-client-cert", as_agent_of("devsecops"))
+        .json(&serde_json::json!({
+            "outcome": "reached",
+            "rooms": [{ "room": ROOM, "outcome": "delivered" }],
+        }))
+        .send()
+        .await
+        .expect("the proxy answers");
+    assert_eq!(reported.status(), StatusCode::NO_CONTENT);
+
+    // A claim after the lease would otherwise offer it again, so the proof that
+    // the report was terminal is that nothing comes back even to the tenant
+    // that holds the claim.
+    let (status, after) = claim_as(&proxy.address, "devsecops").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        after["deliveries"].as_array().expect("a list").is_empty(),
+        "a reported Delivery was offered again: {after}"
+    );
+}
+
+#[tokio::test]
+async fn one_tenant_cannot_report_another_tenants_delivery() {
+    // Reported by identity, and the identity alone is not the authority. A
+    // DeliveryId is random, so guessing one is not a practical attack — but it
+    // travels, in traces and logs and room messages, and authorisation that
+    // rests on an identifier being hard to guess is not authorisation.
+    let (_dir, env) = configured("http://127.0.0.1:1");
+    let proxy = start(env).await.expect("the proxy starts");
+
+    assert_eq!(
+        post_as(
+            &proxy.address,
+            "github",
+            Credential::Signature(SIGNATURE.trim()),
+            PAYLOAD,
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    let (_, claimed) = claim_as(&proxy.address, "devsecops").await;
+    let delivery = claimed["deliveries"][0]["delivery"]
+        .as_str()
+        .expect("a delivery identity")
+        .to_owned();
+
+    let report = |namespace: &'static str, delivery: String, address: String| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/deliveries/{delivery}/report"))
+            .header("x-forwarded-client-cert", as_agent_of(namespace))
+            .json(&serde_json::json!({ "outcome": "routed_to_nothing" }))
+            .send()
+            .await
+            .expect("the proxy answers")
+            .status()
+    };
+
+    // The other tenant discharges nothing, and is told the same thing it would
+    // be told about an identity that never existed.
+    assert_eq!(
+        report("platform", delivery.clone(), proxy.address.clone()).await,
+        StatusCode::NOT_FOUND
+    );
+    // The positive oracle: its own tenant still can, so the refusal above was
+    // not the store having lost it.
+    assert_eq!(
+        report("devsecops", delivery, proxy.address.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+}
+
 #[tokio::test]
 async fn an_origin_naming_a_tenant_nobody_listed_stops_the_process() {
     // The failure bead gc-nkb exists to prevent, proved against the binary

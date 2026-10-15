@@ -166,6 +166,43 @@ here would deny the rooms, and the loss would be reported as the destination
 refusing. Restricting egress means enumerating the rooms, which belongs where
 the rooms are configured.
 
+## The hand-off to a tenant's agent needs a service mesh
+
+Two paths — `/deliveries/claim` and `/deliveries/{delivery}/report` — are a
+tenant agent's, not a sender's, and `docs/tenant-agent-api.md` describes them.
+What they need from a deployment is stated here because getting it wrong is
+silent.
+
+> **Do not run this workload without the mesh sidecar.** Those two paths are
+> authenticated by the caller's mTLS identity, which the process reads from
+> `x-forwarded-client-cert`. That header is a fact only because the sidecar sets
+> it from the verified peer certificate, replacing whatever the request carried.
+> With no sidecar in front, any caller that can reach the port can write the
+> header itself and claim any tenant's alerts.
+
+One thing holds without any of that, and it is why this is not a hole in the
+public path: the namespace in the identity must be a tenant `config.yaml` lists.
+A request arriving through the ingress gateway carries the *gateway's* identity,
+whose namespace is `istio-ingress`, and `istio-ingress` is not a tenant. So even
+a deployment that published these paths by mistake hands out nothing.
+
+What to apply, and where each piece lives:
+
+- `istio/authorizationpolicy.yaml` — **the boundary.** One principal per tenant
+  agent, and `ALLOW` rather than `DENY` so a path nobody wrote a rule for is
+  refused by default. Not in the kustomization below: this development cluster
+  runs Cilium's Gateway API with no mesh, so the API server does not know the
+  kind and `kubectl apply -k` would fail on it. `crates/app/tests/openapi.rs`
+  checks that it names every path the code treats as internal.
+- `networkpolicy.yaml` — which namespaces may reach the pod at all. A tenant
+  agent's namespace is selected by **label**, not by name, so the list of
+  tenants stays in `config.yaml` alone. The alternative was a second copy, whose
+  failure mode is an agent that authenticates successfully and times out.
+- `config.yaml`'s `tenants:` list — which tenants exist. Adding a tenant is two
+  edits: a line there, saying the platform serves it, and a principal in the
+  AuthorizationPolicy, saying which workload speaks for it. Deliberately two:
+  they are different facts, owned by different people.
+
 ## An HTTPRoute, not an Ingress
 
 gc-d01's acceptance criterion said Ingress. The target cluster has no Ingress

@@ -1,0 +1,70 @@
+# Which callers may reach the hand-off, and on which paths.
+#
+# NOT APPLIED BY THE KUSTOMIZATION IN THE PARENT DIRECTORY, and not because it
+# is optional. This development cluster runs Cilium's Gateway API with no
+# service mesh, so `AuthorizationPolicy` is a kind its API server does not know
+# and `kubectl apply -k` would fail on it. It lives here, beside the manifests
+# it belongs with, for the GitOps repository to apply where Istio exists.
+#
+# THIS FILE IS THE AUTHENTICATION BOUNDARY FOR THE TWO INTERNAL PATHS.
+# `crates/app/src/collecting.rs` reads the caller's identity from
+# `x-forwarded-client-cert`, which is trustworthy only because the sidecar sets
+# it from the verified peer certificate. Without a mesh in front, any caller
+# could write that header itself. The process does one thing on its own —
+# refuse a caller whose namespace is not a configured tenant — and that is what
+# makes a request arriving through the public gateway harmless, because
+# `istio-ingress` is not a tenant. It is not a substitute for this.
+#
+# The process deliberately does NOT check which service account called (bead
+# gc-81d): restricting that is this policy's job, so "any workload in that
+# namespace" is not the boundary — these rules are.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: webhook-proxy-handover
+  namespace: webhook-proxy
+  labels:
+    app.kubernetes.io/name: webhook-proxy
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: webhook-proxy
+  # ALLOW rather than DENY, so a path nobody wrote a rule for is refused by
+  # default. A DENY list would publish every path added later.
+  action: ALLOW
+  rules:
+    # The public webhook, reached through the gateway. Its own credential is
+    # what authenticates a sender; this only says which workload may forward it.
+    - to:
+        - operation:
+            paths: ["/webhook/*"]
+      from:
+        - source:
+            # REPLACE: the ingress gateway's own service account.
+            principals: ["cluster.local/ns/istio-ingress/sa/istio-ingressgateway"]
+
+    # The hand-off. One principal per tenant agent, listed, because this is the
+    # list the process does not keep: it checks that a caller's namespace is a
+    # configured tenant, and this checks that the caller is the agent that
+    # tenant runs rather than anything else in the same namespace.
+    #
+    # REPLACE the principals with one per tenant. Adding a tenant means a line
+    # here and a line in `tenants:` — two edits, deliberately: one says the
+    # platform serves that tenant, the other says which workload speaks for it.
+    - to:
+        - operation:
+            paths:
+              - /deliveries/claim
+              - /deliveries/*/report
+      from:
+        - source:
+            principals:
+              - cluster.local/ns/devsecops/sa/alert-agent
+              - cluster.local/ns/platform/sa/alert-agent
+
+    # The probes and the scrape. The kubelet reaches /health from the node and
+    # is not a mesh principal, so this needs no `from` — and /metrics is read by
+    # whatever scrapes it, which the NetworkPolicy restricts by namespace.
+    - to:
+        - operation:
+            paths: ["/health", "/metrics", "/api-info"]

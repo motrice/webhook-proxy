@@ -13,6 +13,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use alertmanager_payload::AlertmanagerPayload;
+mod collecting;
+
 use application::ports::{Dispatcher, Handover, Outbox, Proofs, Translator};
 use application::{Counts, Replay, Retries, Retry, Tally};
 use axum::routing::get;
@@ -727,8 +729,20 @@ async fn run() -> Result<(), Unstartable> {
         config.sweep,
     );
 
+    // The hand-off to a tenant's agent. Merged rather than layered, so these two
+    // paths carry no body limit and no part of the sender pipeline: nothing
+    // about them is a webhook. What authenticates them is the service mesh, and
+    // `collecting`'s own documentation says what that assumption costs if it
+    // does not hold.
+    let collecting = collecting::Collecting::new(
+        Arc::clone(&handover),
+        Arc::new(SystemClock),
+        routing.tenants().clone(),
+    );
+
     let scraped = Arc::clone(&tally);
     let app = router(inbound, config.max_body)
+        .merge(collecting::routes(collecting))
         .route("/health", get(health))
         .route("/api-info", get(api_info))
         .route(
