@@ -136,8 +136,8 @@ mod tests {
 
     use super::Retention;
     use crate::ports::{
-        Behind, Claimed, Clock, Discharged, Handover, Offered, Report, StorageUnavailable, Swept,
-        TenantId, Uncollected,
+        Behind, Claimed, Clock, Discharged, Handover, Offered, Reoffered, Report,
+        StorageUnavailable, Swept, TenantId, Uncollected,
     };
 
     const MONTH: Duration = Duration::from_hours(30 * 24);
@@ -215,6 +215,12 @@ mod tests {
             _at: Timestamp,
         ) -> Result<Discharged, StorageUnavailable> {
             unreachable!("retention never reports")
+        }
+
+        // Nothing in this file offers anything again: a replay is an operator's
+        // command, not part of this use case.
+        async fn reoffer(&self, _delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
+            unreachable!("retention never re-offers")
         }
 
         async fn sweep(&self, accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {

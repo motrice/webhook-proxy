@@ -7,8 +7,8 @@
 //! than one crate holding two tables.
 
 use application::ports::{
-    Behind, Claimed, Discharged, Handover, Offered, Report, RoomOutcome, StorageUnavailable, Swept,
-    TenantId, Uncollected,
+    Behind, Claimed, Discharged, Handover, Offered, Reoffered, Report, RoomOutcome,
+    StorageUnavailable, Swept, TenantId, Uncollected,
 };
 use async_trait::async_trait;
 use domain::{Correlation, DeliveryId, OriginId, Timestamp};
@@ -51,7 +51,7 @@ impl PostgresHandover {
 }
 
 /// Columns every read needs, with the moment already in milliseconds.
-const COLUMNS: &str = "delivery, tenant, origin, events, trace, span, state, \
+const COLUMNS: &str = "delivery, tenant, origin, events, trace, span, state, replayed, \
      (EXTRACT(EPOCH FROM accepted_at) * 1000)::BIGINT AS accepted_at_ms";
 
 /// Reads one row back into what the port speaks.
@@ -193,7 +193,10 @@ impl Handover for PostgresHandover {
         // backlog rather than its newest alerts.
         let mut claimed: Vec<Claimed> = rows
             .iter()
-            .map(|row| offered(row).map(|offered| Claimed::new(offered, until)))
+            .map(|row| {
+                let replayed: bool = row.try_get("replayed").map_err(|_| StorageUnavailable)?;
+                offered(row).map(|offered| Claimed::new(offered, until, replayed))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         claimed.sort_by(|one, other| {
             one.offered()
@@ -224,7 +227,8 @@ impl Handover for PostgresHandover {
         // whose reply was lost can send it again without erasing what it said.
         let settled = sqlx::query(
             "UPDATE handover \
-             SET reported_at = to_timestamp($4::BIGINT / 1000.0), report = $3 \
+             SET reported_at = to_timestamp($4::BIGINT / 1000.0), report = $3, \
+                 replayed = FALSE \
              WHERE delivery = $1 AND tenant = $2 AND reported_at IS NULL",
         )
         .bind(delivery.as_str())
@@ -240,6 +244,33 @@ impl Handover for PostgresHandover {
             Ok(Discharged::NotOutstanding)
         } else {
             Ok(Discharged::Settled)
+        }
+    }
+
+    async fn reoffer(&self, delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
+        // NO TENANT, which the port explains: this serves an operator holding a
+        // Delivery identity out of a log line, not a request. It has no route.
+        //
+        // The previous `report` is deliberately LEFT where it is rather than
+        // cleared. It is the record of what happened last time, and it stays
+        // readable until a new report replaces it — which is strictly more than
+        // clearing it would leave, and costs nothing: `reported_at IS NULL` is
+        // what every other query reads, not this column.
+        let offered = sqlx::query(
+            "UPDATE handover \
+             SET reported_at = NULL, claimed_until = NULL, replayed = TRUE \
+             WHERE delivery = $1",
+        )
+        .bind(delivery.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|_| StorageUnavailable)?
+        .rows_affected();
+
+        if offered == 0 {
+            Ok(Reoffered::NotStored)
+        } else {
+            Ok(Reoffered::Owed)
         }
     }
 
@@ -358,7 +389,9 @@ fn written_report(report: &Report) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use application::ports::{Discharged, Handover, Offered, Report, RoomOutcome, TenantId};
+    use application::ports::{
+        Discharged, Handover, Offered, Reoffered, Report, RoomOutcome, TenantId,
+    };
     use domain::{
         BranchName, Commit, CommitId, Correlation, DeliveryId, Event, OriginId, Pusher,
         RepositoryName, Summary, Timestamp,
@@ -596,7 +629,7 @@ mod tests {
 
         assert_eq!(
             columns.len(),
-            11,
+            12,
             "the handover table gained or lost a column: {columns:?}"
         );
         for forbidden in ["secret", "url", "webhook", "token", "destination"] {
@@ -972,5 +1005,131 @@ mod tests {
             .expect("reported");
 
         assert!(store.behind(at(50)).await.expect("asked").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reported_delivery_can_be_offered_again_marked_as_a_replay() {
+        // What `replay` became. The Dispatch it used to re-send is gone, but a
+        // reported handover row survives its report for a month — so the
+        // Delivery is still there, and offering it again is one row changing
+        // its mind about being settled.
+        let store = handover().await;
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1, vec![a_push("x")]))
+            .await
+            .expect("stored");
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &DeliveryId::new("d-1").expect("an identity"),
+                &Report::Reached(vec![(
+                    domain::DestinationId::new("a-room").expect("an identity"),
+                    RoomOutcome::Delivered,
+                )]),
+                at(2),
+            )
+            .await
+            .expect("reported");
+        assert!(
+            store
+                .claim(&tenant("wallet-lab-prod"), 10, at(3), FIVE_MINUTES)
+                .await
+                .expect("asked")
+                .is_empty(),
+            "a reported Delivery was still being offered"
+        );
+
+        assert_eq!(
+            store
+                .reoffer(&DeliveryId::new("d-1").expect("an identity"))
+                .await
+                .expect("asked"),
+            Reoffered::Owed
+        );
+
+        let again = store
+            .claim(&tenant("wallet-lab-prod"), 10, at(4), FIVE_MINUTES)
+            .await
+            .expect("claimed");
+        assert_eq!(again.len(), 1, "a re-offered Delivery was not handed out");
+        // THE MARKING, which is the part gc-6a5.3 decided deliberately: a
+        // replay that looked like a retry would be a lie told by a tool,
+        // because an alert arriving twice is how a responder learns something
+        // got worse.
+        assert!(again[0].replayed(), "the replay was not marked as one");
+
+        // And what it said last time is still readable, because the re-offer
+        // leaves `report` where it is rather than clearing it.
+        let said: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT report FROM handover WHERE delivery = 'd-1'")
+                .fetch_one(store.handover.pool_for_test())
+                .await
+                .expect("asked");
+        assert_eq!(said.expect("a report")["rooms"][0]["room"], "a-room");
+    }
+
+    #[tokio::test]
+    async fn reporting_a_replay_clears_the_mark() {
+        // The flag is a property of an OFFERING, not of the Delivery: the same
+        // Delivery is a first delivery once and a replay afterwards. Left set,
+        // every later offering of it would be marked.
+        let store = handover().await;
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1, vec![a_push("x")]))
+            .await
+            .expect("stored");
+        let delivery = DeliveryId::new("d-1").expect("an identity");
+        store.reoffer(&delivery).await.expect("asked");
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &delivery,
+                &Report::RoutedToNothing,
+                at(2),
+            )
+            .await
+            .expect("reported");
+
+        store.reoffer(&delivery).await.expect("asked");
+        // Cleared by the report above, then set again by this re-offer: the
+        // point is that the report cleared it rather than that it is set now.
+        let marked: bool =
+            sqlx::query_scalar("SELECT replayed FROM handover WHERE delivery = 'd-1'")
+                .fetch_one(store.handover.pool_for_test())
+                .await
+                .expect("asked");
+        assert!(marked);
+
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &delivery,
+                &Report::RoutedToNothing,
+                at(3),
+            )
+            .await
+            .expect("reported");
+        let marked: bool =
+            sqlx::query_scalar("SELECT replayed FROM handover WHERE delivery = 'd-1'")
+                .fetch_one(store.handover.pool_for_test())
+                .await
+                .expect("asked");
+        assert!(!marked, "a report left the replay mark standing");
+    }
+
+    #[tokio::test]
+    async fn offering_something_that_is_not_stored_again_says_so() {
+        // Not a failure, and one answer for two cases: an operator cannot tell
+        // a Delivery that never existed from one retention deleted, and both
+        // mean there is nothing left to send again.
+        let store = handover().await;
+
+        assert_eq!(
+            store
+                .reoffer(&DeliveryId::new("never-existed").expect("an identity"))
+                .await
+                .expect("asked"),
+            Reoffered::NotStored
+        );
     }
 }

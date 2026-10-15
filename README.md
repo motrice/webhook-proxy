@@ -311,14 +311,26 @@ A past delivery can be sent again, by identity:
 webhook-proxy replay <delivery-id>
 ```
 
-It routes by the rules in force **now**, not the ones in force when the delivery
-arrived — which is usually the point, because a replay happens after somebody
-changed something. The Origin it routes by is the one that was verified at the
-time and stored beside the dispatch, never one typed on the command line.
+**It offers the delivery to its team again rather than sending it itself**, and
+the distinction is worth knowing before reading the output. Routing left this
+service (bead `gc-g9x`), so there is no stored dispatch to re-send and no room
+this process can reach — what it has is the delivery, which survives its report
+for a month, and a team whose agent will deliver it by the rules in force now.
+That is usually the point, because a replay happens after somebody changed
+something.
 
-A replayed message says `(replayed)` in the room. A retry does not: nobody has
-seen a retry, so it is a first arrival that happens to be late, and marking it
-would put noise in the channel people rely on for alerts.
+It asks for no team name: whoever runs this has a delivery identity out of a
+log line, and making them look up its team first would mean looking it up from
+the thing they are already holding.
+
+A replayed message still says `(replayed)` in the room — the flag travels with
+the delivery and the team's agent writes it. A retry does not: nobody has seen
+a retry, so it is a first arrival that happens to be late, and marking it would
+put noise in the channel people rely on for alerts.
+
+If nothing goes by that identity you are told so plainly, and it means one of
+two things that cannot be told apart from here: it was never accepted, or
+retention has already deleted it — one month from acceptance.
 
 Only a person can start one. Nothing on the request path can.
 

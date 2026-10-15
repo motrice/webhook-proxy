@@ -140,7 +140,7 @@ mod tests {
 
     use super::{Collect, Refused};
     use crate::ports::{
-        Behind, Claimed, Clock, Discharged, Handover, Offered, Report, RoomOutcome,
+        Behind, Claimed, Clock, Discharged, Handover, Offered, Reoffered, Report, RoomOutcome,
         StorageUnavailable, Swept, TenantId,
     };
 
@@ -244,8 +244,14 @@ mod tests {
                 .outstanding(tenant, limit)
                 .await?
                 .into_iter()
-                .map(|offered| Claimed::new(offered, now.after(lease)))
+                .map(|offered| Claimed::new(offered, now.after(lease), false))
                 .collect())
+        }
+
+        // Nothing in this file offers anything again: a replay is an operator's
+        // command, not part of this use case.
+        async fn reoffer(&self, _delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
+            unreachable!("collecting never re-offers")
         }
 
         // Nothing in this file sweeps: what is kept and who is told about a

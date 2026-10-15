@@ -66,6 +66,7 @@ claim again.
       "accepted_at_ms": 1760000000000,
       "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
       "tracestate": null,
+      "replayed": false,
       "events": [{ "kind": "alert", "...": "..." }]
     }
   ]
@@ -91,6 +92,19 @@ with two binaries that could disagree about its length, one of them has to own
 it. It is **not renewable** in this version. A claim *lapses* rather than being
 released, so an agent that dies mid-delivery costs the platform nothing to
 notice: the Delivery is simply offered again.
+
+**`replayed` says whether a person asked for this to be sent again**, and an
+agent that receives it `true` must mark the message in the room — the proxy's
+`element-notices` renderer writes `(replayed)`. Bead `gc-6a5.3` decided that
+deliberately: an alert arriving twice is how a responder learns something got
+worse, so a replay that looked like a retry would be a lie told by a tool.
+
+An agent must not infer it. A **retry inside the attempt budget is not a
+replay**: nobody has seen it, so it is a first arrival that happens to be late,
+and marking it would put noise in the channel people rely on for alerts.
+Whether something is a replay is the platform's knowledge, and the field is
+absent only on a platform too old to send it — in which case it is a first
+delivery.
 
 **Moments are milliseconds since the epoch.** The only consumer is the agent in
 this workspace, and a number needs no date library in either process and cannot

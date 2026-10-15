@@ -211,6 +211,12 @@ async fn claim(
                         "accepted_at_ms": offered.accepted_at().millis_since_epoch(),
                         "traceparent": spelled(offered.correlation()),
                         "tracestate": offered.correlation().state(),
+                        // Whether a person asked for this to be sent again, so
+                        // the room can show it. The agent must not guess:
+                        // marking a retry is what bead gc-6a5.3 refused,
+                        // because an alert arriving twice is how a responder
+                        // learns something got worse.
+                        "replayed": one.replayed(),
                         "events": offered.events().iter().map(written).collect::<Vec<_>>(),
                     })
                 })

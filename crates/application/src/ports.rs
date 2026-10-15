@@ -395,100 +395,6 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
 }
 
-/// Which moments a query is interested in.
-///
-/// Both ends optional, so one shape serves "the most recent" and "between these
-/// times" without a second method. Unbounded is the common case: the first
-/// useful question about an outbox is what just happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Window {
-    /// Nothing accepted before this moment.
-    pub from: Option<Timestamp>,
-    /// Nothing accepted after it.
-    pub to: Option<Timestamp>,
-}
-
-/// How much of an answer to return, and where to carry on from.
-///
-/// Part of the port rather than bolted on later, because an outbox grows
-/// without bound: a query with no limit is a query that works in testing and
-/// takes a process down in a year. `after` is the last identity a caller
-/// already has, not an offset — an offset shifts under a concurrent write and
-/// silently skips a row, which for an audit answer is worse than a repeat.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Page {
-    /// At most this many.
-    pub limit: usize,
-    /// Carry on after this one, if a caller has been here before.
-    pub after: Option<DispatchId>,
-}
-
-/// What arrived, and where it went.
-///
-/// The read side of the store, declared in the domain's vocabulary rather than
-/// in a transport's: the questions worth asking are the same whether they come
-/// over HTTP, from a command, or from a test, and declaring them here is what
-/// stops the answers being shaped by what was convenient to serialise.
-///
-/// EVERY QUERY IS SCOPED BY ROOM, and that is not a convenience. Bead gc-mnn
-/// decided a reader may see what the rooms named for it received, so the rooms
-/// arrive as an argument and an implementation returns nothing outside them. A
-/// port that returned everything and left filtering to its caller would put an
-/// authorisation decision in an adapter, where forgetting it is a leak with no
-/// test to catch it. An empty slice therefore answers empty: a reader with no
-/// rooms is a reader who sees nothing, not a reader who sees all of it.
-///
-/// Nothing here can return a payload, an address or a credential, and that is
-/// structural rather than careful: a [`Recorded`] carries a Dispatch, a
-/// Dispatch carries a Destination, and a Destination is a name with no address.
-/// The request body is never stored at all.
-#[async_trait]
-pub trait Archive: Send + Sync {
-    /// What arrived, most recent first.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be asked.
-    async fn arrived(
-        &self,
-        rooms: &[DestinationId],
-        window: Window,
-        page: &Page,
-    ) -> Result<Vec<Recorded>, StorageUnavailable>;
-
-    /// Where one Delivery went, and what became of it in each room.
-    ///
-    /// Empty when nothing is stored under that identity, which is deliberately
-    /// indistinguishable from never having been accepted. Retention is one month
-    /// (gc-mnn), so "it was here last quarter" and "it was never here" are the
-    /// same answer, and a reader must not be able to tell a room it may not see
-    /// from a delivery that does not exist.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be asked.
-    async fn went(
-        &self,
-        delivery: &DeliveryId,
-        rooms: &[DestinationId],
-    ) -> Result<Vec<Recorded>, StorageUnavailable>;
-
-    /// What has not been delivered yet, most recent first.
-    ///
-    /// Everything still [`Outcome::Waiting`] — owed, not lost. An abandoned
-    /// Dispatch is a loss and is reported by the counters and the log, not here:
-    /// a reader asking what is outstanding wants the queue, not the history.
-    ///
-    /// # Errors
-    ///
-    /// [`StorageUnavailable`] if the store could not be asked.
-    async fn waiting(
-        &self,
-        rooms: &[DestinationId],
-        page: &Page,
-    ) -> Result<Vec<Recorded>, StorageUnavailable>;
-}
-
 /// Fresh identities.
 pub trait Ids: Send + Sync {
     /// A Delivery identity that has not been used before.
@@ -717,13 +623,33 @@ impl Offered {
 pub struct Claimed {
     offered: Offered,
     until: Timestamp,
+    replayed: bool,
 }
 
 impl Claimed {
     /// Hands one over, leased until `until`.
+    ///
+    /// `replayed` is a property of THIS OFFERING and not of the Delivery: the
+    /// same Delivery is a first delivery once and a replay afterwards, if
+    /// somebody asks for one.
     #[must_use]
-    pub fn new(offered: Offered, until: Timestamp) -> Self {
-        Self { offered, until }
+    pub fn new(offered: Offered, until: Timestamp, replayed: bool) -> Self {
+        Self {
+            offered,
+            until,
+            replayed,
+        }
+    }
+
+    /// Whether a person asked for this to be sent again.
+    ///
+    /// Carried so a room can show it. Bead gc-6a5.3 decided that marking
+    /// deliberately: an alert arriving twice is how a responder learns
+    /// something got worse, so a replay that looked like a retry would be a lie
+    /// told by a tool.
+    #[must_use]
+    pub fn replayed(&self) -> bool {
+        self.replayed
     }
 
     /// What was claimed.
@@ -837,6 +763,20 @@ pub struct Behind {
     pub oldest: Timestamp,
 }
 
+/// Whether a re-offer found a Delivery to offer again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reoffered {
+    /// It is owed to its tenant again, marked as a replay.
+    Owed,
+    /// Nothing goes by that identity any more.
+    ///
+    /// One answer for two cases, and here that is a kindness rather than a
+    /// precaution: an operator cannot tell a Delivery that never existed from
+    /// one retention has already deleted, and both mean the same thing — there
+    /// is nothing left to send again.
+    NotStored,
+}
+
 /// Whether a report discharged anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Discharged {
@@ -866,11 +806,14 @@ pub enum Discharged {
 /// back and tested, and because the count it answers is what bead gc-wcw.3 will
 /// need in order to log a tenant that has stopped collecting.
 ///
-/// EVERY METHOD IS SCOPED BY TENANT, for the reason [`Archive`] is scoped by
-/// room: a port that answered everything and left the filtering to its caller
-/// would put an authorisation decision in an adapter, where forgetting it is a
-/// leak with no test to catch it. Here it would be the exact leak this whole
-/// split exists to prevent.
+/// EVERY METHOD THAT SERVES A REQUEST IS SCOPED BY TENANT. A port that answered
+/// everything and left the filtering to its caller would put an authorisation
+/// decision in an adapter, where forgetting it is a leak with no test to catch
+/// it — and here it would be the exact leak this whole split exists to prevent.
+///
+/// The exceptions are the two methods no request can reach: [`Self::behind`],
+/// which answers an operator's gauge, and [`Self::reoffer`], which answers an
+/// operator's command. Each says so where it is declared.
 #[async_trait]
 pub trait Handover: Send + Sync {
     /// Records one Delivery as owed to its tenant.
@@ -954,6 +897,30 @@ pub trait Handover: Send + Sync {
     /// deleted in that case — the caller tries again on the next pass rather
     /// than having to reconcile a half-finished sweep.
     async fn sweep(&self, accepted_before: Timestamp) -> Result<Swept, StorageUnavailable>;
+
+    /// Offers one Delivery again, marked as a replay, whoever it belongs to.
+    ///
+    /// THE ONE METHOD HERE WITH NO TENANT, and the exception has a reason.
+    /// Every other method serves a request and is scoped because the caller
+    /// must only ever see its own. This serves an operator who already has the
+    /// database in front of them, running `webhook-proxy replay` on a Delivery
+    /// identity out of a log line — scoping it would mean asking them for a
+    /// tenant they would have to look up from the thing they are already
+    /// holding.
+    ///
+    /// NOTHING REACHABLE FROM AN HTTP HANDLER MAY CALL THIS. It is the one hole
+    /// in the isolation the rest of this port exists to keep, and the thing
+    /// that makes it safe is that it has no route — not that it checks
+    /// anything.
+    ///
+    /// A Delivery still outstanding is offered again anyway and the flag is
+    /// set: an operator asking for a replay of something nobody has collected
+    /// yet means the marking, not the offering.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be told.
+    async fn reoffer(&self, delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable>;
 
     /// Which tenants have work outstanding from before `accepted_before`.
     ///
@@ -1152,6 +1119,7 @@ pub struct Owed {
     correlation: Correlation,
     accepted_at: Timestamp,
     lease_until: Timestamp,
+    replayed: bool,
 }
 
 impl Owed {
@@ -1169,6 +1137,7 @@ impl Owed {
         correlation: Correlation,
         accepted_at: Timestamp,
         lease_until: Timestamp,
+        replayed: bool,
     ) -> Option<Self> {
         if events.is_empty() {
             return None;
@@ -1180,7 +1149,19 @@ impl Owed {
             correlation,
             accepted_at,
             lease_until,
+            replayed,
         })
+    }
+
+    /// Whether a person asked for this to be sent again, so the room is told.
+    ///
+    /// Read from the claim rather than decided here: whether something is a
+    /// replay is the platform's knowledge, and an agent that guessed would mark
+    /// a retry — which bead gc-6a5.3 refused, because an alert arriving twice is
+    /// how a responder learns something got worse.
+    #[must_use]
+    pub fn replayed(&self) -> bool {
+        self.replayed
     }
 
     /// Which Delivery, which is how a report refers to it.

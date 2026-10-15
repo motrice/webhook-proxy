@@ -90,6 +90,13 @@ fn owed(entry: &Value, lease_until: Timestamp) -> Option<Owed> {
         carried(entry)?,
         Timestamp::from_millis_since_epoch(entry.get("accepted_at_ms")?.as_i64()?),
         lease_until,
+        // Absent means not a replay. A platform too old to send the field is
+        // sending first deliveries, and defaulting the other way would mark
+        // every message in every room.
+        entry
+            .get("replayed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     )
 }
 
@@ -260,6 +267,10 @@ mod tests {
             one.correlation().trace(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
         );
+        // A first delivery unless the platform says otherwise, which is the
+        // safe default: the other way round would mark every message in every
+        // room.
+        assert!(!one.replayed());
     }
 
     #[test]

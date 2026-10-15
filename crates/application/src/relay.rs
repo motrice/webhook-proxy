@@ -422,8 +422,8 @@ mod tests {
     use super::{Refused, Relay, Retry};
     use crate::ports::{
         Attempt, Behind, Claimed, Clock, Discharged, DispatchFailed, Dispatcher, Handover, Ids,
-        MalformedProof, Offered, Outbox, Outcome, Proofs, Recorded, Report, SecretUnavailable,
-        StorageUnavailable, Swept, TenantId, Translator, Untranslatable,
+        MalformedProof, Offered, Outbox, Outcome, Proofs, Recorded, Reoffered, Report,
+        SecretUnavailable, StorageUnavailable, Swept, TenantId, Translator, Untranslatable,
     };
 
     const SIGNATURE: [u8; 3] = [1, 2, 3];
@@ -638,6 +638,12 @@ mod tests {
             _at: Timestamp,
         ) -> Result<Discharged, StorageUnavailable> {
             unreachable!("the relay never reports")
+        }
+
+        // Nothing in this file offers anything again: a replay is an operator's
+        // command, not part of this use case.
+        async fn reoffer(&self, _delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
+            unreachable!("the relay never re-offers")
         }
 
         async fn sweep(&self, _accepted_before: Timestamp) -> Result<Swept, StorageUnavailable> {

@@ -157,7 +157,13 @@ impl<'a> Deliver<'a> {
             }
 
             match self
-                .attempted(&delivery, &events, &destination, owed.correlation())
+                .attempted(
+                    &delivery,
+                    &events,
+                    &destination,
+                    owed.correlation(),
+                    owed.replayed(),
+                )
                 .await
             {
                 Ok(()) => {
@@ -187,6 +193,7 @@ impl<'a> Deliver<'a> {
         events: &[Event],
         destination: &Destination,
         chain: &Correlation,
+        replayed: bool,
     ) -> Result<(), (DispatchFailed, u32)> {
         let mut failures = 0_u32;
         loop {
@@ -199,10 +206,17 @@ impl<'a> Deliver<'a> {
 
             // `First` even on a retry: a retry is the same message arriving
             // late and nobody has seen it, so marking it would be noise in an
-            // alert channel. Only a replay somebody asked for is marked.
+            // alert channel. Only a replay somebody ASKED FOR is marked, and
+            // whether this is one is the platform's knowledge rather than a
+            // guess made here (bead gc-6a5.3).
+            let attempt = if replayed {
+                Attempt::Replay
+            } else {
+                Attempt::First
+            };
             match self
                 .dispatcher
-                .dispatch(delivery, events, destination, Attempt::First, &hop)
+                .dispatch(delivery, events, destination, attempt, &hop)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -357,6 +371,10 @@ mod tests {
     }
 
     fn claimed(delivery: &str, events: Vec<Event>, until: i64) -> Owed {
+        offered_as(delivery, events, until, false)
+    }
+
+    fn offered_as(delivery: &str, events: Vec<Event>, until: i64, replayed: bool) -> Owed {
         Owed::new(
             DeliveryId::new(delivery).expect("an identity"),
             OriginId::new("alertmanager-a-tenant").expect("an identity"),
@@ -365,6 +383,7 @@ mod tests {
                 .expect("a chain"),
             at(0),
             at(until),
+            replayed,
         )
         .expect("at least one event")
     }
@@ -421,7 +440,7 @@ mod tests {
 
     /// A dispatcher that records what it was sent and can be made to fail.
     struct Rooms {
-        sent: Mutex<Vec<(String, usize, String)>>,
+        sent: Mutex<Vec<(String, usize, String, Attempt)>>,
         failing: Vec<&'static str>,
     }
 
@@ -434,7 +453,7 @@ mod tests {
         }
 
         /// Each call, as (room, how many events, the span it carried).
-        fn sent(&self) -> Vec<(String, usize, String)> {
+        fn sent(&self) -> Vec<(String, usize, String, Attempt)> {
             self.sent.lock().expect("not poisoned").clone()
         }
     }
@@ -446,7 +465,7 @@ mod tests {
             _delivery: &DeliveryId,
             events: &[Event],
             destination: &Destination,
-            _attempt: Attempt,
+            attempt: Attempt,
             correlation: &Correlation,
         ) -> Result<(), DispatchFailed> {
             let id = destination.id().as_str().to_owned();
@@ -454,6 +473,7 @@ mod tests {
                 id.clone(),
                 events.len(),
                 correlation.span().to_owned(),
+                attempt,
             ));
             if self.failing.contains(&id.as_str()) {
                 return Err(DispatchFailed::Rejected);
@@ -520,7 +540,11 @@ mod tests {
 
         deliver.once().await.expect("the platform answered");
 
-        let sent: Vec<String> = rooms.sent().into_iter().map(|(room, _, _)| room).collect();
+        let sent: Vec<String> = rooms
+            .sent()
+            .into_iter()
+            .map(|(room, _, _, _)| room)
+            .collect();
         assert_eq!(sent, vec!["team-room", "oncall-room"]);
 
         let reported = platform.reported();
@@ -646,6 +670,8 @@ mod tests {
         // A different span from the one claimed, which is what a hop is: the
         // call this agent made is not the call the sender made.
         assert_eq!(rooms.sent()[0].2, "00f067aa0ba90299");
+        // And an ordinary delivery is not marked as a replay.
+        assert_eq!(rooms.sent()[0].3, Attempt::First);
     }
 
     #[tokio::test]
@@ -756,5 +782,64 @@ mod tests {
         );
 
         assert!(deliver.once().await.expect("asked").quiet());
+    }
+
+    #[tokio::test]
+    async fn a_delivery_the_platform_marked_a_replay_arrives_marked() {
+        // Bead gc-6a5.3's decision, surviving the change of mechanism. An alert
+        // arriving twice is how a responder learns something got worse, so a
+        // replay that looked like a retry would be a lie told by a tool — and
+        // this agent is now the only thing that can put the mark in the room.
+        //
+        // Read from the claim and never guessed: whether something is a replay
+        // is the platform's knowledge. A retry inside the budget stays
+        // unmarked, which the test above pins.
+        let platform = Platform::offering(vec![offered_as("d-1", vec![a_push("x")], 60_000, true)]);
+        let rooms = Rooms::new(vec![]);
+        let subscriptions = everything_to(&["team-room"]);
+        let clock = Ticking(Mutex::new(0));
+        let waited = NoWait(Mutex::new(Vec::new()));
+        let deliver = Deliver::new(
+            &platform,
+            &rooms,
+            &clock,
+            &Hops,
+            &waited,
+            &subscriptions,
+            budget(),
+        );
+
+        deliver.once().await.expect("the platform answered");
+
+        assert_eq!(rooms.sent().len(), 1);
+        assert_eq!(rooms.sent()[0].3, Attempt::Replay);
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_a_replay_stays_marked_for_every_attempt() {
+        // Each attempt is its own call and carries its own mark. An agent that
+        // marked only the first would put `(replayed)` in a room or not
+        // depending on whether the first attempt happened to fail, which is
+        // the kind of inconsistency nobody would think to look for.
+        let platform =
+            Platform::offering(vec![offered_as("d-1", vec![a_push("x")], 600_000, true)]);
+        let rooms = Rooms::new(vec!["team-room"]);
+        let subscriptions = everything_to(&["team-room"]);
+        let clock = Ticking(Mutex::new(0));
+        let waited = NoWait(Mutex::new(Vec::new()));
+        let deliver = Deliver::new(
+            &platform,
+            &rooms,
+            &clock,
+            &Hops,
+            &waited,
+            &subscriptions,
+            budget(),
+        );
+
+        deliver.once().await.expect("the platform answered");
+
+        let marks: Vec<Attempt> = rooms.sent().into_iter().map(|(_, _, _, a)| a).collect();
+        assert_eq!(marks, vec![Attempt::Replay; 5]);
     }
 }

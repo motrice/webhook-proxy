@@ -15,8 +15,8 @@ use std::time::Instant;
 use alertmanager_payload::AlertmanagerPayload;
 mod collecting;
 
-use application::ports::{Dispatcher, Handover, Outbox, Proofs, Translator};
-use application::{Backlog, Counts, Replay, Retention, Retries, Retry, Tally};
+use application::ports::{Dispatcher, Handover, Outbox, Proofs, Reoffered, Translator};
+use application::{Backlog, Counts, Retention, Retries, Retry, Tally};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
 use element_notices::ElementNotices;
@@ -303,61 +303,64 @@ async fn stored(config: &Config) -> Result<Stores, Unstartable> {
 
 /// Sends a past Delivery again, and says where it went.
 ///
-/// Reads the same routing file the process runs on, so a replay routes by the
-/// rules in force now — which is usually the point, because a replay happens
-/// after somebody changed something.
+/// Offers a stored Delivery to its tenant again, marked as a replay.
+///
+/// WHAT THIS USED TO DO, and why it changed: it re-sent a stored Dispatch
+/// itself. Routing left this service (bead gc-g9x), so there is no Dispatch to
+/// re-send and no room for this process to reach — what it has instead is the
+/// Delivery, which survives its report for a month, and a tenant whose agent
+/// will deliver it by the rules in force now. The outcome a person wanted is
+/// the same and the mechanism is not, which is worth knowing before reading
+/// the output.
+///
+/// IT STILL ARRIVES MARKED. Bead gc-6a5.3 decided that deliberately and the
+/// decision survives the change of mechanism: an alert arriving twice is how a
+/// responder learns something got worse, so a replay that looked like a retry
+/// would be a lie told by a tool. The flag travels with the claim, and the
+/// agent — not this process — puts `(replayed)` in the room.
+///
+/// NO TENANT IS ASKED FOR. The person running this has a Delivery identity out
+/// of a log line; making them find its tenant first would mean looking it up
+/// from the thing they are already holding. See `Handover::reoffer`, which is
+/// the only method on that port with no tenant and says why.
 async fn replay(id: &str) -> Result<String, Unstartable> {
     let config = Config::from_env();
-    let routing = configured(&config).await?;
 
     let delivery = DeliveryId::new(id)
         .map_err(|why| Unstartable::Configuration(format!("that is not a delivery: {why}")))?;
 
-    let dispatcher = ElementNotices::new(routing.webhooks().clone(), config.timeout)
-        .map_err(|_| Unstartable::NoClient)?;
-    // Only the outbox. A replay re-sends what this service already routed for
-    // itself; it owes a tenant nothing new, and offering the Delivery again
-    // would hand its agent a second copy of something already handed over.
-    let outbox = stored(&config).await?.outbox;
-    let clock = SystemClock;
-
-    let replay = Replay::new(
-        &dispatcher,
-        outbox.as_ref(),
-        &clock,
-        &RandomIds,
-        routing.subscriptions(),
-    );
-
-    let replayed = replay
-        .delivery(&delivery)
-        .await
-        .map_err(|why| Unstartable::Configuration(why.to_string()))?;
+    // Only the handover. Nothing here dispatches, reads a routing file or
+    // reaches a room: a replay is now one row changing its mind about being
+    // settled.
+    let handover = stored(&config).await?.handover;
 
     let mut said = String::new();
-    if replayed.reached.is_empty() && replayed.failed.is_empty() {
-        // Not a failure: the rules changed and nobody wants this any more.
-        // Said plainly, because "nothing happened" is the one outcome an
-        // operator is most likely to misread as success.
-        writeln!(
-            said,
-            "no rule selects that delivery any more; nothing was sent"
-        )
-        .expect("writing to a String cannot fail");
-        return Ok(said);
+    match handover
+        .reoffer(&delivery)
+        .await
+        .map_err(|why| Unstartable::Configuration(why.to_string()))?
+    {
+        Reoffered::Owed => {
+            writeln!(
+                said,
+                "offered again to its tenant, marked as a replay. Its agent \
+                 will deliver it by the rules in force now, which is usually \
+                 the point — and nothing here can say which rooms those are."
+            )
+            .expect("writing to a String cannot fail");
+        }
+        Reoffered::NotStored => {
+            // Not a failure, and said plainly: "nothing happened" is the one
+            // outcome an operator is most likely to misread as success.
+            writeln!(
+                said,
+                "nothing goes by that identity. Either it was never accepted, \
+                 or retention has already deleted it — one month from \
+                 acceptance, and the two are indistinguishable from here."
+            )
+            .expect("writing to a String cannot fail");
+        }
     }
-    for room in &replayed.reached {
-        writeln!(said, "sent again to {}", room.as_str()).expect("writing to a String cannot fail");
-    }
-    for room in &replayed.failed {
-        writeln!(
-            said,
-            "could not reach {}; stored and will be retried",
-            room.as_str()
-        )
-        .expect("writing to a String cannot fail");
-    }
-
     Ok(said)
 }
 
