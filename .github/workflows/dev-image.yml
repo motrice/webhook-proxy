@@ -1,0 +1,50 @@
+# The dev image, on every commit to main. Bead gc-6a1.
+#
+# WHY THIS EXISTS AT ALL: bead gc-kow rejected tag-only publishing as circular —
+# gc-d01 cannot deploy without an image, and nothing should be released that was
+# never deployed. So main publishes something deployable and tags publish
+# something released.
+#
+# WHAT IT DOES NOT DO is give that image a floating tag. publish-dev-container
+# tags `<version>-dev-<branch>-<sha>` and has no override, so there is no
+# `:main` to point a manifest at — which is why the committed manifest carries a
+# REPLACE image and this workflow's output is the digest an operator pins
+# (gc-6a1). A job of our own pushing `:main` was considered and rejected there.
+#
+# Pinned to the same SHA as pr.yml and release.yml.
+name: dev image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Superseded rather than queued, unlike a release: only the newest commit on
+  # main is worth an image, and a backlog of them would publish versions nobody
+  # asked for.
+  group: dev-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    uses: diggsweden/reusable-ci/.github/workflows/publish-dev-container.yml@997d7dc2238b40c79798fda309d8061b0707a3e5 # v3.0.0
+    permissions:
+      contents: read
+      packages: write
+    with:
+      container-file: deploy/Containerfile
+      target: runtime
+      # Deliberately empty, which is what keeps the published path
+      # `ghcr.io/motrice/webhook-proxy` rather than adding a `/webhook-proxy`
+      # subpath. Setting it would give each container its own Packages page,
+      # which is for multi-container repositories and this is not one.
+      name: ""
+      platforms: linux/amd64,linux/arm64
+      # Container-first: nothing is built outside the Containerfile, so none of
+      # the maven/npm/gradle download steps this gates should fire. It is a
+      # required input, so it is stated rather than omitted.
+      artifact-types: cargo
+      working-directory: .

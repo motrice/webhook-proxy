@@ -17,9 +17,20 @@ Bead gc-kow decided it: the release workflow publishes one container to
 built its own image would be a second path to something that looks identical, and
 the two diverge the first time only one of them is rebuilt.
 
-`deployment.yaml` names the `main` tag, rebuilt on every commit to `main`, with
-`imagePullPolicy: Always`. The copy of this manifest in the GitOps repository
-should pin a digest instead — a moving tag cannot be rolled back to.
+**`deployment.yaml` names an image that does not exist**, and that is
+deliberate (bead `gc-6a1`). It is shaped like what `dev-image.yml` publishes on
+every commit to `main` — `<version>-dev-main-<short sha>` — and marked `REPLACE`,
+because `publish-dev-container.yml` has no tag-override input and there is
+therefore no floating `:main` to point at. This manifest used to name one, which
+looked turnkey and was not.
+
+Two places to get the real coordinate: the `dev image` workflow run's summary,
+which prints the image and its digest, or a release tag. **Prefer the digest.**
+`imagePullPolicy: Always` on a moving tag means a pod restart silently changes
+version, which is the thing this paragraph used to warn about while the manifest
+beside it did it. The manifest now sets `IfNotPresent`, which is correct for an
+immutable reference and removes a registry round trip — and a dependency on the
+registry being reachable — from every pod start.
 
 ### While the repository is private
 
@@ -296,6 +307,14 @@ storage class and resources set, or its backup Jobs never complete.
 ```sh
 kubectl apply -k deploy/webhook-proxy
 ```
+
+**Replace the image first, or the pods will not start.** The committed value is
+not a real coordinate (see above), so an apply of this directory unedited gives
+`ImagePullBackOff` — loudly, which is the right failure: the alternative was a
+manifest that pulled a moving tag and changed version on a restart without
+anybody asking. `crates/app/tests/release.rs` checks that the registry path
+here is the one CI actually publishes to, so what needs replacing is the tag
+and nothing else.
 
 ## Proving it locally, before any image is published
 

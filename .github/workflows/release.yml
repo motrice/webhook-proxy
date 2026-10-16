@@ -1,0 +1,48 @@
+# Releases, on a tag. Bead gc-lw3; the artefact decision is gc-kow's and the
+# dev-image decision is gc-6a1's.
+#
+# diggsweden/reusable-ci is pinned to a tag's full commit SHA, not a moving ref,
+# and to THE SAME SHA as pr.yml — a release checked by one version of the policy
+# layer and published by another is two definitions of green. Update both
+# deliberately, in one commit:
+#   v3.0.0 = 997d7dc2238b40c79798fda309d8061b0707a3e5
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Queued rather than cancelled: a half-published release is worse than a slow
+  # one, and two tags pushed together must not race each other to the registry.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: diggsweden/reusable-ci/.github/workflows/release-orchestrator.yml@997d7dc2238b40c79798fda309d8061b0707a3e5 # v3.0.0
+    permissions:
+      contents: write # create the release and push the version bump
+      packages: write # push the image
+      id-token: write # OIDC, for the SLSA attestation
+      attestations: write # attach the SBOMs
+      actions: read # read the workflow for SLSA
+      pull-requests: read # read PR metadata for the changelog
+    with:
+      artifacts-config: .github/artifacts.yml
+    secrets:
+      # Mapped explicitly, one by one. v3.0.0 does not support
+      # `secrets: inherit`, and that is the better default: a workflow that
+      # inherited everything would hand every secret this repository holds to a
+      # third-party workflow, whether the release used it or not.
+      #
+      # Every one of these is optional upstream, so a missing secret is a
+      # release that fails at the step needing it rather than at the call.
+      # README.md lists what each is for and who can set it.
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+      RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+      RELEASE_GPG_PUBLIC_KEY: ${{ secrets.RELEASE_GPG_PUBLIC_KEY }}

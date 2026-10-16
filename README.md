@@ -410,6 +410,55 @@ nowhere to hide while neither job has to install the other's tools.
 It has no cargo build workflow, so it checks everything about a change except
 whether the code works — which is what our own gate job is for.
 
+**All three workflows pin the same commit**, and `crates/app/tests/release.rs`
+asserts it. A release checked by one version of the policy layer and published
+by another is two definitions of green, and the difference would surface as a
+release that passed every gate and shipped something the gates would now
+reject. Updating the pin belongs in one commit.
+
+### Publishing
+
+| Workflow | Fires on | Publishes |
+| -------- | -------- | --------- |
+| `dev-image.yml` | every commit to `main` | `ghcr.io/motrice/webhook-proxy:<version>-dev-main-<sha>` |
+| `release.yml` | a `v*` tag | the released image, with SLSA provenance, SBOMs and a GitHub release |
+
+One container and no binary (`gc-kow`): the only deployment target is a
+cluster, and an artefact with no audience still has to be signed, SBOM'd and
+patched. Both workflows build the same `runtime` stage of `deploy/Containerfile`
+for `linux/amd64` and `linux/arm64`, and `release.rs` asserts that too — two
+workflows building different stages would mean what is deployed from `main` is
+not what is released from a tag.
+
+**There is no floating `:main` tag.** `publish-dev-container.yml` has no
+tag-override input, so every dev image carries a commit sha. That is why
+`deploy/webhook-proxy/deployment.yaml` names a `REPLACE` image rather than a tag
+that exists — bead `gc-6a1` records the decision, and the deploy README says
+what to put there.
+
+### Secrets a release needs
+
+Repository secrets, settable only by someone with admin on the repository.
+Every one is optional upstream, so a missing secret is a release that fails at
+the step needing it rather than at the call — which is worse than failing early,
+and is why they are listed here.
+
+| Secret | For | Without it |
+| ------ | --- | ---------- |
+| `RELEASE_TOKEN` | creating the GitHub release and pushing the version-bump commit | the release cannot be created; `GITHUB_TOKEN` cannot push to a protected branch |
+| `RELEASE_GPG_PRIVATE_KEY` | signing the release artefacts and the tag | artefacts publish unsigned |
+| `RELEASE_GPG_PASSPHRASE` | unlocking that key | signing fails |
+| `RELEASE_GPG_PUBLIC_KEY` | verifying the signed tag | verification is skipped |
+
+The image itself needs no secret: `GITHUB_TOKEN` authenticates to `ghcr.io`.
+**Pulling it does**, while this repository is private — the GHCR package matches
+the repository's visibility, so a cluster needs the `ghcr-pull` secret
+`deploy/webhook-proxy/README.md` describes. That goes away when the repository
+goes public (`gc-rdz`).
+
+`CODE_SCANNING_TOKEN` is an organisation secret and is not mapped here: without
+it the Trivy scan still runs and its findings do not reach Code Scanning.
+
 ## Prerequisites
 
 ```bash

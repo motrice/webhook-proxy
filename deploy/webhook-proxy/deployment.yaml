@@ -75,15 +75,29 @@ spec:
         - name: ghcr-pull
       containers:
         - name: webhook-proxy
-          # Published by the release workflow (gc-lw3), never built here: gc-kow
-          # decided that a hand-built image would be a second path that diverges
-          # from the released one. `main` is the dev tag, rebuilt on every commit
-          # to main; the GitOps copy of this manifest pins a digest instead, which
-          # is what makes a rollback mean something.
-          image: ghcr.io/motrice/webhook-proxy:main
-          # Always, because `main` is a moving tag and any other policy would
-          # leave a node serving whatever it happened to pull first.
-          imagePullPolicy: Always
+          # REPLACE: a tag or digest that exists. Published by CI, never built
+          # here — gc-kow decided a hand-built image would be a second path that
+          # diverges from the released one.
+          #
+          # THE VALUE BELOW IS NOT A REAL IMAGE, and that is deliberate (bead
+          # gc-6a1). It is shaped like what `.github/workflows/dev-image.yml`
+          # actually publishes on every commit to main —
+          # `<version>-dev-<branch>-<short sha>` — because reusable-ci's dev
+          # publisher has no floating-tag override and there is therefore no
+          # `:main` to point at. This manifest used to name one, which looked
+          # turnkey and was not.
+          #
+          # Take the real coordinate from the dev-image run's output, or from a
+          # release tag. PREFER THE DIGEST: `imagePullPolicy: Always` on a moving
+          # tag means a pod restart silently changes version, which is the thing
+          # the README beside this warns about and this manifest used to do.
+          image: ghcr.io/motrice/webhook-proxy:0.0.0-dev-main-0000000
+          # IfNotPresent, now that the reference is immutable. Always was for a
+          # moving tag; with a digest or a dev tag carrying a commit sha there is
+          # nothing to re-resolve, and Always would only add a registry round
+          # trip to every pod start — and a dependency on the registry being up
+          # in order to restart.
+          imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -1,0 +1,36 @@
+# What a release produces. Required by release-orchestrator.yml, which takes
+# `artifacts-config` and refuses to run without it.
+#
+# ONE CONTAINER AND NO BINARY, which is bead gc-kow's decision: the only
+# deployment target is a Kubernetes cluster, nobody runs this from a tarball,
+# and an artefact with no audience still has to be signed, SBOM'd and patched.
+# `extract.binary` is therefore deliberately absent rather than merely unused.
+
+artifacts:
+  # Container-first: the Containerfile builds from source, so nothing is built
+  # here and handed to the container stage. `project-type: cargo` is what tells
+  # the orchestrator that.
+  - name: webhook-proxy
+    project-type: cargo
+    working-directory: .
+
+containers:
+  # THE NAME MUST MATCH THE REPOSITORY'S, and that is load-bearing rather than
+  # tidy. reusable-ci collapses the redundant `<repo>/<repo>` subpath only when
+  # a container's name equals the repository's short name, so this is what makes
+  # the published image `ghcr.io/motrice/webhook-proxy` rather than
+  # `ghcr.io/motrice/webhook-proxy/webhook-proxy`. The deployment manifests name
+  # the collapsed form, and crates/app/tests/release.rs checks the two agree.
+  - name: webhook-proxy
+    from: [webhook-proxy]
+    container-file: deploy/Containerfile
+    # The whole workspace: the Containerfile builds two binaries from one
+    # commit, and `.dockerignore` keeps the host's target/ out.
+    context: .
+    # Not the last stage. The Containerfile's last stage is `runtime`, but
+    # naming it means a stage added after it does not silently become the
+    # deployable image.
+    target: runtime
+    # Both, because this development cluster is arm64 under Lima while CI and
+    # anything production is amd64. Native runners per architecture, no QEMU.
+    platforms: linux/amd64,linux/arm64
