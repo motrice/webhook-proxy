@@ -245,3 +245,73 @@ fn the_dev_image_publishes_the_same_stage_as_a_release() {
         "dev-image.yml does not build the Containerfile the release builds"
     );
 }
+
+/// Every `Cargo.toml` in the workspace, with its path relative to the root.
+fn manifests() -> Vec<(String, String)> {
+    fn walk(at: &std::path::Path, found: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml") {
+                found.push((
+                    path.display().to_string(),
+                    std::fs::read_to_string(&path).expect("a readable manifest"),
+                ));
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates")),
+        &mut found,
+    );
+    assert!(
+        found.len() > 10,
+        "found {} manifests, which is fewer than this workspace has",
+        found.len()
+    );
+    found
+}
+
+#[test]
+fn every_crate_inherits_that_version_rather_than_declaring_its_own() {
+    // THE BUG THIS EXISTS FOR, and it was silent (bead gc-50x). reusable-ci's
+    // version bump SUBSTITUTES an existing `version` line inside
+    // `[workspace.package]`. This workspace had that section with no version
+    // key and a literal `version = "0.0.0"` in every crate, so the
+    // substitution matched nothing: a release would have tagged v0.1.0,
+    // committed a changelog, and left every crate at 0.0.0 — reporting 0.0.0
+    // at /api-info for ever, which is exactly what gc-4oo.6 read the version
+    // from the crate to prevent.
+    //
+    // ONLY THIS DIRECTION IS WORTH A TEST. A companion assertion that
+    // `[workspace.package]` still declares a version was written and then
+    // deleted: with members inheriting it, cargo refuses to load the workspace
+    // at all if it goes, so that test could not fail and would have been a
+    // guard in name only. What cargo does NOT catch is a crate declaring its
+    // own version again — added later, or copied from a sibling — which
+    // reintroduces the bug for itself alone and compiles perfectly.
+    let mut literal = Vec::new();
+    for (path, manifest) in manifests() {
+        let declares_literal = manifest.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("version")
+                && !line.starts_with("rust-version")
+                && !line.contains("workspace")
+        });
+        if declares_literal {
+            literal.push(path);
+        }
+    }
+
+    assert!(
+        literal.is_empty(),
+        "{literal:?} declare a version of their own instead of \
+         `version.workspace = true`, so a release would not bump them"
+    );
+}

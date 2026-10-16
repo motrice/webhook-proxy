@@ -27,6 +27,22 @@ members = [
 ]
 
 [workspace.package]
+# ONE VERSION FOR THE WHOLE WORKSPACE, and it has to live HERE rather than in
+# each crate. reusable-ci's version bump substitutes an existing `version` line
+# inside this section; with the line absent it matched nothing and a release
+# bumped nothing at all, silently — so a tag said v0.1.0 while /api-info went on
+# reporting 0.0.0 for ever. Bead gc-50x, found by running that substitution
+# against this file rather than reading it.
+#
+# Every member inherits with `version.workspace = true`, which
+# crates/app/tests/release.rs asserts: a crate with a literal version of its own
+# would not be bumped either, and nothing would say so until somebody read
+# /api-info after a release.
+#
+# 0.0.0 until the first real release. `api_info_moves_its_release_date_when_a_
+# version_is_actually_released` fails the moment this leaves 0.0.0 with
+# main.rs's RELEASED date unchanged, which is the tripwire that bug had disarmed.
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "EUPL-1.2"
