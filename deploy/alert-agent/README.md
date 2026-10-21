@@ -5,12 +5,27 @@ that are genuinely the tenant's — which alerts reach which room, and those
 rooms' URLs — and pulls everything else from the platform service. Bead
 `gc-72e`.
 
-**Nothing here delivers yet.** This directory carries the configuration file and
-its schema; the binary currently supports `check` and nothing else. Claiming,
-delivering and reporting arrive in `gc-72e.2`, and the manifests and the cutover
-that stops the platform delivering arrive in `gc-72e.3`. Until then the platform
-is still the thing that reaches your rooms, and deploying this would deliver
-every message twice.
+**This is the only thing that reaches your rooms.** The platform verifies a
+delivery and offers it to your team; it has no dispatcher, no outbox and no
+retry loop of its own (`gc-72e.3.2`). If this agent does not deliver an alert,
+nobody does.
+
+It has run in a cluster: the agent claims, delivers, reports
+`reached=N lost=N routed_to_nothing=N`, and a room receives exactly one copy per
+delivery.
+
+> **Know this before you rely on it:** a room this agent gives up on is recorded
+> in **this process's log and nowhere else** — there is no counter a monitoring
+> system can read, and `kubectl logs deploy/alert-agent` shows only the current
+> pod, so a restart erases the evidence. The sender was told `202` long before,
+> so every signal upstream stays green while a room goes quiet. Bead `gc-556`,
+> and it is the reason to treat this agent's log as a thing to ship somewhere
+> rather than to read on demand.
+
+This section said the opposite until bead `gc-uh0` — that nothing here delivered
+yet, and that deploying it would double every message. It was true when written
+and then stayed for a release after it stopped being true, which is worth
+knowing if you find a copy of it quoted somewhere else.
 
 ## What it is deliberately not
 
@@ -58,6 +73,8 @@ credential** (bead `gc-o61`): anyone holding it can post to that room, which is
 why rooms are *named* here and their URLs are not.
 
 That rendering pattern is the platform's intended one and, per
-`tenant/wallet-devops-docs-prod/docs/secrets.md`, is marked *"Unverified — needs
-a first-tenant trial run"*. This deployment would be its first real user, so
-expect `gc-72e.3` to find something there rather than to confirm it works.
+`tenant/wallet-devops-docs-prod/docs/secrets.md`, is still marked *"Unverified —
+needs a first-tenant trial run"*. This deployment is its first real user.
+Nothing in this repository has confirmed it works, and the cluster runs so far
+do not settle it either way — so expect to find something there rather than to
+have it confirmed.

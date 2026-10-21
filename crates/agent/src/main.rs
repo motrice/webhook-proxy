@@ -10,12 +10,17 @@
 //! agent's own mTLS identity at claim time, so a name here would be checked
 //! against nothing (bead gc-nkb). No database: it pulls, and it is stateless.
 //!
-//! IT RUNS, AND NOTHING STARTS IT YET. Claiming, delivering and reporting are
-//! here; the cutover that stops the platform delivering is bead gc-72e.3, and
-//! until that lands THE PLATFORM IS STILL DELIVERING TOO. Running this now
-//! means every room hears everything twice, so the run mode says so on the way
-//! up — loudly, because the only person who can reach it is someone starting it
-//! by hand, and that is exactly who needs telling.
+//! IT IS THE ONLY THING THAT REACHES A ROOM. The platform verifies a delivery
+//! and owes it to a tenant; bead gc-72e.3.2 removed its dispatcher, its outbox
+//! and its retry loop, so if this agent does not deliver an alert then nobody
+//! does. What a room saw, and what it was never told, is in this process's log
+//! and the counters beside it.
+//!
+//! This paragraph used to say the opposite — that the platform delivered too
+//! and running this would duplicate every message — and it stayed true for two
+//! beads and then false for one. Bead gc-o2x: the cost of leaving it was that
+//! an operator read it as the explanation for a loss that had a different cause
+//! entirely.
 
 mod platform;
 
@@ -111,16 +116,6 @@ fn check() -> Result<String, Unstartable> {
 async fn serve() -> Result<(), Unstartable> {
     let where_platform = std::env::var(PLATFORM).map_err(|_| Unstartable::Missing(PLATFORM))?;
     let routing = configured()?;
-
-    // LOUD, AND ON THE WAY UP. Until bead gc-72e.3 the platform delivers too,
-    // so anything started here duplicates every message. The only person who
-    // can see this is somebody starting it by hand, which is exactly who needs
-    // telling — and a warning that waited for the first delivery would arrive
-    // after the first duplicate.
-    tracing::warn!(
-        "the platform is still delivering to rooms as well (bead gc-72e.3 is \
-         the cutover), so every message this agent sends is a second copy"
-    );
 
     let platform = Platform::at(&where_platform, TIMEOUT)
         .map_err(|why| Unstartable::Configuration(why.to_string()))?;

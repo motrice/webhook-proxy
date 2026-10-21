@@ -89,6 +89,22 @@ bd ready -> claim -> worktree -> red/green/refactor -> just verify -> PR -> huma
    the devbase linters). CI composes the same two halves as two jobs, because
    they need different toolchains — one definition of green, checked twice.
 5. **You open the PR. A human merges it.** Always.
+6. **A bead that closes takes its forward references with it.** Prose that says
+   work *will* arrive — "delivering arrives in `gc-72e.2`", "until that lands the
+   platform still delivers" — is true when written and false the moment the bead
+   closes. Two such claims survived a release and were found in a live cluster
+   (`gc-o2x`, `gc-uh0`): one of them, printed on every start, read as the
+   explanation for a loss that had a different cause, which cost real debugging
+   time and taught an operator to distrust the only channel that agent's losses
+   have. So before closing a bead, grep the tree for its id and retire anything
+   written in the future tense about it.
+
+   **This is not mechanically checkable and that was tested, not assumed.** A
+   lint on "until `gc-…`" matches seven legitimate past-tense sentences — "there
+   were two until bead `gc-72e.3.2`" — and separating those from "until that
+   lands" is parsing English, not linting. A rule tuned to the exact phrases
+   that happened to go wrong would catch nothing new, which is the decorative
+   kind of test `gc-50x` deleted one of. The guard is this habit.
 
 ## Authority
 
