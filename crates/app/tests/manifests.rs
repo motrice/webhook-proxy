@@ -291,10 +291,21 @@ async fn the_probe_path_in_the_manifest_is_a_path_the_binary_answers() {
         .as_str()
         .expect("the readiness probe is an HTTP GET")
         .to_owned();
-    assert_eq!(
-        probe("livenessProbe")["path"].as_str(),
-        Some(path.as_str()),
-        "the two probes must agree, or one of them is testing nothing"
+    let alive = probe("livenessProbe")["path"]
+        .as_str()
+        .expect("the liveness probe is an HTTP GET")
+        .to_owned();
+
+    // THE TWO PROBES MUST DIFFER, and this assertion used to say the opposite
+    // — that they must agree, which was right while there was only one answer
+    // to give. Bead gc-28a split the questions: liveness answers from the
+    // process alone, because restarting will not reach a database that is down;
+    // readiness asks the store, because a pod that cannot store a delivery
+    // should not be in the Service. A manifest that pointed both at the same
+    // path would have thrown one of those away, silently.
+    assert_ne!(
+        path, alive,
+        "both probes ask the same question, so one of them is not being asked"
     );
 
     let (dir, file, secrets) = a_usable_configuration();
@@ -313,6 +324,17 @@ async fn the_probe_path_in_the_manifest_is_a_path_the_binary_answers() {
     let answer = reqwest::get(format!("http://{}{path}", running.operator))
         .await
         .expect("the binary answers the probe path");
+
+    // The liveness path too, on the same socket: two probes naming two paths is
+    // two chances for a manifest to name one the binary does not serve.
+    let living = reqwest::get(format!("http://{}{alive}", running.operator))
+        .await
+        .expect("the binary answers the liveness path");
+    assert!(
+        living.status().is_success(),
+        "{alive} answered {:?}",
+        living.status()
+    );
 
     // And not on the tenant-facing one, which is the whole reason the probe had
     // to move: a probe aimed there would get this 404 and hold every pod

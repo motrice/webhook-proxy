@@ -168,7 +168,14 @@ spec:
               value: info
           readinessProbe:
             httpGet:
-              path: /health
+              # /ready, NOT /health, and the difference is the whole of bead
+              # gc-28a: /health answers from the process alone, so a replica
+              # whose pool could not reach the database stayed Ready, kept its
+              # Endpoint and failed every request it was handed. /ready asks the
+              # store. With two replicas there is a healthy sibling to route to,
+              # which is what makes taking this pod out of the Service an
+              # improvement rather than a 503 turned into a refused connection.
+              path: /ready
               # THE OPERATOR PORT, because that is where /health answers now
               # (bead gc-wdt). The number rather than the `operator` name, in
               # every place, so the manifest test can compare them — and that
@@ -176,8 +183,17 @@ spec:
               # /health is a 404 and every pod would be permanently unready.
               port: 9090
             periodSeconds: 5
+            # Shorter than the process's own two-second bound on asking the
+            # store, so an unreachable database shows up as a probe that FAILED
+            # rather than one that timed out. The kubelet treats both as
+            # unready; a human reading the events does not.
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
+              # /health, which is process-only on purpose. Restarting will not
+              # reach a database that is down, and a dependency failure that
+              # turned into a restart loop would replace a recoverable outage
+              # with a pod that is never up long enough to recover.
               path: /health
               port: 9090
             periodSeconds: 10

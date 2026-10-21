@@ -84,6 +84,16 @@ impl PostgresHandover {
 }
 
 /// Columns every read needs, with the moment already in milliseconds.
+/// How long `reachable` waits for the database to say something.
+///
+/// Shorter than any probe that will read it: the readiness probe in
+/// deployment.yaml carries its own `timeoutSeconds`, and a process-side bound
+/// that was longer would make the probe's timeout the one that fires — which
+/// looks like a slow pod rather than an unusable store. Two seconds is long
+/// enough that a busy pool is not called unready and short enough that nobody
+/// waits on it.
+const READINESS_BOUND: core::time::Duration = core::time::Duration::from_secs(2);
+
 const COLUMNS: &str = "delivery, tenant, origin, events, trace, span, state, replayed, \
      (EXTRACT(EPOCH FROM accepted_at) * 1000)::BIGINT AS accepted_at_ms";
 
@@ -126,6 +136,29 @@ fn offered(row: &sqlx::postgres::PgRow) -> Result<Offered, StorageUnavailable> {
 
 #[async_trait]
 impl Handover for PostgresHandover {
+    /// One trivial statement, bounded, on a connection from the pool.
+    ///
+    /// BOUNDED IS THE POINT (bead gc-28a). A readiness probe that waited as
+    /// long as the pool's own acquire timeout would turn an unreachable
+    /// database into a probe that times out rather than one that fails, and the
+    /// kubelet reads those the same way only if the probe's own timeout is
+    /// shorter — which is a coupling in a manifest nobody would notice. So the
+    /// bound is here, in the process, and it is well under the probe's.
+    ///
+    /// `SELECT 1` rather than a pool metric: a pool reports connections it has
+    /// not used since the network went away, so a count would answer from
+    /// memory. This asks the database to say something.
+    async fn reachable(&self) -> Result<(), StorageUnavailable> {
+        tokio::time::timeout(READINESS_BOUND, sqlx::query("SELECT 1").execute(&self.pool))
+            .await
+            // The timeout and the error are the same answer: not usable now.
+            // Neither carries an address or a password, which gc-b0n required
+            // of everything this type says.
+            .map_err(|_| StorageUnavailable)?
+            .map(|_| ())
+            .map_err(|_| StorageUnavailable)
+    }
+
     async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
         // One statement, so there is no half-written row to reason about. The
         // Events go in together for the reason the migration gives.
@@ -431,7 +464,8 @@ fn written_report(report: &Report) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use application::ports::{
-        Discharged, DispatchFailed, Handover, Offered, Reoffered, Report, RoomOutcome, TenantId,
+        Discharged, DispatchFailed, Handover, Offered, Reoffered, Report, RoomOutcome,
+        StorageUnavailable, TenantId,
     };
     use domain::{
         BranchName, Commit, CommitId, Correlation, DeliveryId, Event, OriginId, Pusher,
@@ -463,6 +497,56 @@ mod tests {
             _database: database,
             handover,
         }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_answers_is_reachable_and_one_that_cannot_be_reached_is_not() {
+        // BEAD gc-28a, and this is where the behaviour actually lives: the
+        // acceptance test can only reach the memory store, which is reachable
+        // by construction, and a binary pointed at a dead database never
+        // finishes starting (gc-6b7) so there is nothing to ask.
+        let store = handover().await;
+        assert_eq!(store.handover.reachable().await, Ok(()));
+
+        // A pool that was never connected, pointed at an address in the range
+        // reserved for documentation, which nothing routes. `connect_lazy` is
+        // what makes this testable: it builds the pool without asking anything,
+        // exactly as a pool whose database has gone away behaves afterwards.
+        let gone = PostgresHandover::using(
+            sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(core::time::Duration::from_secs(30))
+                .connect_lazy("postgres://nobody@203.0.113.1:5432/nothing")
+                .expect("a lazy pool asks nothing yet"),
+        );
+        assert_eq!(
+            gone.reachable().await,
+            Err(StorageUnavailable),
+            "a store nothing answers on reported itself usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn reachability_is_bounded_well_inside_a_probe() {
+        // The acquire timeout above is thirty seconds; the answer must not take
+        // that long. A readiness probe carries its own timeout, and a process
+        // that let the pool's bound win would turn "unusable store" into
+        // "slow pod" — the kubelet treats them alike, a human reading the
+        // events does not.
+        let gone = PostgresHandover::using(
+            sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(core::time::Duration::from_secs(30))
+                .connect_lazy("postgres://nobody@203.0.113.1:5432/nothing")
+                .expect("a lazy pool asks nothing yet"),
+        );
+
+        let began = std::time::Instant::now();
+        assert_eq!(gone.reachable().await, Err(StorageUnavailable));
+        let took = began.elapsed();
+
+        assert!(
+            took < core::time::Duration::from_secs(5),
+            "readiness took {took:?}, which is the pool's bound rather than its own"
+        );
     }
 
     fn at(millis: i64) -> Timestamp {

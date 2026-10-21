@@ -187,7 +187,7 @@ never a path.** So the process draws it, with a second socket:
 | Port | Served there | Who may reach it |
 | ---- | ------------ | ---------------- |
 | `8080` | `/webhook/{origin}`, `/deliveries/*` | the Gateway, and every namespace labelled as running an agent |
-| `9090` | `/metrics`, `/health`, `/api-info` | the scraper's namespace, and the kubelet |
+| `9090` | `/metrics`, `/health`, `/ready`, `/api-info` | the scraper's namespace, and the kubelet |
 
 One rule decides which socket a new path belongs on: **the operator port carries
 everything that is neither the public webhook nor the tenant hand-off.** There is
@@ -198,6 +198,27 @@ this is a breaking change.** `/health` and `/metrics` moved off `8080`, so
 anything pointed at `http://webhook-proxy.webhook-proxy.svc:8080/health` now
 gets a `404` — including a health script in another repository. Point it at
 `:9090`.
+
+**The two probes ask two different questions** (bead `gc-28a`), and the manifest
+test refuses a manifest that points them at the same path:
+
+- **`livenessProbe` → `/health`.** The process alone. Restarting will not reach
+  a database that is down, and a dependency failure that turned into a restart
+  loop would replace a recoverable outage with a pod that is never up long
+  enough to recover.
+- **`readinessProbe` → `/ready`.** Asks the delivery store, bounded at two
+  seconds in the process with `timeoutSeconds: 3` outside it, so an unreachable
+  database reads as a probe that failed rather than a pod that is slow. A
+  replica whose pool cannot reach the database used to answer `ok`, stay Ready,
+  keep its Endpoint and fail every request it was handed — half of everything,
+  intermittently, behind a green probe. The value of removing it from the
+  Service appears exactly when there is a healthy sibling, which `replicas: 2`
+  is; a single pod with a dead database is still the only pod, and a `503` is no
+  worse than a refused connection.
+
+A deployment with no database stays Ready throughout: the memory store is
+reachable by construction, which keeps the shape `gc-f7t` calls supported
+working as it did.
 
 Both probes name `9090` for the same reason. A probe left on `8080` would get
 the `404` and hold every pod permanently unready, which is the one way this

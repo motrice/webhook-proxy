@@ -295,6 +295,11 @@ mod tests {
 
     #[async_trait]
     impl Handover for Owed {
+        async fn reachable(&self) -> Result<(), StorageUnavailable> {
+            // A fake with nothing to reach.
+            Ok(())
+        }
+
         async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
             if !self.available {
                 return Err(StorageUnavailable);

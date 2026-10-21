@@ -185,6 +185,11 @@ mod tests {
 
     #[async_trait]
     impl Handover for Store {
+        async fn reachable(&self) -> Result<(), StorageUnavailable> {
+            // A fake with nothing to reach.
+            Ok(())
+        }
+
         async fn offer(&self, _offered: &Offered) -> Result<(), StorageUnavailable> {
             unreachable!("retention never offers")
         }

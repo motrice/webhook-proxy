@@ -109,6 +109,15 @@ impl Handover for MemoryHandover {
             .collect())
     }
 
+    /// Always, and it is true of this store rather than unexamined (bead
+    /// gc-28a): there is nothing to reach. A pod holding deliveries in memory
+    /// can serve every request it is sent; what it cannot do is share them with
+    /// a second replica, which is a different problem with its own answer
+    /// (gc-f7t prints it at startup, gc-wm8 would export it).
+    async fn reachable(&self) -> Result<(), StorageUnavailable> {
+        Ok(())
+    }
+
     async fn claim(
         &self,
         tenant: &TenantId,

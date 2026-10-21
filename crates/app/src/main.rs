@@ -17,6 +17,7 @@ mod collecting;
 
 use application::ports::{Handover, Proofs, Reoffered, Translator};
 use application::{Backlog, Outcomes, Retention};
+use axum::http::StatusCode;
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
 use github_payload::GithubPayload;
@@ -587,13 +588,100 @@ fn escaped(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Liveness and readiness for k3s probes.
+/// Liveness. The process is running and its own machinery answers.
 ///
 /// Deliberately answers from the process alone: a probe that depended on the
 /// destination being reachable would restart a healthy proxy every time a chat
 /// server hiccupped.
+///
+/// THAT ARGUMENT IS LIVENESS'S AND IT KEEPS IT (bead gc-28a). It did not cover
+/// the database and it did not cover readiness, which is a different question —
+/// `ready` below asks it. Restarting will not reach a database that is down, so
+/// the store must never appear here: a dependency failure that turned into a
+/// restart loop would replace a recoverable outage with a pod that is never up
+/// long enough to recover.
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Readiness. Whether this pod can do the work, which means its store answering.
+///
+/// WHAT THIS FIXES (bead gc-28a): a replica whose pool cannot reach the database
+/// used to answer "ok", stay Ready, keep its Endpoint and take its share of
+/// traffic from the Service — and fail every request it got. A sender that was
+/// going to be told `202` is told `503`, an agent's claim is handed nothing, and
+/// a report cannot settle. With two replicas that is half of everything,
+/// intermittently, behind a green probe.
+///
+/// Kubernetes already knows what to do about a pod that cannot serve: take it
+/// out of the Service until it can. This process used to decline to say so.
+///
+/// THE VALUE APPEARS EXACTLY WHEN THERE IS A HEALTHY SIBLING. At one replica,
+/// removing the only pod turns a `503` into a connection refused, which is no
+/// better — and the memory store is reachable by construction, so the
+/// no-database shape gc-f7t calls supported stays Ready throughout.
+///
+/// The destination stays out of this as much as out of liveness: an unreachable
+/// room is the agent's problem, in another namespace, and it is counted
+/// (gc-556).
+async fn ready(handover: &dyn Handover) -> (StatusCode, &'static str) {
+    if handover.reachable().await.is_ok() {
+        (StatusCode::OK, "ready")
+    } else {
+        // No address, no credential, no driver text: `StorageUnavailable`
+        // carries none (gc-b0n), and a probe's body is read by anybody who can
+        // reach the port. What it is NOT is silence — this log line says the
+        // same thing where an operator will find it after the fact.
+        // THE LOG CARRIES THE REASON AND THE RESPONSE DOES NOT. A probe reads a
+        // status code, so a body buys nothing here — and declaring one in
+        // docs/openapi.yaml would make it this interface's first error with a
+        // schema, which brings RAP-LP's FEL.02 (errors SKALL be
+        // application/problem+json) to bear on a readiness endpoint while every
+        // other error in the spec has no body at all. Whether this API adopts
+        // RFC 9457 is bead gc-4oo.2's to decide, not this bead's to pre-empt.
+        tracing::warn!("not ready: the delivery store is not answering");
+        (StatusCode::SERVICE_UNAVAILABLE, "")
+    }
+}
+
+/// The surface the cluster's own machinery reaches, and no tenant.
+///
+/// Assembled here rather than in `run` so that what belongs on this socket is
+/// one list in one place: everything that is neither the public webhook nor the
+/// tenant hand-off (bead gc-wdt). A path added to the wrong router is a path
+/// served to every tenant, which is not the sort of mistake that should depend
+/// on reading a long function.
+///
+/// One rule, so there is nothing to judge when a path is added. What is here is
+/// reachable by whoever the `NetworkPolicy` admits to this port — Prometheus and
+/// the kubelet — and what is on the other router is reachable by every tenant.
+/// `/health` and `/ready` are here rather than beside the hand-off because they
+/// answer a machine that reaches the pod directly; `deployment.yaml`'s probes
+/// name this port, and `crates/app/tests/manifests.rs` refuses a probe that
+/// names the other one.
+fn operators(
+    backlog: Arc<Backlog>,
+    outcomes: Arc<Outcomes>,
+    handover: Arc<dyn Handover>,
+) -> axum::Router {
+    axum::Router::new()
+        .route("/health", get(health))
+        .route(
+            "/ready",
+            get(move || {
+                let handover = Arc::clone(&handover);
+                async move { ready(handover.as_ref()).await }
+            }),
+        )
+        .route("/api-info", get(api_info))
+        .route(
+            "/metrics",
+            get(move || {
+                let backlog = Arc::clone(&backlog);
+                let outcomes = Arc::clone(&outcomes);
+                async move { exported(&backlog, &outcomes) }
+            }),
+        )
 }
 
 /// When this version of the interface was published.
@@ -850,35 +938,17 @@ async fn run() -> Result<(), Unstartable> {
     let backlog = Arc::new(Backlog::new());
     let reaped = reaping(Arc::clone(&handover), Arc::clone(&backlog), REAP_EVERY);
 
-    let counted = Arc::clone(&backlog);
-    let told = Arc::clone(&outcomes);
-
     // WHAT EVERY TENANT MAY REACH, and nothing else (bead gc-wdt): the senders'
     // webhook, and the hand-off the agents authenticate themselves to.
     let app = router(inbound, config.max_body).merge(collecting::routes(collecting));
 
-    // WHAT THE CLUSTER'S OWN MACHINERY REACHES. One rule, so there is nothing to
-    // judge when a path is added: this socket carries everything that is neither
-    // the public webhook nor the tenant hand-off. A path put here is reachable by
-    // whoever the NetworkPolicy lets reach this port, which is Prometheus and the
-    // kubelet; a path put there is reachable by every tenant.
-    //
-    // /health moves with it rather than staying: it answers a machine that
-    // reaches the pod directly, and after this it is the only thing on this
-    // socket a tenant could have wanted. The probe in deployment.yaml names this
-    // port, and crates/app/tests/manifests.rs refuses a probe that names the
-    // other one.
-    let operator = axum::Router::new()
-        .route("/health", get(health))
-        .route("/api-info", get(api_info))
-        .route(
-            "/metrics",
-            get(move || {
-                let counted = Arc::clone(&counted);
-                let told = Arc::clone(&told);
-                async move { exported(&counted, &told) }
-            }),
-        );
+    // WHAT THE CLUSTER'S OWN MACHINERY REACHES, on its own socket (bead gc-wdt),
+    // and never anything a tenant may knock on.
+    let operator = operators(
+        Arc::clone(&backlog),
+        Arc::clone(&outcomes),
+        Arc::clone(&handover),
+    );
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await

@@ -28,6 +28,11 @@ sqlx = { version = "0.8", default-features = false, features = [
   "macros",
 ] }
 serde_json = "1"
+# For one timeout: `reachable` bounds its own question so a readiness probe
+# cannot be left waiting on the pool's much longer one (bead gc-28a). The
+# runtime itself is still the composition root's to choose — this asks for
+# `time` and nothing else.
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

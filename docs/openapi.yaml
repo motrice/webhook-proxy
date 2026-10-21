@@ -318,6 +318,42 @@ paths:
                 apiDocumentation: https://github.com/motrice/webhook-proxy/blob/main/docs/sending-to-this-proxy.md
                 apiStatus: beta
 
+  /ready:
+    get:
+      summary: Whether this pod can do the work.
+      description: |
+        Asks the delivery store whether it answers, bounded in the process. A
+        pod whose store cannot be reached can do none of this interface's work —
+        a push that would have been accepted is refused, and a team's agent is
+        handed nothing — so it should be taken out of the Service until it can,
+        which is what this tells the orchestrator.
+
+        Separate from /health, which is liveness and answers from the process
+        alone. Restarting does not reach a store that is down. On the operator
+        port, like /health.
+      operationId: ready
+      security: []
+      responses:
+        "200":
+          description: The store answers; this pod can serve.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: |
+            The store is not answering, so this pod should be taken out of the
+            Service. No body: the reason is in the process's log, where an
+            operator can find it afterwards, and a probe reads a status code.
+
+            DECLARING A BODY HERE WOULD BE THIS SPECIFICATION'S FIRST, and it
+            would make RAP-LP's FEL.02 apply — error responses SKALL use
+            application/problem+json. Every error in this interface describes
+            itself and carries no declared schema, so adopting RFC 9457 for one
+            readiness endpoint while 401, 404, 413 and 415 have none would be
+            incoherent. Whether this API adopts it at all belongs to bead
+            gc-4oo.2, which decided area by area what this proxy follows.
+
   /metrics:
     get:
       summary: What each room was told, for a scraper.
