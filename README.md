@@ -47,24 +47,31 @@ follows from it:
   verification succeeds. A destination failing afterwards must not turn into
   a 5xx, because the sender would retry and re-deliver to the destinations that
   already succeeded.
-- **Each room's traffic is counted separately.** Three numbers per destination —
-  `delivered`, `retrying`, `abandoned` — because the question anybody asks is
-  *which* room, and a single total says a thousand messages went somewhere.
+- **Each room's traffic is counted separately.** Two numbers per room —
+  `delivered` and `abandoned`, the latter also by reason — because the question
+  anybody asks is *which* room, and a single total says a thousand messages went
+  somewhere.
   `delivered` is what a reader in that room actually saw — **messages, not
   alerts**: a sender that groups twenty alerts into one notification produces
   one message per room, so this counts what landed in the room rather than how
   many facts it carried. `abandoned` is a loss.
-  `retrying` counts **attempts, not messages**: a destination that is down shows
-  a number that keeps climbing, which is the signal, so it is not a backlog
-  length and does not subtract into anything. The arithmetic that *is* right is
-  `delivered + abandoned` = what has finished; anything else is still waiting.
+  The arithmetic that is right is `delivered + abandoned` = what a team has
+  reported finishing; anything else is still waiting, and what is waiting is
+  counted per team rather than per room — this service does not know a team's
+  rooms until that team tells it.
   Nothing here can hold an address or a secret: a destination is a name, and
   where it lives belongs to the adapter that reaches it.
 
   They are scraped from `/metrics` on the pod's own port, in Prometheus's text
-  format, as `webhook_proxy_dispatches_delivered_total`,
-  `webhook_proxy_dispatch_attempts_retried_total` and
-  `webhook_proxy_dispatches_abandoned_total`, each labelled by `destination`.
+  format, as `webhook_proxy_room_delivered_total{tenant,room}` and
+  `webhook_proxy_room_abandoned_total{tenant,room,reason}` — **counted from each
+  team's own reports and not from anything this service observed**, because the
+  agent that reaches a room runs in that team's namespace with no scrape
+  endpoint of its own by design (beads `gc-72e`, `gc-556`). The honest
+  consequences: a loss an agent never manages to report is not counted (its
+  delivery is offered again, so the work survives and that attempt's record does
+  not), and the numbers are as current as the last report. Attempts within a
+  budget are counted nowhere central; they are in that agent's log.
   Like `/health`, it is **not published through the ingress**: both answer a
   machine that reaches the pod directly, and publishing either would say more
   about an internal service than anyone outside should be able to ask. A scrape

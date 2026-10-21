@@ -14,6 +14,7 @@
 mod backlog;
 mod collect;
 mod deliver;
+mod outcomes;
 pub mod ports;
 mod relay;
 mod retention;
@@ -21,5 +22,6 @@ mod retention;
 pub use backlog::{Backlog, Outstanding};
 pub use collect::{Collect, Refused as NotCollected};
 pub use deliver::{Deliver, Delivered, Retry, idle_for};
+pub use outcomes::Outcomes;
 pub use relay::{Refused, Relay, Relayed};
 pub use retention::{Reaped, Retention};

@@ -225,7 +225,11 @@ impl<'a> Deliver<'a> {
                 Err((why, spent)) => {
                     done.lost
                         .push((delivery.clone(), destination.id().clone(), why, spent));
-                    outcomes.push((destination.id().clone(), RoomOutcome::Abandoned));
+                    // The same reason the log line carries, reported onward so
+                    // the platform can count it (bead gc-556). This agent has
+                    // no scrape endpoint by design, so a loss counted only here
+                    // is a loss no monitoring system can see.
+                    outcomes.push((destination.id().clone(), RoomOutcome::Abandoned(why)));
                 }
             }
         }
@@ -687,12 +691,22 @@ mod tests {
         assert_eq!(done.lost[0].3, 5, "the loss does not say what it cost");
         // Reported as abandoned rather than withheld: the platform's obligation
         // is discharged, and the loss is this agent's to log.
+        //
+        // WITH THE REASON, and the same one the log line carries (bead gc-556).
+        // The platform counts losses by reason, so a report that said only
+        // "abandoned" would have cost the distinction between a room that
+        // refused and a room that was never reached.
         assert_eq!(
             platform.reported()[0].1,
             Report::Reached(vec![(
                 DestinationId::new("team-room").expect("an identity"),
-                RoomOutcome::Abandoned
+                RoomOutcome::Abandoned(DispatchFailed::Rejected)
             )])
+        );
+        assert_eq!(
+            done.lost[0].2,
+            DispatchFailed::Rejected,
+            "the log and the report disagree about why"
         );
     }
 

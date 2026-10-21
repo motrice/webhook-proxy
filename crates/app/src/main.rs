@@ -16,7 +16,7 @@ use alertmanager_payload::AlertmanagerPayload;
 mod collecting;
 
 use application::ports::{Handover, Proofs, Reoffered, Translator};
-use application::{Backlog, Retention};
+use application::{Backlog, Outcomes, Retention};
 use axum::routing::get;
 use domain::{DeliveryId, Verification};
 use github_payload::GithubPayload;
@@ -425,18 +425,22 @@ fn reaping(
 /// monitoring system polling every fifteen seconds would otherwise become load
 /// on the thing it is monitoring, and would go quiet exactly when the database
 /// is in trouble — which is when somebody is looking.
-fn exported(backlog: &Backlog) -> String {
+fn exported(backlog: &Backlog, told: &Outcomes) -> String {
     let mut out = String::new();
 
-    // KEYED BY TENANT, AND THERE IS NOTHING KEYED BY ROOM ANY MORE. This
-    // service used to count what each room was sent; it does not reach a room
-    // now, and a tenant's agent does — in another namespace, with no scrape
-    // endpoint of its own by design (bead gc-72e). So what a room saw is in
-    // that agent's log and nowhere else, which gc-g9x accepted when it deferred
-    // the read API: the loss line is the deliverable.
+    // KEYED BY ROOM AGAIN, BUT ON SOMEBODY ELSE'S WORD. This service does not
+    // reach a room — a tenant's agent does, in another namespace, with no
+    // scrape endpoint of its own by design (bead gc-72e) — so what a room saw
+    // is counted here from the reports that already cross the wire, and not
+    // observed here (bead gc-556). Two honest consequences: a loss an agent
+    // never manages to report is not counted, and the count is as current as
+    // that tenant's last report.
     //
-    // Nothing here is a room name, an address or a secret: a tenant is a
-    // namespace, and the numbers are a count and a moment.
+    // A ROOM NAME IS NOT A ROOM ADDRESS, which is why this is sayable at all: a
+    // `Destination` is a name with no address by construction, the URL lives in
+    // the tenant's own namespace, and this process never learns one. So nothing
+    // here is an address or a secret — a tenant is a namespace, a room is a
+    // name its tenant chose, and the numbers are counts and a moment.
     writeln!(
         out,
         "# HELP webhook_proxy_uncollected_dropped_total Alerts deleted by retention \
@@ -480,6 +484,51 @@ fn exported(backlog: &Backlog) -> String {
             writeln!(out, "{name}{{tenant=\"{}\"}} {value}", escaped(&tenant))
                 .expect("writing to a String cannot fail");
         }
+    }
+
+    // THE ONE LINE AN ALERT CAN BE WRITTEN AGAINST WITHOUT KNOWING WHICH ROOMS
+    // EXIST, and the reason it is here at zero rather than only when something
+    // has been lost: a rule on a series that does not exist yet never fires, so
+    // the first loss in a fresh pod would be the one nobody is paged for.
+    writeln!(
+        out,
+        "# HELP webhook_proxy_room_abandoned_total Dispatches a tenant's agent \
+         spent its whole retry budget on and did not deliver. These are losses."
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(out, "# TYPE webhook_proxy_room_abandoned_total counter")
+        .expect("writing to a String cannot fail");
+    writeln!(out, "webhook_proxy_room_abandoned_total {}", told.losses())
+        .expect("writing to a String cannot fail");
+    for ((tenant, room, why), count) in told.abandoned() {
+        writeln!(
+            out,
+            "webhook_proxy_room_abandoned_total{{tenant=\"{}\",room=\"{}\",reason=\"{why}\"}} {count}",
+            escaped(&tenant),
+            escaped(&room)
+        )
+        .expect("writing to a String cannot fail");
+    }
+
+    // The denominator. An absolute number of losses says nothing on its own: a
+    // tenant sending thousands an hour and a tenant sending one a week want
+    // very different thresholds, and a ratio needs both halves (bead gc-556).
+    writeln!(
+        out,
+        "# HELP webhook_proxy_room_delivered_total Dispatches a tenant's agent \
+         reported as accepted by the room."
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(out, "# TYPE webhook_proxy_room_delivered_total counter")
+        .expect("writing to a String cannot fail");
+    for ((tenant, room), count) in told.delivered() {
+        writeln!(
+            out,
+            "webhook_proxy_room_delivered_total{{tenant=\"{}\",room=\"{}\"}} {count}",
+            escaped(&tenant),
+            escaped(&room)
+        )
+        .expect("writing to a String cannot fail");
     }
 
     out
@@ -741,10 +790,18 @@ async fn run() -> Result<(), Unstartable> {
     // about them is a webhook. What authenticates them is the service mesh, and
     // `collecting`'s own documentation says what that assumption costs if it
     // does not hold.
+    // What each room was told, shared: the report path writes it and the scrape
+    // reads it. In this process because the tenant agents that learn these
+    // outcomes have no scrape endpoint and bead gc-72e forbade them one, so an
+    // abandoned dispatch was visible in one pod's log and nowhere else — and
+    // gone with that pod (bead gc-556).
+    let outcomes = Arc::new(Outcomes::new());
+
     let collecting = collecting::Collecting::new(
         Arc::clone(&handover),
         Arc::new(SystemClock),
         routing.tenants().clone(),
+        Arc::clone(&outcomes),
     );
 
     // One backlog, shared: the retention task writes it and the scrape reads it.
@@ -755,6 +812,7 @@ async fn run() -> Result<(), Unstartable> {
     let reaped = reaping(Arc::clone(&handover), Arc::clone(&backlog), REAP_EVERY);
 
     let counted = Arc::clone(&backlog);
+    let told = Arc::clone(&outcomes);
     let app = router(inbound, config.max_body)
         .merge(collecting::routes(collecting))
         .route("/health", get(health))
@@ -763,7 +821,8 @@ async fn run() -> Result<(), Unstartable> {
             "/metrics",
             get(move || {
                 let counted = Arc::clone(&counted);
-                async move { exported(&counted) }
+                let told = Arc::clone(&told);
+                async move { exported(&counted, &told) }
             }),
         );
 

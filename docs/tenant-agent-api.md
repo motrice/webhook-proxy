@@ -126,6 +126,17 @@ POST /deliveries/{delivery}/report
 { "outcome": "reached", "rooms": [{ "room": "devsecops-room", "outcome": "delivered" }] }
 ```
 
+or, for a room that was given up on:
+
+```json
+{
+  "outcome": "reached",
+  "rooms": [
+    { "room": "devsecops-room", "outcome": "abandoned", "reason": "unreachable" }
+  ]
+}
+```
+
 or
 
 ```json
@@ -133,8 +144,8 @@ or
 ```
 
 - `204` when it was outstanding for this tenant and now is not.
-- `400` when the report is not one of the two shapes above, or when
-  `rooms` is empty.
+- `400` when the report is not one of the shapes above, when `rooms` is empty,
+  or when an `abandoned` room carries no `reason` or an unrecognised one.
 - `404` when nothing outstanding for this caller goes by that identity. **One
   answer for three cases** — another tenant's Delivery, one already reported,
   one that never existed — because a caller that could tell them apart could ask
@@ -145,6 +156,17 @@ or
 go on offering the Delivery. Room `outcome` is `delivered` or `abandoned`; there
 is no "still trying", because an agent that has not finished has not reported and
 the lease covers that gap.
+
+**`abandoned` requires a `reason`**, one of `rejected`, `intercepted`,
+`unreachable` or `timed_out`, and the whole report is refused without one or
+with any other word (bead `gc-556`). Required rather than optional because the
+platform counts losses by reason and the four are not interchangeable to whoever
+acts on one: `rejected` is a configuration problem in the tenant's own repo,
+`unreachable` is the network, and `intercepted` means something answered on the
+room's behalf and the room never saw it. An unknown spelling is **refused rather
+than bucketed**: an "other" bucket would absorb a spelling the two sides stopped
+agreeing about and keep counting, which is how a metric becomes something nobody
+trusts.
 
 **`routed_to_nothing` is a named outcome and not an empty room list.** A tenant
 whose rules match no room must be able to say so, or the platform's queue never
@@ -160,7 +182,8 @@ again.
 
 **Neither side may give up on the other's behalf.** There is no verb for it in
 either direction. An agent that exhausts its retry budget reports `abandoned` —
-a loss it logs and counts where it happened. A tenant that stops collecting
+a loss it logs, and one the platform counts from that report, because this pod
+has no scrape endpoint of its own by design (beads `gc-72e`, `gc-556`). A tenant that stops collecting
 leaves its Deliveries offered, and the platform counts and logs their age rather
 than inventing a terminal state it cannot justify (bead `gc-g9x`; the count is
 bead `gc-wcw.3`).

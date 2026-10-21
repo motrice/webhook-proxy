@@ -140,13 +140,27 @@ fn written(report: &Report) -> Value {
             "outcome": "reached",
             "rooms": rooms
                 .iter()
-                .map(|(room, outcome)| json!({
-                    "room": room.as_str(),
-                    "outcome": match outcome {
-                        RoomOutcome::Delivered => "delivered",
-                        RoomOutcome::Abandoned => "abandoned",
-                    },
-                }))
+                .map(|(room, outcome)| match outcome {
+                    RoomOutcome::Delivered => json!({
+                        "room": room.as_str(),
+                        "outcome": "delivered",
+                    }),
+                    // WHY, not just THAT. The platform turns this into a
+                    // counter labelled by reason (bead gc-556), because the
+                    // four are not interchangeable to whoever acts on one — a
+                    // room that refused needs a configuration change, a room
+                    // that was never reached needs the network looked at.
+                    //
+                    // The spelling is the reason's own (`DispatchFailed::
+                    // spelled`), shared with the stored row and with the
+                    // platform's metric label, so a reason cannot be one word
+                    // on the wire and another in the database.
+                    RoomOutcome::Abandoned(why) => json!({
+                        "room": room.as_str(),
+                        "outcome": "abandoned",
+                        "reason": why.spelled(),
+                    }),
+                })
                 .collect::<Vec<_>>(),
         }),
     }
@@ -352,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_report_is_written_the_way_the_platform_reads_it() {
-        use application::ports::{Report, RoomOutcome};
+        use application::ports::{DispatchFailed, Report, RoomOutcome};
         use domain::DestinationId;
 
         assert_eq!(
@@ -367,16 +381,38 @@ mod tests {
                 ),
                 (
                     DestinationId::new("oncall-room").expect("an identity"),
-                    RoomOutcome::Abandoned
+                    RoomOutcome::Abandoned(DispatchFailed::Intercepted)
                 ),
             ])),
             json!({
                 "outcome": "reached",
                 "rooms": [
                     { "room": "team-room", "outcome": "delivered" },
-                    { "room": "oncall-room", "outcome": "abandoned" },
+                    { "room": "oncall-room", "outcome": "abandoned", "reason": "intercepted" },
                 ],
             })
         );
+
+        // Every reason has a word, and it is the reason's own — the same one
+        // the platform's metric label and the stored row use (bead gc-556). A
+        // reason the platform cannot read back is a report it refuses whole, so
+        // this is the agent's half of a wire format neither side owns alone.
+        for (why, word) in [
+            (DispatchFailed::Rejected, "rejected"),
+            (DispatchFailed::Intercepted, "intercepted"),
+            (DispatchFailed::Unreachable, "unreachable"),
+            (DispatchFailed::TimedOut, "timed_out"),
+        ] {
+            assert_eq!(
+                written(&Report::Reached(vec![(
+                    DestinationId::new("team-room").expect("an identity"),
+                    RoomOutcome::Abandoned(why)
+                )])),
+                json!({
+                    "outcome": "reached",
+                    "rooms": [{ "room": "team-room", "outcome": "abandoned", "reason": word }],
+                })
+            );
+        }
     }
 }

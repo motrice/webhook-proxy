@@ -408,13 +408,21 @@ fn written_report(report: &Report) -> serde_json::Value {
             "outcome": "reached",
             "rooms": rooms
                 .iter()
-                .map(|(room, outcome)| serde_json::json!({
-                    "room": room.as_str(),
-                    "outcome": match outcome {
-                        RoomOutcome::Delivered => "delivered",
-                        RoomOutcome::Abandoned => "abandoned",
-                    },
-                }))
+                .map(|(room, outcome)| match outcome {
+                    RoomOutcome::Delivered => serde_json::json!({
+                        "room": room.as_str(),
+                        "outcome": "delivered",
+                    }),
+                    // The reason is stored beside the outcome, not folded into
+                    // it: a row that said only "abandoned" would be a row an
+                    // operator has to go to a log to interpret, which is the
+                    // problem bead gc-556 is about.
+                    RoomOutcome::Abandoned(why) => serde_json::json!({
+                        "room": room.as_str(),
+                        "outcome": "abandoned",
+                        "reason": why.spelled(),
+                    }),
+                })
                 .collect::<Vec<_>>(),
         }),
     }
@@ -423,7 +431,7 @@ fn written_report(report: &Report) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use application::ports::{
-        Discharged, Handover, Offered, Reoffered, Report, RoomOutcome, TenantId,
+        Discharged, DispatchFailed, Handover, Offered, Reoffered, Report, RoomOutcome, TenantId,
     };
     use domain::{
         BranchName, Commit, CommitId, Correlation, DeliveryId, Event, OriginId, Pusher,
@@ -804,7 +812,7 @@ mod tests {
             ),
             (
                 domain::DestinationId::new("another-room").expect("an identity"),
-                RoomOutcome::Abandoned,
+                RoomOutcome::Abandoned(DispatchFailed::Unreachable),
             ),
         ]);
 
@@ -863,6 +871,10 @@ mod tests {
         assert_eq!(said["rooms"][0]["room"], "a-room");
         assert_eq!(said["rooms"][0]["outcome"], "delivered");
         assert_eq!(said["rooms"][1]["outcome"], "abandoned");
+        // WITH ITS REASON, because a row that said only "abandoned" is a row
+        // somebody has to go and find a log for — and the log is in another
+        // namespace, in a pod that has since restarted (bead gc-556).
+        assert_eq!(said["rooms"][1]["reason"], "unreachable");
     }
 
     #[tokio::test]

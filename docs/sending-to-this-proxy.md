@@ -99,7 +99,9 @@ statement is the honest one: this proxy no longer attempts a room itself, so a
 team whose agent is broken leaves alerts sitting where this proxy would once
 have tried and reported a loss. **Nobody will tell you that has happened** — it
 is visible to whoever runs the proxy, as a count and a log, and to the team, in
-its own agent's log. It is not visible in anything you get back.
+its own agent's log. A room that was given up on is counted too, per room and
+with its reason, by whoever runs the proxy. None of it is visible in anything
+you get back.
 
 Nothing about what you send or how you send it changed when that did.
 

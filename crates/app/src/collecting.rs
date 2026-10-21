@@ -43,8 +43,8 @@
 
 use std::sync::Arc;
 
-use application::ports::{Clock, Handover, Report, RoomOutcome, TenantId};
-use application::{Collect, NotCollected};
+use application::ports::{Clock, DispatchFailed, Handover, Report, RoomOutcome, TenantId};
+use application::{Collect, NotCollected, Outcomes};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -77,6 +77,12 @@ pub struct Collecting {
     handover: Arc<dyn Handover>,
     clock: Arc<dyn Clock>,
     tenants: Arc<std::collections::BTreeSet<TenantId>>,
+    /// What each room was told, shared with the scrape endpoint.
+    ///
+    /// Here rather than in the agent because an agent has no scrape endpoint
+    /// and bead gc-72e forbade it one; the outcomes already cross the wire in
+    /// every report (bead gc-556).
+    outcomes: Arc<Outcomes>,
 }
 
 impl Collecting {
@@ -86,11 +92,13 @@ impl Collecting {
         handover: Arc<dyn Handover>,
         clock: Arc<dyn Clock>,
         tenants: std::collections::BTreeSet<TenantId>,
+        outcomes: Arc<Outcomes>,
     ) -> Self {
         Self {
             handover,
             clock,
             tenants: Arc::new(tenants),
+            outcomes,
         }
     }
 
@@ -267,7 +275,9 @@ async fn report(
             Json(json!({
                 "error": "a report says either outcome=routed_to_nothing, or \
                           outcome=reached with a non-empty rooms list of \
-                          {room, outcome} where outcome is delivered or abandoned"
+                          {room, outcome}, where outcome is delivered, or \
+                          abandoned with reason=rejected|intercepted|\
+                          unreachable|timed_out"
             })),
         );
     };
@@ -277,7 +287,22 @@ async fn report(
         .report(&caller, &delivery, &report)
         .await
     {
-        Ok(application::ports::Discharged::Settled) => (StatusCode::NO_CONTENT, Json(Value::Null)),
+        Ok(application::ports::Discharged::Settled) => {
+            // COUNTED HERE AND NOWHERE EARLIER, because this is the only place
+            // that knows the report discharged something. A report that arrives
+            // twice — an agent whose first reply was lost, which this API
+            // explicitly allows — answers `NotOutstanding` below and must not
+            // count again, or a single loss becomes as many losses as the agent
+            // had attempts to tell us about it (bead gc-556).
+            if let Report::Reached(rooms) = &report {
+                for (room, outcome) in rooms {
+                    collecting
+                        .outcomes
+                        .reported(caller.as_str(), room.as_str(), *outcome);
+                }
+            }
+            (StatusCode::NO_CONTENT, Json(Value::Null))
+        }
         // One answer for three cases — another tenant's Delivery, one already
         // reported, one that never existed — because a caller that could tell
         // them apart could ask after another tenant's Delivery identities and
@@ -287,6 +312,23 @@ async fn report(
             Json(json!({ "error": "nothing outstanding goes by that identity" })),
         ),
         Err(why) => refused(&why),
+    }
+}
+
+/// The four reasons an agent may report, read back from the one spelling
+/// `DispatchFailed::spelled` writes.
+///
+/// `None` for anything else, which refuses the whole report. The alternative —
+/// an "other" bucket — would absorb a spelling the two sides stopped agreeing
+/// about and keep counting, which is how a metric becomes something nobody
+/// trusts.
+fn read_reason(said: &str) -> Option<DispatchFailed> {
+    match said {
+        "rejected" => Some(DispatchFailed::Rejected),
+        "intercepted" => Some(DispatchFailed::Intercepted),
+        "unreachable" => Some(DispatchFailed::Unreachable),
+        "timed_out" => Some(DispatchFailed::TimedOut),
+        _ => None,
     }
 }
 
@@ -311,7 +353,16 @@ fn read_report(body: &Value) -> Option<Report> {
                     let room = DestinationId::new(entry.get("room")?.as_str()?).ok()?;
                     let outcome = match entry.get("outcome")?.as_str()? {
                         "delivered" => RoomOutcome::Delivered,
-                        "abandoned" => RoomOutcome::Abandoned,
+                        // A reason is REQUIRED with an abandonment, and a
+                        // report without one is refused rather than counted
+                        // under a catch-all. An "unknown" bucket would fill up
+                        // silently the first time the two sides disagreed about
+                        // a spelling, and the counter exists precisely so a
+                        // loss is not something somebody has to go and read a
+                        // log to understand (bead gc-556).
+                        "abandoned" => {
+                            RoomOutcome::Abandoned(read_reason(entry.get("reason")?.as_str()?)?)
+                        }
                         _ => return None,
                     };
                     Some((room, outcome))

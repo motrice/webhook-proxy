@@ -316,13 +316,16 @@ paths:
 
   /metrics:
     get:
-      summary: What each room was sent, for a scraper.
+      summary: What each room was told, for a scraper.
       description: |
-        Prometheus text format. Carries counts per TEAM: how much each has not
+        Prometheus text format. Carries counts per TEAM — how much each has not
         yet collected, how old the oldest of that is, and how much was dropped
-        uncollected. Nothing per room, because this service reaches none — what
-        a room saw is in its team's own agent's log. No address, no secret, no
-        part of any payload.
+        uncollected — and counts per ROOM, on its own team's word: what it
+        accepted, and what was given up on with the reason. This service
+        reaches no room itself, so the per-room numbers are what each team's
+        agent reported rather than what this service observed. A room's NAME
+        appears; a room's address cannot, because this service never learns one.
+        No secret, no part of any payload.
       operationId: metrics
       security: []
       responses:

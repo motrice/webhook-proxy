@@ -369,6 +369,33 @@ async fn claim_as(address: &str, namespace: &str) -> (StatusCode, serde_json::Va
     (status, body)
 }
 
+/// Reports what became of one Delivery, as that tenant's agent.
+async fn report_as(
+    address: &str,
+    namespace: &str,
+    delivery: &str,
+    report: serde_json::Value,
+) -> StatusCode {
+    reqwest::Client::new()
+        .post(format!("http://{address}/deliveries/{delivery}/report"))
+        .header("x-forwarded-client-cert", as_agent_of(namespace))
+        .json(&report)
+        .send()
+        .await
+        .expect("the proxy answers")
+        .status()
+}
+
+/// What `/metrics` says right now.
+async fn scraped(address: &str) -> String {
+    reqwest::get(format!("http://{address}/metrics"))
+        .await
+        .expect("the binary answers a scrape")
+        .text()
+        .await
+        .expect("a body")
+}
+
 #[tokio::test]
 async fn an_agent_is_offered_none_of_another_tenants_deliveries() {
     // THE ONE PROPERTY THE WHOLE SPLIT EXISTS TO PROVIDE, end to end against
@@ -993,26 +1020,163 @@ async fn the_alerting_senders_do_not_share_a_credential() {
 }
 
 #[tokio::test]
-async fn a_scrape_reveals_no_secret_and_nothing_about_a_room() {
+async fn a_loss_a_tenant_reports_is_counted_by_room_and_by_reason() {
+    // THE WHOLE POINT OF BEAD gc-556, end to end against the running binary.
+    // Before this, an abandoned dispatch existed in exactly one place: the
+    // agent's own log, in one pod, for as long as that pod lived — and the pod
+    // is rolled by a routine apply. The sender was told `202` and every signal
+    // upstream stayed green while a room went quiet.
+    //
+    // Counted by REASON as well as by room, because the four are not
+    // interchangeable to whoever acts on one: `rejected` is a configuration
+    // problem in the tenant's own repo, `unreachable` is the network, and
+    // `intercepted` means something answered on the room's behalf.
+    let (_dir, env) = configured();
+    let proxy = start(env).await.expect("the proxy starts");
+
+    assert_eq!(
+        post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await,
+        StatusCode::ACCEPTED
+    );
+    let (_, claimed) = claim_as(&proxy.address, "devsecops").await;
+    let delivery = claimed["deliveries"][0]["delivery"]
+        .as_str()
+        .expect("a delivery identity")
+        .to_owned();
+
+    assert_eq!(
+        report_as(
+            &proxy.address,
+            "devsecops",
+            &delivery,
+            serde_json::json!({
+                "outcome": "reached",
+                "rooms": [{ "room": ROOM, "outcome": "abandoned", "reason": "unreachable" }],
+            }),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let scraped = scraped(&proxy.address).await;
+    assert!(
+        scraped.contains(&format!(
+            "webhook_proxy_room_abandoned_total{{tenant=\"devsecops\",room=\"{ROOM}\",reason=\"unreachable\"}} 1"
+        )),
+        "{scraped}"
+    );
+    // And in the total an alert can name without knowing which rooms exist.
+    assert!(
+        scraped.contains("webhook_proxy_room_abandoned_total 1"),
+        "{scraped}"
+    );
+    // Not as a delivery. A loss counted on both sides of the ratio would make
+    // the ratio say everything is fine, which is worse than no ratio.
+    assert!(
+        !scraped.contains("webhook_proxy_room_delivered_total{"),
+        "{scraped}"
+    );
+}
+
+#[tokio::test]
+async fn a_report_that_arrives_twice_is_one_loss() {
+    // The API deliberately allows a second report — an agent whose reply was
+    // lost on the way back must be able to send it again, and this document
+    // says so. So the counter has to be driven by what the STORE says the
+    // report discharged, not by the request arriving: counting per request
+    // would turn one loss into as many as the agent had attempts to tell us
+    // about it, and a number that inflates under exactly the conditions you
+    // are investigating is worse than no number.
+    let (_dir, env) = configured();
+    let proxy = start(env).await.expect("the proxy starts");
+
+    post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
+    let (_, claimed) = claim_as(&proxy.address, "devsecops").await;
+    let delivery = claimed["deliveries"][0]["delivery"]
+        .as_str()
+        .expect("a delivery identity")
+        .to_owned();
+    let twice = serde_json::json!({
+        "outcome": "reached",
+        "rooms": [{ "room": ROOM, "outcome": "abandoned", "reason": "rejected" }],
+    });
+
+    assert_eq!(
+        report_as(&proxy.address, "devsecops", &delivery, twice.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        report_as(&proxy.address, "devsecops", &delivery, twice).await,
+        StatusCode::NOT_FOUND,
+        "the second report was not refused, so this test proves nothing"
+    );
+
+    let scraped = scraped(&proxy.address).await;
+    assert!(
+        scraped.contains("webhook_proxy_room_abandoned_total 1"),
+        "two reports of one loss were counted twice: {scraped}"
+    );
+}
+
+#[tokio::test]
+async fn a_delivered_report_counts_against_the_room_that_accepted_it() {
+    // The denominator, and the reason it is worth the series: an absolute
+    // number of losses says nothing on its own — a tenant sending thousands an
+    // hour and a tenant sending one a week want very different thresholds, so
+    // what an operator alerts on is a ratio and a ratio needs both halves.
+    let (_dir, env) = configured();
+    let proxy = start(env).await.expect("the proxy starts");
+
+    post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
+    let (_, claimed) = claim_as(&proxy.address, "devsecops").await;
+    let delivery = claimed["deliveries"][0]["delivery"]
+        .as_str()
+        .expect("a delivery identity")
+        .to_owned();
+
+    assert_eq!(
+        report_as(
+            &proxy.address,
+            "devsecops",
+            &delivery,
+            serde_json::json!({
+                "outcome": "reached",
+                "rooms": [{ "room": ROOM, "outcome": "delivered" }],
+            }),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let scraped = scraped(&proxy.address).await;
+    assert!(
+        scraped.contains(&format!(
+            "webhook_proxy_room_delivered_total{{tenant=\"devsecops\",room=\"{ROOM}\"}} 1"
+        )),
+        "{scraped}"
+    );
+    assert!(
+        scraped.contains("webhook_proxy_room_abandoned_total 0"),
+        "a delivery was counted as a loss: {scraped}"
+    );
+}
+
+#[tokio::test]
+async fn a_scrape_reveals_no_secret_and_no_room_address() {
     // These numbers are the sort of thing that ends up on a dashboard anybody
-    // can open. There is nothing about a room here to leak — this service
-    // reaches none (bead gc-72e.3.2) — and the senders' credentials are nowhere
-    // near a counter.
+    // can open. A room NAME can appear — bead gc-556 counts what each room was
+    // told, from its tenant's own reports — and a room ADDRESS cannot: a
+    // `Destination` is a name with no address by construction, and the URL
+    // never leaves the tenant's namespace. So the assertion is about addresses
+    // and credentials, which is what there was ever anything to leak about.
     let (_dir, env) = configured();
     let proxy = start(env).await.expect("the binary starts");
 
     post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
 
-    let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
-        .await
-        .expect("the binary answers a scrape")
-        .text()
-        .await
-        .expect("a body");
+    let scraped = scraped(&proxy.address).await;
 
     assert!(!scraped.contains("http"), "{scraped}");
-    // Not a room name either, which this service never learns.
-    assert!(!scraped.contains("room"), "{scraped}");
     assert!(!scraped.contains(TOKEN), "{scraped}");
     assert!(!scraped.contains(SECRET.trim()), "{scraped}");
 }
@@ -1032,12 +1196,18 @@ async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped()
         .await
         .expect("a body");
 
-    // NOTHING IS KEYED BY ROOM ANY MORE, and that is the shape of this
-    // service now: it does not reach a room, so it counts nothing about one
-    // (bead gc-72e.3.2). What a room saw is in its tenant's agent's log, in
-    // another namespace.
-    assert!(!scraped.contains("destination="), "{scraped}");
+    // What a room was told is keyed by room again, but only on its tenant's
+    // word: this service reaches no room (bead gc-72e.3.2), so the series the
+    // old one-deployment product exported by observing its own sends cannot
+    // come back under its old names.
     assert!(!scraped.contains("dispatches_delivered"), "{scraped}");
+
+    // The loss total, present at zero before any room exists, because a rule
+    // on a series that does not exist yet never fires (bead gc-556).
+    assert!(
+        scraped.contains("webhook_proxy_room_abandoned_total 0"),
+        "{scraped}"
+    );
 
     // The tenant side, which exists for the one loss nothing else can see: an
     // alert no agent ever collected reached no room, so it has none to be

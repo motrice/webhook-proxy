@@ -178,6 +178,30 @@ pub enum DispatchFailed {
     TimedOut,
 }
 
+impl DispatchFailed {
+    /// How this reason is written down, everywhere it is written down.
+    ///
+    /// ONE SPELLING FOR FOUR AUDIENCES: the stored report row, the wire format
+    /// an agent sends, the word the platform reads back, and the `reason` label
+    /// on the metric the platform exports (bead gc-556). Shared rather than
+    /// written out per adapter so an operator who sees `unreachable` in a
+    /// dashboard can grep the database for the same word, and so a rename can
+    /// only happen deliberately and in one place.
+    ///
+    /// Not `Debug`. These four words are a published interface — a stored row
+    /// somebody will read next year and a series somebody has alerted on — and
+    /// renaming a Rust variant must not silently rename them.
+    #[must_use]
+    pub const fn spelled(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Intercepted => "intercepted",
+            Self::Unreachable => "unreachable",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
 /// The store is not answering.
 ///
 /// Separate from every other way storing can fail because the decision in
@@ -491,9 +515,21 @@ impl Claimed {
 pub enum RoomOutcome {
     /// It arrived.
     Delivered,
-    /// Every attempt was spent and it did not arrive. This is a loss, and the
-    /// tenant has already logged and counted it where it happened.
-    Abandoned,
+    /// Every attempt was spent and it did not arrive. This is a loss.
+    ///
+    /// CARRIES THE REASON, AND NOT OPTIONALLY. A tenant reporting an
+    /// abandonment must say why, because the four [`DispatchFailed`] variants
+    /// are not interchangeable to whoever has to act on one: `Rejected` means a
+    /// room refused and somebody has to change a configuration, `Intercepted`
+    /// means something on the path answered on the room's behalf and the room
+    /// never saw it, `Unreachable` and `TimedOut` mean the room or the network.
+    /// That distinction is already load-bearing in `DispatchFailed`'s own
+    /// documentation, and collapsing it here would throw away the thing an
+    /// operator needs (bead gc-556).
+    ///
+    /// An enum variant rather than a field, so it cannot be left out: a report
+    /// that said "abandoned" and nothing else could not be made at all.
+    Abandoned(DispatchFailed),
 }
 
 /// The terminal statement about one Delivery, which discharges the platform's

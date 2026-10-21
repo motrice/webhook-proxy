@@ -14,13 +14,20 @@ It has run in a cluster: the agent claims, delivers, reports
 `reached=N lost=N routed_to_nothing=N`, and a room receives exactly one copy per
 delivery.
 
-> **Know this before you rely on it:** a room this agent gives up on is recorded
-> in **this process's log and nowhere else** — there is no counter a monitoring
-> system can read, and `kubectl logs deploy/alert-agent` shows only the current
-> pod, so a restart erases the evidence. The sender was told `202` long before,
-> so every signal upstream stays green while a room goes quiet. Bead `gc-556`,
-> and it is the reason to treat this agent's log as a thing to ship somewhere
-> rather than to read on demand.
+> **Where a loss shows up:** a room this agent gives up on is reported to the
+> platform with its reason, and the platform counts it on its own `/metrics` as
+> `webhook_proxy_room_abandoned_total{tenant,room,reason}`, beside
+> `webhook_proxy_room_delivered_total{tenant,room}` so a ratio can be alerted on
+> rather than an absolute. **Counted there and not here on purpose** — this pod
+> has no Service, no HTTPRoute and no ingress NetworkPolicy (`gc-72e`), so
+> nothing can scrape it, and a counter in this process would have been erased by
+> the next restart along with the log. Bead `gc-556`.
+>
+> Two things that still only this log knows: the attempt-by-attempt detail, and
+> a loss the agent never manages to report at all — if this pod dies before
+> reporting, the delivery's lease lapses and it is offered again, so the work is
+> not lost but that attempt's record is. The sender was told `202` long before
+> either way.
 
 This section said the opposite until bead `gc-uh0` — that nothing here delivered
 yet, and that deploying it would double every message. It was true when written
