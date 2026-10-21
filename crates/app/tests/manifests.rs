@@ -170,6 +170,9 @@ struct Started {
     child: tokio::process::Child,
     /// The address it announced on stdout.
     address: String,
+    /// The second address it announced: the operator's surface, where /health,
+    /// /api-info and /metrics answer and no tenant may knock (bead gc-wdt).
+    operator: String,
 }
 
 impl Drop for Started {
@@ -194,6 +197,9 @@ async fn started_with(env: HashMap<String, String>) -> Result<Started, String> {
         // point a variable somewhere decisive and read the complaint, and
         // nothing is going to render a file underneath them.
         .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
+        // An ephemeral operator port too (bead gc-wdt), or these tests race for
+        // the one default.
+        .env("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (name, value) in env {
@@ -214,7 +220,20 @@ async fn started_with(env: HashMap<String, String>) -> Result<Started, String> {
             .strip_prefix("listening on ")
             .ok_or_else(|| format!("unexpected first line: {line}"))?
             .to_owned();
-        Ok(Started { child, address })
+        let second = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .map_err(|_| "the binary announced one address and not the other".to_owned())?
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| "the binary exited after announcing one address".to_owned())?;
+        let operator = second
+            .strip_prefix("operator listening on ")
+            .ok_or_else(|| format!("unexpected second line: {second}"))?
+            .to_owned();
+        Ok(Started {
+            child,
+            address,
+            operator,
+        })
     } else {
         // It exited. EVERYTHING it said is the evidence, not just the first
         // line: the binary may legitimately say something before it refuses --
@@ -287,9 +306,25 @@ async fn the_probe_path_in_the_manifest_is_a_path_the_binary_answers() {
     .await
     .expect("the binary starts");
 
-    let answer = reqwest::get(format!("http://{}{path}", running.address))
+    // ON THE OPERATOR SOCKET, because that is the port both probes name since
+    // bead gc-wdt. The number itself is checked against the manifest in
+    // `the_port_is_the_same_number_everywhere_it_appears`; what this proves is
+    // that the path answers on the socket that port belongs to.
+    let answer = reqwest::get(format!("http://{}{path}", running.operator))
         .await
         .expect("the binary answers the probe path");
+
+    // And not on the tenant-facing one, which is the whole reason the probe had
+    // to move: a probe aimed there would get this 404 and hold every pod
+    // unready.
+    let elsewhere = reqwest::get(format!("http://{}{path}", running.address))
+        .await
+        .expect("the tenant-facing listener answers");
+    assert_eq!(
+        elsewhere.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "{path} is served to every tenant as well"
+    );
 
     assert!(
         answer.status().is_success(),
@@ -371,10 +406,15 @@ async fn the_manifest_names_the_variable_the_binary_reads_for_its_secrets() {
 
 #[tokio::test]
 async fn the_manifest_names_the_variable_the_binary_reads_for_its_listen_address() {
-    let (name, declared) = environment()
-        .into_iter()
-        .find(|(name, _)| name.contains("LISTEN"))
-        .expect("the manifest tells the binary where to listen");
+    // BY NAME, NOT BY SUBSTRING. Two variables contain "LISTEN" since bead
+    // gc-wdt, so `find(|name| name.contains("LISTEN"))` would have picked one
+    // of them by HashMap order — a test that passes or fails depending on
+    // nothing.
+    let declared = environment()
+        .get("WEBHOOK_PROXY_LISTEN")
+        .expect("the manifest tells the binary where to listen")
+        .clone();
+    let name = "WEBHOOK_PROXY_LISTEN".to_owned();
 
     let (dir, file, secrets) = a_usable_configuration();
     // An address no host can bind. Obeyed, the process refuses to start and says
@@ -401,49 +441,130 @@ async fn the_manifest_names_the_variable_the_binary_reads_for_its_listen_address
     drop(dir);
 }
 
+#[tokio::test]
+async fn the_manifest_names_the_variable_the_binary_reads_for_its_operator_address() {
+    // The second socket is only a boundary if the binary actually reads this
+    // name (bead gc-wdt). Pointed at an address no host can bind, the process
+    // must refuse and say which variable — ignored, it would quietly serve
+    // /metrics on its loopback default and the manifest would be describing a
+    // socket nobody is listening on.
+    let declared = environment()
+        .get("WEBHOOK_PROXY_OPERATOR_LISTEN")
+        .expect("the manifest tells the binary where to serve the operator's surface")
+        .clone();
+
+    let (dir, file, secrets) = a_usable_configuration();
+    let why = started_with(HashMap::from([
+        (
+            "WEBHOOK_PROXY_OPERATOR_LISTEN".to_owned(),
+            "203.0.113.1:9".to_owned(),
+        ),
+        ("WEBHOOK_PROXY_LISTEN".to_owned(), "127.0.0.1:0".to_owned()),
+        ("WEBHOOK_PROXY_CONFIG".to_owned(), file),
+        ("WEBHOOK_PROXY_SECRETS_DIR".to_owned(), secrets),
+    ]))
+    .await
+    .expect_err("an unbindable operator address must stop the process");
+
+    assert!(
+        why.contains("WEBHOOK_PROXY_OPERATOR_LISTEN"),
+        "WEBHOOK_PROXY_OPERATOR_LISTEN is not the variable the binary reads: {why}"
+    );
+    assert!(
+        declared.starts_with("0.0.0.0:"),
+        "a pod that serves the operator's surface on {declared} answers no probe and no scrape"
+    );
+    drop(dir);
+}
+
 #[test]
 fn the_port_is_the_same_number_everywhere_it_appears() {
     let declared = environment();
-    let listen = declared
-        .values()
-        .find_map(|value| value.strip_prefix("0.0.0.0:"))
-        .expect("a listen address")
-        .parse::<u64>()
-        .expect("a port number");
+    let port_of = |name: &str| {
+        declared
+            .get(name)
+            .unwrap_or_else(|| panic!("the manifest sets {name}"))
+            .strip_prefix("0.0.0.0:")
+            .unwrap_or_else(|| panic!("{name} is not a 0.0.0.0 address"))
+            .parse::<u64>()
+            .expect("a port number")
+    };
+    // TWO PORTS SINCE BEAD gc-wdt, and which is which is the whole point: 8080
+    // is reachable by every tenant because the hand-off lives there, 9090 by
+    // the cluster's own machinery. A test that only checked "the same number
+    // everywhere" would now pass with the two swapped.
+    let tenants = port_of("WEBHOOK_PROXY_LISTEN");
+    let operator = port_of("WEBHOOK_PROXY_OPERATOR_LISTEN");
+    assert_ne!(
+        tenants, operator,
+        "both surfaces are on one socket, so every tenant can read every other \
+         tenant's room names (bead gc-wdt)"
+    );
 
+    let declared_ports: std::collections::BTreeMap<String, u64> = container()["ports"]
+        .as_sequence()
+        .expect("the container declares its ports")
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().expect("a named port").to_owned(),
+                entry["containerPort"].as_u64().expect("a port number"),
+            )
+        })
+        .collect();
     assert_eq!(
-        container()["ports"][0]["containerPort"].as_u64(),
-        Some(listen),
-        "the declared containerPort is not the port the binary is told to bind"
+        declared_ports.values().copied().collect::<Vec<u64>>(),
+        {
+            let mut both = vec![tenants, operator];
+            both.sort_unstable();
+            both
+        },
+        "the declared containerPorts are not the ports the binary is told to bind: \
+         {declared_ports:?}"
     );
-    assert_eq!(
-        probe("readinessProbe")["port"].as_u64(),
-        Some(listen),
-        "the readiness probe is aimed at a port nothing listens on"
-    );
-    assert_eq!(
-        probe("livenessProbe")["port"].as_u64(),
-        Some(listen),
-        "the liveness probe is aimed at a port nothing listens on"
-    );
+
+    // BOTH PROBES NAME THE OPERATOR PORT, because that is where /health answers
+    // now. Aimed at the tenant-facing port they would get a 404 and every pod
+    // would be permanently unready — which is the one way this split can break a
+    // deployment, so it is the assertion to keep.
+    for kind in ["readinessProbe", "livenessProbe"] {
+        assert_eq!(
+            probe(kind)["port"].as_u64(),
+            Some(operator),
+            "the {kind} is aimed at a port where /health does not answer"
+        );
+    }
 
     let service: Value = serde_yaml_ng::from_str(SERVICE).expect("the Service parses");
-    assert_eq!(
-        service["spec"]["ports"][0]["targetPort"].as_u64(),
-        Some(listen),
-        "the Service forwards to a port nothing listens on"
+    let forwarded: Vec<u64> = service["spec"]["ports"]
+        .as_sequence()
+        .expect("the Service forwards something")
+        .iter()
+        .map(|entry| entry["targetPort"].as_u64().expect("a port number"))
+        .collect();
+    assert!(
+        forwarded.contains(&tenants),
+        "the Service does not forward to the port the senders and the agents use: {forwarded:?}"
+    );
+    assert!(
+        forwarded.contains(&operator),
+        "the Service does not publish the operator port, so a ServiceMonitor has \
+         nothing to name: {forwarded:?}"
     );
 
     // The NetworkPolicy filters the pod's port, not the Service's, because it
     // is evaluated after the Service has rewritten the destination. Here the
-    // two numbers are equal, so naming the wrong one would pass — and would go
-    // on passing until somebody made them differ, by which time the policy
-    // would be denying the traffic it was written to allow.
+    // Service's numbers equal the pod's deliberately, so naming the wrong one
+    // would pass — and would go on passing until somebody made them differ, by
+    // which time the policy would be denying the traffic it was written to
+    // allow.
     let policy: Value = serde_yaml_ng::from_str(POLICY).expect("the NetworkPolicy parses");
     let allowed = policy["spec"]["ingress"]
         .as_sequence()
         .expect("the policy allows something");
     assert!(!allowed.is_empty(), "the policy allows nothing in");
+
+    let mut granted_the_operator_port = 0;
     for rule in allowed {
         let ports = rule["ports"]
             .as_sequence()
@@ -452,14 +573,35 @@ fn the_port_is_the_same_number_everywhere_it_appears() {
             !ports.is_empty(),
             "a rule names no port, so it allows every port this pod ever opens"
         );
+
+        // Which rule this is, read from what it selects rather than from its
+        // position: a rule that admits a tenant's agent must never name the
+        // operator port, because that is the leak this bead closed.
+        let selects = serde_yaml_ng::to_string(&rule["from"]).expect("the rule's selectors");
+        let for_a_tenant = selects.contains("agent");
+
         for port in ports {
-            assert_eq!(
-                port["port"].as_u64(),
-                Some(listen),
-                "the policy allows a port nothing listens on"
+            let port = port["port"].as_u64();
+            assert!(
+                port == Some(tenants) || port == Some(operator),
+                "the policy allows a port nothing listens on: {port:?}"
             );
+            if port == Some(operator) {
+                assert!(
+                    !for_a_tenant,
+                    "a rule admitting a tenant's agent grants the operator port, which \
+                     is how every tenant could read every other tenant's room names \
+                     (bead gc-wdt)"
+                );
+                granted_the_operator_port += 1;
+            }
         }
     }
+    assert_eq!(
+        granted_the_operator_port, 1,
+        "the operator port is granted by {granted_the_operator_port} rules; it should \
+         be exactly one, the scraper's"
+    );
 }
 
 #[test]

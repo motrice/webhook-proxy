@@ -7,9 +7,11 @@
 # both probes, and unreachable. Nothing reports that; the Gateway simply answers
 # 503 and the pod's logs are empty, because no request ever arrived. Bead gc-hzn.
 #
-# A NetworkPolicy is additive: it grants, and never denies. So the two rules
-# below are the whole list of what may talk to this workload, and anything that
-# needs to talk to it later has to be added here deliberately.
+# A NetworkPolicy is additive: it grants, and never denies. So the rules below
+# are the whole list of what may talk to this workload, and anything that needs
+# to talk to it later has to be added here deliberately — on the port that fits
+# what it is, which since bead gc-wdt is a real choice: 8080 is reachable by
+# every tenant, 9090 by the cluster's own machinery.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -74,11 +76,15 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # The metrics scraper. Nothing scrapes /metrics today; this is here because
-    # under default-deny the first thing to try will fail by timing out against
-    # a Ready pod, and that failure is expensive to diagnose and cheap to
-    # prevent. A namespaceSelector naming a namespace that does not exist
-    # matches nothing and grants nothing, so on this cluster it is inert.
+    # The metrics scraper, ON THE OPERATOR PORT AND ONLY THERE (bead gc-wdt).
+    # This rule used to grant 8080, which granted nothing a tenant did not
+    # already have — the agents need that port — and that was the problem: the
+    # scrape surface was wherever the tenants already were. 9090 is reachable by
+    # this rule alone, so the series labelled by tenant and room are now
+    # reachable by the scraper and the kubelet and nobody else.
+    #
+    # A namespaceSelector naming a namespace that does not exist matches nothing
+    # and grants nothing, so on a cluster without this namespace it is inert.
     - from:
         - namespaceSelector:
             matchLabels:
@@ -86,7 +92,7 @@ spec:
               kubernetes.io/metadata.name: openshift-monitoring
       ports:
         - protocol: TCP
-          port: 8080
+          port: 9090
 # No Egress rule, and that is a decision rather than an omission. This pod has
 # to reach the secret store, the database and every chat room it posts into, and
 # of those three only the first two have an address this repository knows. An

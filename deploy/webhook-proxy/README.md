@@ -171,10 +171,44 @@ what it is waiting for (bead gc-6b7). That works under a plain sidecar, a native
 one, an injector, or a plainly mounted Secret, and leaves the choice to whoever
 owns the platform.
 
+## Two ports, and why that is a boundary rather than tidiness
+
+**`8080` is reachable by every tenant. `9090` is not.** The hand-off a tenant's
+agent uses — `/deliveries/claim` and `/deliveries/{delivery}/report` — has to
+be on a port every tenant's namespace may reach, so anything served beside it
+is served to all of them. `/metrics` is labelled by `tenant` and `room`, which
+means one tenant could enumerate every other tenant's room identities, how much
+each is being told, and which are failing and why. That was measured from a
+tenant namespace rather than reasoned about (bead `gc-wdt`).
+
+A NetworkPolicy cannot draw that line: **ingress rules select a pod and a port,
+never a path.** So the process draws it, with a second socket:
+
+| Port | Served there | Who may reach it |
+| ---- | ------------ | ---------------- |
+| `8080` | `/webhook/{origin}`, `/deliveries/*` | the Gateway, and every namespace labelled as running an agent |
+| `9090` | `/metrics`, `/health`, `/api-info` | the scraper's namespace, and the kubelet |
+
+One rule decides which socket a new path belongs on: **the operator port carries
+everything that is neither the public webhook nor the tenant hand-off.** There is
+nothing to weigh up when the next path is added.
+
+**If you scrape or probe this service from outside the cluster's own machinery,
+this is a breaking change.** `/health` and `/metrics` moved off `8080`, so
+anything pointed at `http://webhook-proxy.webhook-proxy.svc:8080/health` now
+gets a `404` — including a health script in another repository. Point it at
+`:9090`.
+
+Both probes name `9090` for the same reason. A probe left on `8080` would get
+the `404` and hold every pod permanently unready, which is the one way this
+split can break a deployment, so `manifests.rs` asserts the probes name the port
+where `/health` actually answers.
+
 ## Who may reach the pods
 
-`networkpolicy.yaml` allows ingress from the Gateway's namespace, and from a
-metrics scraper's, on the **pod's** port. Nothing else.
+`networkpolicy.yaml` allows ingress from the Gateway's namespace and from the
+agents' namespaces on the **pod's** `8080`, and from a metrics scraper's on
+`9090`. Nothing else.
 
 On a cluster with no default-deny it changes nothing you can observe, which is
 why it was missing until bead gc-hzn. On a cluster that denies ingress per
@@ -186,8 +220,12 @@ and a 503 from the Gateway as the only symptom.
 Two things to keep right when editing it:
 
 - **It names the pod's port, not the Service's.** The policy is evaluated after
-  the Service has rewritten the destination. Here both numbers are 8080, so
-  naming the wrong one would pass unnoticed until somebody made them differ.
+  the Service has rewritten the destination. The Service keeps both numbers
+  equal to the pod's deliberately, so naming the wrong one would pass unnoticed
+  until somebody made them differ.
+- **Which port a rule grants is now a decision.** `manifests.rs` refuses a rule
+  that admits a tenant's agent and grants `9090`, and refuses more than one rule
+  granting it at all — that rule is the scraper's.
 - **Its `podSelector` has to match the Deployment's own selector.** A policy
   selecting no pod is accepted, reports nothing, and protects nothing.
 

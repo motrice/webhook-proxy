@@ -56,6 +56,9 @@ const NOTIFICATION: &[u8] =
 struct Proxy {
     child: Child,
     address: String,
+    /// Where `/metrics`, `/health` and `/api-info` answer, which is NOT where a
+    /// tenant may knock (bead gc-wdt).
+    operator: String,
 }
 
 impl Drop for Proxy {
@@ -76,6 +79,9 @@ async fn start(extra: HashMap<&str, String>) -> Result<Proxy, String> {
         // that renders secrets, and the real bound in every test that proves a
         // refusal would be half a minute of suite each.
         .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
+        // An ephemeral operator port as well, or every test in this file would
+        // race for the one default and most would fail to bind.
+        .env("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (name, value) in extra {
@@ -109,7 +115,25 @@ async fn start(extra: HashMap<&str, String>) -> Result<Proxy, String> {
         .ok_or_else(|| format!("unexpected first line: {line}"))?
         .to_owned();
 
-    Ok(Proxy { child, address })
+    // The second line, and it is not optional: the binary binds both sockets
+    // before it announces either, so a process that printed the first and not
+    // the second would be a process that is not actually serving what these
+    // tests go on to ask of it.
+    let second = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .map_err(|_| "the binary announced one address and not the other".to_owned())?
+        .map_err(|why| why.to_string())?
+        .ok_or_else(|| "the binary exited after announcing one address".to_owned())?;
+    let operator = second
+        .strip_prefix("operator listening on ")
+        .ok_or_else(|| format!("unexpected second line: {second}"))?
+        .to_owned();
+
+    Ok(Proxy {
+        child,
+        address,
+        operator,
+    })
 }
 
 /// The routing this deployment is given, written where the binary will find it.
@@ -329,7 +353,7 @@ async fn health_answers_without_asking_the_destination() {
     let (_dir, env) = configured();
     let proxy = start(env).await.expect("the proxy starts");
 
-    let body = reqwest::get(format!("http://{}/health", proxy.address))
+    let body = reqwest::get(format!("http://{}/health", proxy.operator))
         .await
         .expect("the proxy answers")
         .text()
@@ -908,6 +932,7 @@ async fn a_secret_that_arrives_a_moment_late_is_waited_for() {
     command
         .env_clear()
         .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        .env("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:0")
         .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "10000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -963,6 +988,7 @@ async fn a_proxy_holding_deliveries_in_memory_says_so_before_it_listens() {
     command
         .env_clear()
         .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        .env("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:0")
         .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1015,6 +1041,7 @@ async fn a_proxy_that_names_a_database_does_not_warn_about_memory() {
     command
         .env_clear()
         .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        .env("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:0")
         .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
         .env("WEBHOOK_PROXY_DATABASE_SECRET", "database-url")
         .stdout(Stdio::piped())
@@ -1161,7 +1188,7 @@ async fn a_loss_a_tenant_reports_is_counted_by_room_and_by_reason() {
         StatusCode::NO_CONTENT
     );
 
-    let scraped = scraped(&proxy.address).await;
+    let scraped = scraped(&proxy.operator).await;
     assert!(
         scraped.contains(&format!(
             "webhook_proxy_room_abandoned_total{{tenant=\"devsecops\",room=\"{ROOM}\",reason=\"unreachable\"}} 1"
@@ -1214,7 +1241,7 @@ async fn a_report_that_arrives_twice_is_one_loss() {
         "the second report was not refused, so this test proves nothing"
     );
 
-    let scraped = scraped(&proxy.address).await;
+    let scraped = scraped(&proxy.operator).await;
     assert!(
         scraped.contains("webhook_proxy_room_abandoned_total 1"),
         "two reports of one loss were counted twice: {scraped}"
@@ -1251,7 +1278,7 @@ async fn a_delivered_report_counts_against_the_room_that_accepted_it() {
         StatusCode::NO_CONTENT
     );
 
-    let scraped = scraped(&proxy.address).await;
+    let scraped = scraped(&proxy.operator).await;
     assert!(
         scraped.contains(&format!(
             "webhook_proxy_room_delivered_total{{tenant=\"devsecops\",room=\"{ROOM}\"}} 1"
@@ -1262,6 +1289,80 @@ async fn a_delivered_report_counts_against_the_room_that_accepted_it() {
         scraped.contains("webhook_proxy_room_abandoned_total 0"),
         "a delivery was counted as a loss: {scraped}"
     );
+}
+
+#[tokio::test]
+async fn nothing_a_tenant_can_reach_answers_about_another_tenant() {
+    // BEAD gc-wdt, and the measurement that found it: a pod in a TENANT
+    // namespace asked this proxy for /metrics and got it in full — every
+    // tenant's room identities, how much each was being told, and which were
+    // failing and why. That path is not a misconfiguration to close, either:
+    // the tenant's egress MUST permit its agent to reach this port, because
+    // claim and report live here. Closing it closes delivery.
+    //
+    // A NetworkPolicy cannot draw the line, because ingress rules select a pod
+    // and a port and never a path. So the process draws it, with a second
+    // socket, and this is the assertion that it did.
+    let (_dir, env) = configured();
+    let proxy = start(env).await.expect("the proxy starts");
+
+    post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
+
+    for path in ["metrics", "health", "api-info"] {
+        let answered = reqwest::get(format!("http://{}/{path}", proxy.address))
+            .await
+            .expect("the tenant-facing listener answers");
+        assert_eq!(
+            answered.status(),
+            StatusCode::NOT_FOUND,
+            "/{path} is reachable by every tenant on the hand-off listener"
+        );
+        let body = answered.text().await.expect("a body");
+        assert!(
+            !body.contains("webhook_proxy_"),
+            "/{path} served counters to a tenant: {body}"
+        );
+
+        // And present on the one a cluster can keep to Prometheus and the
+        // kubelet, so this test cannot pass by the path simply being gone.
+        let elsewhere = reqwest::get(format!("http://{}/{path}", proxy.operator))
+            .await
+            .expect("the operator listener answers");
+        assert_eq!(
+            elsewhere.status(),
+            StatusCode::OK,
+            "/{path} answers nowhere at all now"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_two_listeners_are_two_sockets() {
+    // The property the whole bead rests on, stated so it cannot drift back: the
+    // addresses are different. A process that served both surfaces on one
+    // socket would pass every assertion above by accident.
+    let (_dir, env) = configured();
+    let proxy = start(env).await.expect("the proxy starts");
+
+    assert_ne!(
+        proxy.address, proxy.operator,
+        "one socket is serving the tenants and the operator both"
+    );
+
+    // The webhook is on the tenant-facing one and nowhere else, which is the
+    // other half of the rule: a sender must not have to find the operator port.
+    assert_eq!(
+        post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await,
+        StatusCode::ACCEPTED
+    );
+    let elsewhere = reqwest::Client::new()
+        .post(format!("http://{}/webhook/github", proxy.operator))
+        .header("x-hub-signature-256", SIGNATURE.trim())
+        .body(PAYLOAD)
+        .send()
+        .await
+        .expect("the operator listener answers");
+    assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND, "{elsewhere:?}");
 }
 
 #[tokio::test]
@@ -1277,7 +1378,7 @@ async fn a_scrape_reveals_no_secret_and_no_room_address() {
 
     post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
 
-    let scraped = scraped(&proxy.address).await;
+    let scraped = scraped(&proxy.operator).await;
 
     assert!(!scraped.contains("http"), "{scraped}");
     assert!(!scraped.contains(TOKEN), "{scraped}");
@@ -1292,7 +1393,7 @@ async fn a_scrape_of_a_proxy_nothing_has_been_sent_through_is_empty_but_shaped()
     let (_dir, env) = configured();
     let proxy = start(env).await.expect("the binary starts");
 
-    let scraped = reqwest::get(format!("http://{}/metrics", proxy.address))
+    let scraped = reqwest::get(format!("http://{}/metrics", proxy.operator))
         .await
         .expect("the binary answers a scrape")
         .text()
@@ -1345,7 +1446,7 @@ async fn api_info_says_what_is_answering_without_being_asked_for_a_credential() 
     let proxy = start(env).await.expect("the proxy starts");
 
     let answered = reqwest::Client::new()
-        .get(format!("http://{}/api-info", proxy.address))
+        .get(format!("http://{}/api-info", proxy.operator))
         .send()
         .await
         .expect("api-info answers");

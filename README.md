@@ -227,7 +227,8 @@ where it cannot authenticate what it receives.
 | -------- | -------- | ------- |
 | `WEBHOOK_PROXY_CONFIG` | no | default `/etc/webhook-proxy/config.yaml`; the routing file |
 | `WEBHOOK_PROXY_SECRETS_DIR` | no | default `/etc/webhook-proxy/secrets`; one file per named secret |
-| `WEBHOOK_PROXY_LISTEN` | no | default `127.0.0.1:8080`; `0.0.0.0:8080` in a container |
+| `WEBHOOK_PROXY_LISTEN` | no | default `127.0.0.1:8080`; `0.0.0.0:8080` in a container. The senders' webhook and the tenant hand-off |
+| `WEBHOOK_PROXY_OPERATOR_LISTEN` | no | default `127.0.0.1:9090`; `0.0.0.0:9090` in a container. `/metrics`, `/health` and `/api-info`, which must not be on a port every tenant may reach (bead `gc-wdt`) |
 | `WEBHOOK_PROXY_MAX_BODY` | no | default 1 MiB, refused before anything is verified or parsed |
 | `WEBHOOK_PROXY_TIMEOUT_MS` | no | default 5000, bounding each dispatch |
 

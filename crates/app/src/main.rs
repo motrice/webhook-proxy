@@ -65,6 +65,20 @@ impl fmt::Display for Unstartable {
 /// find the file and the secrets it names. Bead gc-ast.3 drew that line.
 struct Config {
     listen: String,
+    /// Where the operator's surface answers: `/metrics`, `/health`, `/api-info`.
+    ///
+    /// A SECOND SOCKET, AND IT IS A BOUNDARY RATHER THAN TIDINESS (bead gc-wdt).
+    /// Every tenant's agent must be allowed to reach `listen`, because claim and
+    /// report live there — so anything served beside them is served to every
+    /// tenant. The series `/metrics` exports are labelled by tenant and room, so
+    /// one tenant could enumerate another's room identities, how much each is
+    /// being told, and which are failing and why. Measured from a tenant
+    /// namespace, not reasoned about.
+    ///
+    /// A `NetworkPolicy` cannot draw this line: ingress rules select a pod and a
+    /// port, never a path, and the port the agent needs is the port metrics was
+    /// on. A second socket is the one separation the process itself can make.
+    operator: String,
     max_body: usize,
     file: PathBuf,
     secrets: PathBuf,
@@ -92,6 +106,10 @@ impl Config {
     fn from_env() -> Self {
         Self {
             listen: optional("WEBHOOK_PROXY_LISTEN", "127.0.0.1:8080"),
+            // Loopback by default for the same reason as above: a default that
+            // reached the network would be a surface nobody asked for. The
+            // manifest sets both, and the manifest tests prove it.
+            operator: optional("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:9090"),
             max_body: optional("WEBHOOK_PROXY_MAX_BODY", "1048576")
                 .parse()
                 .unwrap_or(1_048_576),
@@ -834,8 +852,23 @@ async fn run() -> Result<(), Unstartable> {
 
     let counted = Arc::clone(&backlog);
     let told = Arc::clone(&outcomes);
-    let app = router(inbound, config.max_body)
-        .merge(collecting::routes(collecting))
+
+    // WHAT EVERY TENANT MAY REACH, and nothing else (bead gc-wdt): the senders'
+    // webhook, and the hand-off the agents authenticate themselves to.
+    let app = router(inbound, config.max_body).merge(collecting::routes(collecting));
+
+    // WHAT THE CLUSTER'S OWN MACHINERY REACHES. One rule, so there is nothing to
+    // judge when a path is added: this socket carries everything that is neither
+    // the public webhook nor the tenant hand-off. A path put here is reachable by
+    // whoever the NetworkPolicy lets reach this port, which is Prometheus and the
+    // kubelet; a path put there is reachable by every tenant.
+    //
+    // /health moves with it rather than staying: it answers a machine that
+    // reaches the pod directly, and after this it is the only thing on this
+    // socket a tenant could have wanted. The probe in deployment.yaml names this
+    // port, and crates/app/tests/manifests.rs refuses a probe that names the
+    // other one.
+    let operator = axum::Router::new()
         .route("/health", get(health))
         .route("/api-info", get(api_info))
         .route(
@@ -853,20 +886,46 @@ async fn run() -> Result<(), Unstartable> {
             name: "WEBHOOK_PROXY_LISTEN",
             why: why.to_string(),
         })?;
+    // BOTH BOUND BEFORE EITHER IS ANNOUNCED. A process that printed its first
+    // address and then failed on the second would have told the truth in a way
+    // that reads as a successful start, and the acceptance harness takes that
+    // line as proof it is up.
+    let watching = tokio::net::TcpListener::bind(&config.operator)
+        .await
+        .map_err(|why| Unstartable::Unusable {
+            name: "WEBHOOK_PROXY_OPERATOR_LISTEN",
+            why: why.to_string(),
+        })?;
     let address = listener
+        .local_addr()
+        .map_err(|why| Unstartable::Serving(why.to_string()))?;
+    let watched = watching
         .local_addr()
         .map_err(|why| Unstartable::Serving(why.to_string()))?;
 
     // Printed on stdout, not logged, because the acceptance test reads it to
     // learn which port was chosen when asked to bind port 0 — and because an
-    // operator wants it even with logging turned down.
+    // operator wants it even with logging turned down. THE FIRST LINE IS A
+    // PROTOCOL: it is the public address, and the operator address comes after
+    // it, so a reader that only wants one keeps working.
     println!("listening on {address}");
-    tracing::info!(%address, "webhook-proxy started");
+    println!("operator listening on {watched}");
+    tracing::info!(%address, %watched, "webhook-proxy started");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(asked_to_stop())
-        .await
-        .map_err(|why| Unstartable::Serving(why.to_string()))?;
+    // Both served from one task tree, and the public one owns the shutdown: when
+    // it has finished draining what it accepted, this future is dropped and the
+    // operator socket closes with it. So a probe during a graceful stop still
+    // sees a process that is answering, which is what it is doing.
+    //
+    // The operator server is in the select rather than spawned so that its own
+    // failure is this function's failure. Spawned, it could die unnoticed and
+    // leave a pod that passes no probe while serving every webhook.
+    let served = axum::serve(listener, app).with_graceful_shutdown(asked_to_stop());
+    let watched_over = axum::serve(watching, operator);
+    tokio::select! {
+        ended = served => ended.map_err(|why| Unstartable::Serving(why.to_string()))?,
+        ended = watched_over => ended.map_err(|why| Unstartable::Serving(why.to_string()))?,
+    }
 
     // Stopped with the listener. Anything it was mid-way through is still in
     // the outbox, which is the point of the outbox — and is only true of a

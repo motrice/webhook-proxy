@@ -237,6 +237,9 @@ async fn platform(env: &HashMap<&'static str, String>) -> (Running, String) {
         .env_clear()
         .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
         .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
+        // An ephemeral operator port too (bead gc-wdt), or these tests race for
+        // the one default.
+        .env("WEBHOOK_PROXY_OPERATOR_LISTEN", "127.0.0.1:0")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     for (name, value) in env {

@@ -251,6 +251,10 @@ paths:
         Says nothing about whether a room is reachable or a secret is readable —
         a proxy that cannot deliver still answers this. It is what the
         orchestrator reads to decide whether to route traffic here.
+
+        ON THE OPERATOR PORT, not the one the webhook is published on: this
+        answers a machine that reaches the pod directly, and the port the
+        senders and the teams' agents use is reachable by every team.
       operationId: health
       security: []
       responses:
@@ -326,6 +330,12 @@ paths:
         agent reported rather than what this service observed. A room's NAME
         appears; a room's address cannot, because this service never learns one.
         No secret, no part of any payload.
+
+        ON THE OPERATOR PORT, and that is a boundary rather than a detail: a
+        team's agent must be allowed to reach the port the hand-off is on, and
+        these series name every team's rooms. A separate socket is the only
+        separation available, because an ingress rule selects a port and never
+        a path.
       operationId: metrics
       security: []
       responses:

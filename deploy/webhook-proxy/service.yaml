@@ -18,3 +18,11 @@ spec:
       port: 8080
       targetPort: 8080
       protocol: TCP
+    # The operator's port, published so a ServiceMonitor can name it rather than
+    # guess (bead gc-wdt). Publishing it here grants nothing: a NetworkPolicy is
+    # evaluated after the Service has rewritten the destination, so what may
+    # reach 9090 is decided by networkpolicy.yaml and not by this file.
+    - name: operator
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

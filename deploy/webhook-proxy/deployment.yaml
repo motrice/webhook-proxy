@@ -121,12 +121,28 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            # The operator's port, and the reason it is a second one: every
+            # tenant's agent must be allowed to reach 8080, because claim and
+            # report live there, so anything served beside them is served to
+            # every tenant — and /metrics is labelled by tenant and room. A
+            # NetworkPolicy cannot help: ingress rules select a pod and a port,
+            # never a path. Bead gc-wdt, measured from a tenant namespace.
+            - name: operator
+              containerPort: 9090
+              protocol: TCP
           env:
             # 0.0.0.0, not the binary's loopback default. A pod listening on
             # loopback is reachable by nothing at all — not the Service, not the
             # kubelet probe — and looks healthy right up to the first request.
             - name: WEBHOOK_PROXY_LISTEN
               value: 0.0.0.0:8080
+            # /metrics, /health and /api-info, and nothing a tenant may knock
+            # on. One rule, so a path added later needs no judgement: this
+            # socket carries everything that is neither the public webhook nor
+            # the tenant hand-off. 0.0.0.0 for the same reason as above — the
+            # kubelet's probe comes from the node.
+            - name: WEBHOOK_PROXY_OPERATOR_LISTEN
+              value: 0.0.0.0:9090
             # Both paths are inside the volumes mounted below, and
             # crates/app/tests/manifests.rs proves these are the names the binary
             # actually reads: it points each one somewhere broken and checks the
@@ -153,15 +169,17 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              # The number rather than the `http` name, in all three places, so
-              # the manifest test can compare them. A probe aimed at a port
-              # nothing listens on makes every pod unready and explains nothing.
-              port: 8080
+              # THE OPERATOR PORT, because that is where /health answers now
+              # (bead gc-wdt). The number rather than the `operator` name, in
+              # every place, so the manifest test can compare them — and that
+              # test refuses a probe aimed at the tenant-facing port, where
+              # /health is a 404 and every pod would be permanently unready.
+              port: 9090
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 9090
             periodSeconds: 10
             # The probe answers from the process alone and never touches the chat
             # server, so a failure here really does mean this pod is wedged.
