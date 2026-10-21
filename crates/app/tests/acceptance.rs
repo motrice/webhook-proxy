@@ -1292,6 +1292,39 @@ async fn a_delivered_report_counts_against_the_room_that_accepted_it() {
 }
 
 #[tokio::test]
+async fn a_proxy_whose_store_answers_is_ready() {
+    // BEAD gc-28a, and the honest limit of what this test can prove. With the
+    // memory store, reachable() is true by construction — so this proves the
+    // route is wired, answers on the operator socket, and says 200 for a store
+    // that answers. It does NOT prove the unready half: a proxy pointed at an
+    // unreachable database never finishes starting (gc-6b7 waits, then
+    // refuses), so there is no binary to ask. That half is proved where the
+    // behaviour lives, in postgres-outbox's own tests, against a pool whose
+    // address nothing answers on.
+    let (_dir, env) = configured();
+    let proxy = start(env).await.expect("the proxy starts");
+
+    let answered = reqwest::get(format!("http://{}/ready", proxy.operator))
+        .await
+        .expect("the binary answers readiness");
+    assert_eq!(answered.status(), StatusCode::OK);
+    assert_eq!(
+        answered.text().await.expect("a body"),
+        "ready",
+        "readiness says something other than that it is ready"
+    );
+
+    // Liveness is a different question asked of the same pod, and it must not
+    // have become the same answer: the manifest points its two probes at these
+    // two paths, and gc-28a's whole point is that they differ.
+    let alive = reqwest::get(format!("http://{}/health", proxy.operator))
+        .await
+        .expect("the binary answers liveness");
+    assert_eq!(alive.status(), StatusCode::OK);
+    assert_eq!(alive.text().await.expect("a body"), "ok");
+}
+
+#[tokio::test]
 async fn nothing_a_tenant_can_reach_answers_about_another_tenant() {
     // BEAD gc-wdt, and the measurement that found it: a pod in a TENANT
     // namespace asked this proxy for /metrics and got it in full — every
@@ -1308,7 +1341,7 @@ async fn nothing_a_tenant_can_reach_answers_about_another_tenant() {
 
     post_webhook(&proxy.address, Some(SIGNATURE.trim()), PAYLOAD).await;
 
-    for path in ["metrics", "health", "api-info"] {
+    for path in ["metrics", "health", "ready", "api-info"] {
         let answered = reqwest::get(format!("http://{}/{path}", proxy.address))
             .await
             .expect("the tenant-facing listener answers");

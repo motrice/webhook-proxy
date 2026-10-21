@@ -810,6 +810,33 @@ pub trait Handover: Send + Sync {
         tenant: &TenantId,
         limit: usize,
     ) -> Result<Vec<Offered>, StorageUnavailable>;
+
+    /// Whether this store can be used right now.
+    ///
+    /// FOR READINESS AND NOTHING ELSE (bead gc-28a). A pod whose store cannot
+    /// be reached can do none of the work above: a sender that was going to be
+    /// told `202` is told `503`, an agent's claim is handed nothing, and a
+    /// report cannot settle. With more than one replica — which gc-f7t made a
+    /// shape this repository endorses — that is a share of everything, failing
+    /// intermittently, while the pod stays in the Service.
+    ///
+    /// NOT FOR LIVENESS. Restarting will not reach a database that is down, and
+    /// a dependency failure that turned into a restart loop would replace a
+    /// recoverable outage with a pod that is never up long enough to recover.
+    /// That argument is `health`'s in the composition root and it stands.
+    ///
+    /// REQUIRED RATHER THAN DEFAULTED, deliberately. A default of "reachable"
+    /// would be inherited in silence by the next store that has something to
+    /// reach, and a readiness probe that is wrong in that direction reports
+    /// health it has not checked. An in-memory store answers `Ok` because it is
+    /// true of it, not because nobody thought about it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] when the store cannot be used. It carries no
+    /// address and no credential (gc-b0n), which is what makes it safe to put
+    /// in a probe's answer.
+    async fn reachable(&self) -> Result<(), StorageUnavailable>;
 }
 
 #[cfg(test)]
