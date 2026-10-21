@@ -6,10 +6,22 @@ metadata:
   labels:
     app.kubernetes.io/name: webhook-proxy
 spec:
-  # Two, because the delivery promise is best-effort and a restart should still
-  # cost nothing. The proxy holds no state between requests — it verifies, it
-  # translates, it forwards — so a second replica is free of the coordination
-  # problem that made the Forgejo runner a single pod.
+  # Two, so a restart costs nothing and a rolling update is not an outage.
+  #
+  # SAFE ONLY BECAUSE THE ENVIRONMENT BELOW NAMES A DATABASE. The two lines are a
+  # pair: replicas share nothing in process, so what makes a second replica safe
+  # is that every one of them answers out of the same store. This comment used to
+  # say the opposite — that the proxy "holds no state between requests", which was
+  # true before the outbox landed and is exactly the premise that makes dropping
+  # the database look harmless. With no database each replica holds its own
+  # deliveries in memory, a claim or a report reaches a replica that has never
+  # heard of the delivery, and the symptoms are a duplicate in a room and a
+  # delivered counter that disagrees with it (bead gc-f7t).
+  #
+  # Trimming this for a cluster with no database is fine — set replicas: 1.
+  # crates/app/tests/manifests.rs fails if this says more than one while
+  # WEBHOOK_PROXY_DATABASE_SECRET is unset, and README.md says what the broken
+  # pair looks like in a room.
   replicas: 2
   strategy:
     type: RollingUpdate

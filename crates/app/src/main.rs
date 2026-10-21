@@ -209,6 +209,27 @@ const DATABASE_CONNECTIONS: u32 = 8;
 /// this service delivered itself, and it no longer delivers anything.
 async fn stored(config: &Config) -> Result<Arc<dyn Handover>, Unstartable> {
     let Some(name) = config.database.as_deref() else {
+        // SAID OUT LOUD, BECAUSE NOTHING ELSE CAN SAY IT (bead gc-f7t). A
+        // process cannot know its own replica count, so this cannot fail
+        // closed; what it can do is state the one rule that makes a memory
+        // store safe, in the first thing it prints.
+        //
+        // The failure it exists for was measured on a dev cluster: two replicas
+        // with no database each held their own store, a webhook landed in A's
+        // memory, the agent's claim was load-balanced to B and got an empty
+        // list, its report was load-balanced to B and got a 404, and the
+        // symptoms were a duplicate in a room and a delivered counter that
+        // disagreed with what the room got. Nothing in that points at a replica
+        // count.
+        //
+        // ON STDERR, not stdout: stdout's first line is the address, which the
+        // acceptance tests and an operator both read as a protocol.
+        eprintln!(
+            "webhook-proxy is holding deliveries in memory: WEBHOOK_PROXY_DATABASE_SECRET \
+             is not set, so this deployment must run exactly one replica — with more, a \
+             claim or a report can reach a replica that has never heard of the delivery — \
+             and nothing uncollected survives a restart"
+        );
         return Ok(Arc::new(MemoryHandover::new()));
     };
 

@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_yaml_ng::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 const DEPLOYMENT: &str = include_str!("../../../deploy/webhook-proxy/deployment.yaml");
@@ -216,10 +216,16 @@ async fn started_with(env: HashMap<String, String>) -> Result<Started, String> {
             .to_owned();
         Ok(Started { child, address })
     } else {
-        // It exited. Its complaint is the evidence.
+        // It exited. EVERYTHING it said is the evidence, not just the first
+        // line: the binary may legitimately say something before it refuses --
+        // that it is waiting for configuration, or that it is holding
+        // deliveries in memory (bead gc-f7t) -- and a harness that read one
+        // line would turn any such line into a test failure somewhere else
+        // entirely. Reading to the end is safe because the process has already
+        // exited.
         let mut why = String::new();
-        if let Some(stderr) = child.stderr.take() {
-            let _ = BufReader::new(stderr).read_line(&mut why).await;
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut why).await;
         }
         Err(why)
     }
@@ -679,6 +685,46 @@ fn the_deployment_names_a_database_so_a_dispatch_outlives_the_process() {
          reads as 'no database' — the filter in Config::from_environment treats \
          a blank name as absent, so this would silently keep the memory outbox"
     );
+}
+
+#[test]
+fn more_than_one_replica_requires_a_shared_store() {
+    // BEAD gc-f7t. These two lines are a pair and nothing said so: replicas: 2
+    // is only correct because WEBHOOK_PROXY_DATABASE_SECRET is set, so every
+    // replica answers out of the same store. Drop one and keep the other and
+    // the deployment is silently broken -- which is what happened when these
+    // manifests were adapted for a dev cluster: replicas: 2 came across, the
+    // database did not, and two replicas each held their own memory store.
+    //
+    // What that looked like is the reason this is a test and not a comment: a
+    // webhook landed in replica A's memory, the agent's claim was load-balanced
+    // to B and got an empty list, its report was load-balanced to B and got a
+    // 404, and the symptoms were a duplicate in a room and a delivered counter
+    // that disagreed with what the room received. Nothing in that points at a
+    // replica count, and setting replicas: 1 fixed it instantly.
+    //
+    // THIS CANNOT CATCH ANOTHER REPOSITORY'S RENDERING -- the trimming happened
+    // in wallet-iac-k3s, which this test cannot see. What it does is keep THIS
+    // repository from ever shipping the broken pair, and state the rule in the
+    // one place that fails loudly. deploy/webhook-proxy/README.md carries it in
+    // prose for whoever adapts these files.
+    let manifest: Value = serde_yaml_ng::from_str(DEPLOYMENT).expect("the Deployment parses");
+    let replicas = manifest["spec"]["replicas"].as_u64().expect(
+        "the Deployment says how many replicas it wants, rather than leaving it to a default",
+    );
+
+    if replicas > 1 {
+        let declared = environment();
+        let named = declared
+            .get("WEBHOOK_PROXY_DATABASE_SECRET")
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            !named.trim().is_empty(),
+            "this Deployment asks for {replicas} replicas and names no database, so each              replica would hold its own memory store: a claim or a report can reach a              replica that has never heard of the delivery. Either name              WEBHOOK_PROXY_DATABASE_SECRET or set replicas: 1 (bead gc-f7t)"
+        );
+    }
 }
 
 #[test]

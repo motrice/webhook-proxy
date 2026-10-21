@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 const PAYLOAD: &[u8] = include_bytes!("../../adapters/github-signatures/fixtures/push.json");
@@ -94,10 +94,12 @@ async fn start(extra: HashMap<&str, String>) -> Result<Proxy, String> {
         .map_err(|why| why.to_string())?;
 
     let Some(line) = announced else {
-        // It exited. Its complaint is the interesting part.
+        // It exited, and everything it said is the interesting part rather than
+        // only the first line -- the binary may say something before it refuses
+        // (bead gc-f7t). Reading to the end is safe: the process is gone.
         let mut why = String::new();
-        if let Some(stderr) = child.stderr.take() {
-            let _ = BufReader::new(stderr).read_line(&mut why).await;
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut why).await;
         }
         return Err(why);
     };
@@ -933,6 +935,107 @@ async fn a_secret_that_arrives_a_moment_late_is_waited_for() {
         .expect("it announces a port rather than exiting");
 
     assert!(line.starts_with("listening on 127.0.0.1:"), "{line}");
+
+    let _ = child.start_kill();
+    drop(dir);
+}
+
+#[tokio::test]
+async fn a_proxy_holding_deliveries_in_memory_says_so_before_it_listens() {
+    // BEAD gc-f7t, found by adapting these manifests for a dev cluster. The
+    // rendering kept replicas: 2 and did not carry the database, so two
+    // replicas each held their own memory store. Nothing said so, and the
+    // symptoms pointed nowhere near a replica count: a webhook stored in A's
+    // memory, an agent's claim load-balanced to B getting an empty list, a
+    // report load-balanced to B answering 404, a duplicate in the room and a
+    // delivered counter that disagreed with what the room actually got.
+    //
+    // A process cannot know its own replica count, so this cannot fail closed.
+    // It CAN say what it is doing, in the first thing it prints, which turns
+    // that whole investigation into one line of a log.
+    let (dir, env) = configured();
+    assert!(
+        !env.contains_key("WEBHOOK_PROXY_DATABASE_SECRET"),
+        "this fixture names a database, so it proves nothing about the fallback"
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_webhook-proxy"));
+    command
+        .env_clear()
+        .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in &env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("the binary runs");
+
+    let mut complaints = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+    let said = tokio::time::timeout(Duration::from_secs(10), complaints.next_line())
+        .await
+        .expect("it says something within ten seconds")
+        .expect("stderr is readable")
+        .expect("it says what it is doing rather than exiting");
+
+    // The words an operator needs: that it is memory, and the rule that makes
+    // memory unsafe. Not a hint that something might be suboptimal.
+    assert!(said.contains("memory"), "{said}");
+    assert!(
+        said.contains("one replica"),
+        "the line does not name the rule it exists for: {said}"
+    );
+
+    // ON STDERR AND NOT STDOUT, because stdout is a protocol: the first line is
+    // the address, which the acceptance harness and an operator both read. A
+    // warning printed there would have broken every test in this file, which is
+    // a thing worth asserting rather than discovering.
+    let mut announced = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
+    let line = tokio::time::timeout(Duration::from_secs(10), announced.next_line())
+        .await
+        .expect("it starts within ten seconds")
+        .expect("stdout is readable")
+        .expect("it announces a port rather than exiting");
+    assert!(line.starts_with("listening on 127.0.0.1:"), "{line}");
+
+    let _ = child.start_kill();
+    drop(dir);
+}
+
+#[tokio::test]
+async fn a_proxy_that_names_a_database_does_not_warn_about_memory() {
+    // The other side of the same line, cheaply: a deployment that names a
+    // database must not be told it is running on memory. Proved without a
+    // database by naming a secret that is not there -- the binary then
+    // complains about the missing secret, which is only reachable from the
+    // branch that did NOT fall back. An unconditional warning would fail here.
+    let (dir, env) = configured();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_webhook-proxy"));
+    command
+        .env_clear()
+        .env("WEBHOOK_PROXY_LISTEN", "127.0.0.1:0")
+        .env("WEBHOOK_PROXY_STARTUP_WAIT_MS", "0")
+        .env("WEBHOOK_PROXY_DATABASE_SECRET", "database-url")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in &env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("the binary runs");
+
+    let mut complaints = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+    let said = tokio::time::timeout(Duration::from_secs(10), complaints.next_line())
+        .await
+        .expect("it says something within ten seconds")
+        .expect("stderr is readable")
+        .expect("it complains rather than starting silently");
+
+    assert!(said.contains("database-url"), "{said}");
+    assert!(
+        !said.contains("memory"),
+        "a deployment that named a database was told it is running on memory: {said}"
+    );
 
     let _ = child.start_kill();
     drop(dir);

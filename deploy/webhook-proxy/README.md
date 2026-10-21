@@ -117,6 +117,31 @@ rather than discover:
 The schema applies itself at startup, behind the advisory lock `sqlx` takes, so
 two replicas cannot race it and there is no migration job to run.
 
+**`replicas: 2` and `WEBHOOK_PROXY_DATABASE_SECRET` are a pair. Trim one and you
+must trim the other.** More than one replica is only correct because every
+replica answers out of the same store; with no database each replica holds its
+own in memory, and then a delivery stored by one is unknown to the other. This
+is the one invariant in these manifests that an adapter is most likely to break
+by trimming, so it is worth knowing what it looks like when broken (bead
+`gc-f7t`, measured on a dev cluster that kept `replicas: 2` and dropped the
+database):
+
+- A webhook lands on replica A and is stored in A's memory. `202`, correctly.
+- The agent's claim is load-balanced. On A it gets the delivery; on B an empty
+  list.
+- Its report is load-balanced again. On B the identity is unknown, so
+  `POST /deliveries/{delivery}/report` answers `404`.
+- **The symptoms are a duplicate message in a room and a `delivered` counter
+  that disagrees with what the room actually received** — neither of which
+  points at a replica count.
+
+A process cannot know its own replica count, so this cannot fail closed at
+startup. Two things do catch it: a proxy with no database **says so on stderr
+in its first line**, and `crates/app/tests/manifests.rs` fails if this file ever
+asks for more than one replica without naming a database. If you are adapting
+these manifests and want a single pod with no database, that is a supported
+shape — set `replicas: 1` and expect to lose anything uncollected on restart.
+
 Two things each `template` stanza must get right, both of which cost a working
 deployment if missed, and both of which have already cost one once:
 
