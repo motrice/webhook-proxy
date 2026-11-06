@@ -22,8 +22,8 @@
 use std::sync::Mutex;
 
 use application::ports::{
-    Behind, Claimed, Discharged, Handover, Offered, Reoffered, Report, StorageUnavailable, Swept,
-    TenantId, Uncollected,
+    Behind, Claimed, Counted, Discharged, Handover, Offered, PerReason, PerRoom, PerTenant,
+    Reoffered, Report, RoomOutcome, StorageUnavailable, Swept, TenantId, Uncollected,
 };
 use async_trait::async_trait;
 use domain::{DeliveryId, Timestamp};
@@ -45,6 +45,31 @@ use domain::{DeliveryId, Timestamp};
 pub struct MemoryHandover {
     /// In the order offered, which is the order it should be collected in.
     offered: Mutex<Vec<Owed>>,
+    /// What has been reported and what has been dropped, since this process
+    /// started.
+    ///
+    /// COUNTED BY THE STORE RATHER THAN BY ITS CALLER, which is bead gc-5px and
+    /// is a property of the port rather than of this implementation: a count
+    /// kept beside the metrics endpoint is one replica's share of the truth,
+    /// and one a routine apply destroys. Here it still dies with the process —
+    /// so does everything else in this store, and the deployment that endorses
+    /// two replicas is the one that names a database (bead gc-f7t).
+    ///
+    /// Separate from `offered` and not derived from it, because `report`
+    /// removes the row it discharges: by the time there is something to count,
+    /// the thing it was counted from is gone.
+    counted: Mutex<Tallies>,
+}
+
+/// The three counts this store keeps, each keyed by what it may be summed over.
+#[derive(Default)]
+struct Tallies {
+    /// Rooms that were told, by (tenant, room).
+    delivered: std::collections::BTreeMap<(String, String), u64>,
+    /// Rooms that were not, by (tenant, room, reason). EVERY ONE IS A LOSS.
+    abandoned: std::collections::BTreeMap<(String, String, String), u64>,
+    /// Deliveries swept away before their tenant collected them, by tenant.
+    dropped: std::collections::BTreeMap<String, u64>,
 }
 
 /// One Delivery owed, and whether somebody is holding it.
@@ -85,6 +110,39 @@ impl core::fmt::Debug for MemoryHandover {
 
 #[async_trait]
 impl Handover for MemoryHandover {
+    async fn counted(&self) -> Result<Counted, StorageUnavailable> {
+        let counted = self.counted.lock().map_err(|_| StorageUnavailable)?;
+        Ok(Counted {
+            delivered: counted
+                .delivered
+                .iter()
+                .map(|((tenant, room), count)| PerRoom {
+                    tenant: tenant.clone(),
+                    room: room.clone(),
+                    count: *count,
+                })
+                .collect(),
+            abandoned: counted
+                .abandoned
+                .iter()
+                .map(|((tenant, room, reason), count)| PerReason {
+                    tenant: tenant.clone(),
+                    room: room.clone(),
+                    reason: reason.clone(),
+                    count: *count,
+                })
+                .collect(),
+            dropped: counted
+                .dropped
+                .iter()
+                .map(|(tenant, count)| PerTenant {
+                    tenant: tenant.clone(),
+                    count: *count,
+                })
+                .collect(),
+        })
+    }
+
     async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
         let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
         held.push(Owed {
@@ -144,7 +202,7 @@ impl Handover for MemoryHandover {
         &self,
         tenant: &TenantId,
         delivery: &DeliveryId,
-        _report: &Report,
+        report: &Report,
         _at: Timestamp,
     ) -> Result<Discharged, StorageUnavailable> {
         let mut held = self.offered.lock().map_err(|_| StorageUnavailable)?;
@@ -161,10 +219,34 @@ impl Handover for MemoryHandover {
         // exit, and keeping it would be modelling a retention sweep that has
         // nothing to sweep.
         if held.len() == before {
-            Ok(Discharged::NotOutstanding)
-        } else {
-            Ok(Discharged::Settled)
+            return Ok(Discharged::NotOutstanding);
         }
+
+        // COUNTED ONLY HERE, past the return above, which is what makes a
+        // report that arrives twice one count rather than two. An agent whose
+        // reply was lost on the way back must be able to send it again and this
+        // API says so, so the second one discharges nothing and must count
+        // nothing — a number that inflates under exactly the conditions
+        // somebody is investigating is worse than no number (bead gc-556).
+        if let Report::Reached(rooms) = report {
+            let mut counted = self.counted.lock().map_err(|_| StorageUnavailable)?;
+            for (room, outcome) in rooms {
+                let whose = tenant.as_str().to_owned();
+                let room = room.as_str().to_owned();
+                match outcome {
+                    RoomOutcome::Delivered => {
+                        *counted.delivered.entry((whose, room)).or_default() += 1;
+                    }
+                    RoomOutcome::Abandoned(why) => {
+                        *counted
+                            .abandoned
+                            .entry((whose, room, why.spelled().to_owned()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+        Ok(Discharged::Settled)
     }
 
     async fn reoffer(&self, delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
@@ -201,9 +283,21 @@ impl Handover for MemoryHandover {
             .partition(|owed| owed.offered.accepted_at() < accepted_before);
         *held = current;
 
+        let uncollected: Vec<Uncollected> = old.iter().map(|owed| lost(&owed.offered)).collect();
+
+        // THE COUNT OF A LOSS, kept where the rows were, for the reason the
+        // port's `counted` gives: it used to be an integer in the process that
+        // exported it, so an apply that rolled the pod destroyed the evidence
+        // that anything had been dropped.
+        let mut counted = self.counted.lock().map_err(|_| StorageUnavailable)?;
+        for one in &uncollected {
+            *counted.dropped.entry(one.tenant.clone()).or_default() += 1;
+        }
+        drop(counted);
+
         Ok(Swept {
             settled: 0,
-            uncollected: old.iter().map(|owed| lost(&owed.offered)).collect(),
+            uncollected,
         })
     }
 
@@ -255,7 +349,9 @@ fn lost(offered: &Offered) -> Uncollected {
 
 #[cfg(test)]
 mod handover_tests {
-    use application::ports::{Discharged, Handover, Offered, Reoffered, Report, TenantId};
+    use application::ports::{
+        Discharged, DispatchFailed, Handover, Offered, Reoffered, Report, RoomOutcome, TenantId,
+    };
     use domain::{
         BranchName, Correlation, DeliveryId, Event, OriginId, Pusher, RepositoryName, Timestamp,
     };
@@ -591,6 +687,89 @@ mod handover_tests {
                 .await
                 .expect("asked"),
             Reoffered::NotStored
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loss_its_tenant_reported_is_counted_by_room_and_by_reason() {
+        // BEAD gc-5px: counted BY THE STORE, which is the whole change. These
+        // numbers used to be accumulated in the process that served the
+        // metrics endpoint, so two replicas each held a share of them and a
+        // routine apply zeroed the count of a real loss. A count belongs
+        // wherever the store is — which for this store is still one process,
+        // and that is honest rather than a gap: nothing here survives exit.
+        //
+        // By REASON as well as by room, because the four are not
+        // interchangeable to whoever acts on one: `rejected` is a
+        // configuration problem in the tenant's own repository, `unreachable`
+        // is the network.
+        let store = MemoryHandover::new();
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1))
+            .await
+            .expect("stored");
+
+        assert_eq!(
+            store
+                .report(
+                    &tenant("wallet-lab-prod"),
+                    &DeliveryId::new("d-1").expect("an identity"),
+                    &Report::Reached(vec![(
+                        domain::DestinationId::new("oncall-room").expect("an identity"),
+                        RoomOutcome::Abandoned(DispatchFailed::Unreachable),
+                    )]),
+                    at(2),
+                )
+                .await
+                .expect("asked"),
+            Discharged::Settled
+        );
+
+        let counted = store.counted().await.expect("asked");
+        assert_eq!(counted.abandoned.len(), 1, "{counted:?}");
+        assert_eq!(counted.abandoned[0].tenant, "wallet-lab-prod");
+        assert_eq!(counted.abandoned[0].room, "oncall-room");
+        assert_eq!(counted.abandoned[0].reason, "unreachable");
+        assert_eq!(counted.abandoned[0].count, 1);
+        assert!(
+            counted.delivered.is_empty(),
+            "a loss was counted as a delivery, which would make a ratio of \
+             the two say everything is fine: {counted:?}"
+        );
+    }
+    #[tokio::test]
+    async fn a_delivery_swept_away_before_anyone_collected_it_is_counted_against_its_tenant() {
+        // The third kind of loss bead gc-g9x enumerated, and the only one that
+        // happens without anybody having attempted anything: retention deletes
+        // a Delivery its tenant never came for. Counted by tenant because it
+        // never reached a room, so there is no room to name.
+        //
+        // This count was an `AtomicU64` beside the metrics endpoint
+        // (`Backlog::dropped`) and is the one the bare
+        // `webhook_proxy_uncollected_dropped_total` was read from, so it had
+        // both defects at once: two replicas each ran the sweep and each held
+        // a share of the answer, and an apply set it back to zero.
+        let store = MemoryHandover::new();
+        for (id, whose) in [
+            ("d-1", "wallet-lab-prod"),
+            ("d-2", "wallet-lab-prod"),
+            ("d-3", "wallet-hsm-prod"),
+        ] {
+            store.offer(&offered(id, whose, 1)).await.expect("stored");
+        }
+
+        let swept = store.sweep(at(2)).await.expect("swept");
+        assert_eq!(swept.uncollected.len(), 3, "the sweep deleted nothing");
+
+        let counted = store.counted().await.expect("asked");
+        assert_eq!(
+            counted
+                .dropped
+                .iter()
+                .map(|one| (one.tenant.as_str(), one.count))
+                .collect::<Vec<_>>(),
+            vec![("wallet-hsm-prod", 1), ("wallet-lab-prod", 2)],
+            "{counted:?}"
         );
     }
 }

@@ -422,6 +422,31 @@ async fn scraped(address: &str) -> String {
         .expect("a body")
 }
 
+/// What `/metrics` says once it says `expected`, or the last thing it said.
+///
+/// POLLED RATHER THAN READ ONCE, SINCE BEAD gc-5px, and the reason is the
+/// change that bead made rather than a flake being papered over. The counts
+/// used to be incremented by the report handler on its way out, so they were
+/// visible to the very next scrape — and were one replica's share of the truth,
+/// reset by every deployment. They are now counted by the STORE and read back
+/// by a task on an interval, because a scrape must never touch the database.
+/// So the contract an operator actually has is "the number appears within an
+/// interval", and that is what this asserts.
+///
+/// Returns as soon as it appears, so a passing test waits for one pass rather
+/// than for this deadline. The deadline is long enough that a loaded machine
+/// does not fail it and short enough to fail rather than hang.
+async fn scraped_until(address: &str, expected: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let scraped = scraped(address).await;
+        if scraped.contains(expected) || std::time::Instant::now() > deadline {
+            return scraped;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn an_agent_is_offered_none_of_another_tenants_deliveries() {
     // THE ONE PROPERTY THE WHOLE SPLIT EXISTS TO PROVIDE, end to end against
@@ -1188,13 +1213,11 @@ async fn a_loss_a_tenant_reports_is_counted_by_room_and_by_reason() {
         StatusCode::NO_CONTENT
     );
 
-    let scraped = scraped(&proxy.operator).await;
-    assert!(
-        scraped.contains(&format!(
-            "webhook_proxy_room_abandoned_total{{tenant=\"devsecops\",room=\"{ROOM}\",reason=\"unreachable\"}} 1"
-        )),
-        "{scraped}"
+    let expected = format!(
+        "webhook_proxy_room_abandoned_total{{tenant=\"devsecops\",room=\"{ROOM}\",reason=\"unreachable\"}} 1"
     );
+    let scraped = scraped_until(&proxy.operator, &expected).await;
+    assert!(scraped.contains(&expected), "{scraped}");
     // And in the total an alert can name without knowing which rooms exist.
     assert!(
         scraped.contains("webhook_proxy_room_abandoned_total 1"),
@@ -1241,7 +1264,7 @@ async fn a_report_that_arrives_twice_is_one_loss() {
         "the second report was not refused, so this test proves nothing"
     );
 
-    let scraped = scraped(&proxy.operator).await;
+    let scraped = scraped_until(&proxy.operator, "webhook_proxy_room_abandoned_total 1").await;
     assert!(
         scraped.contains("webhook_proxy_room_abandoned_total 1"),
         "two reports of one loss were counted twice: {scraped}"
@@ -1278,13 +1301,10 @@ async fn a_delivered_report_counts_against_the_room_that_accepted_it() {
         StatusCode::NO_CONTENT
     );
 
-    let scraped = scraped(&proxy.operator).await;
-    assert!(
-        scraped.contains(&format!(
-            "webhook_proxy_room_delivered_total{{tenant=\"devsecops\",room=\"{ROOM}\"}} 1"
-        )),
-        "{scraped}"
-    );
+    let expected =
+        format!("webhook_proxy_room_delivered_total{{tenant=\"devsecops\",room=\"{ROOM}\"}} 1");
+    let scraped = scraped_until(&proxy.operator, &expected).await;
+    assert!(scraped.contains(&expected), "{scraped}");
     assert!(
         scraped.contains("webhook_proxy_room_abandoned_total 0"),
         "a delivery was counted as a loss: {scraped}"

@@ -21,7 +21,11 @@ delivery.
 > rather than an absolute. **Counted there and not here on purpose** — this pod
 > has no Service, no HTTPRoute and no ingress NetworkPolicy (`gc-72e`), so
 > nothing can scrape it, and a counter in this process would have been erased by
-> the next restart along with the log. Bead `gc-556`.
+> the next restart along with the log. Bead `gc-556`. And the platform's copy is
+> no longer erased by the platform's OWN restart either: it keeps the count in
+> its database, written in the transaction that settles the report (`gc-5px`).
+> Until that landed, this paragraph's argument held one layer up and failed at
+> the next.
 >
 > Two things that still only this log knows: the attempt-by-attempt detail, and
 > a loss the agent never manages to report at all — if this pod dies before

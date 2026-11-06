@@ -136,7 +136,7 @@ mod tests {
 
     use super::Retention;
     use crate::ports::{
-        Behind, Claimed, Clock, Discharged, Handover, Offered, Reoffered, Report,
+        Behind, Claimed, Clock, Counted, Discharged, Handover, Offered, Reoffered, Report,
         StorageUnavailable, Swept, TenantId, Uncollected,
     };
 
@@ -185,6 +185,10 @@ mod tests {
 
     #[async_trait]
     impl Handover for Store {
+        async fn counted(&self) -> Result<Counted, StorageUnavailable> {
+            Ok(Counted::default())
+        }
+
         async fn offer(&self, _offered: &Offered) -> Result<(), StorageUnavailable> {
             unreachable!("retention never offers")
         }

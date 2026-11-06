@@ -370,15 +370,33 @@ const REPORT_BEHIND_AFTER: Duration = Duration::from_hours(24);
 
 /// How often retention runs.
 ///
-/// Its own interval rather than the outbox sweep's, which is five seconds: the
-/// questions here are about days and a month, and asking them every five
-/// seconds would mean a `GROUP BY` over every outstanding row twelve times a
-/// minute for an answer that cannot have changed.
+/// Fifteen minutes, because the questions it asks are about days and a month: a
+/// shorter interval would mean a `GROUP BY` over every outstanding row for an
+/// answer that cannot have changed. (This used to say "its own interval rather
+/// than the outbox sweep's, which is five seconds". There is no outbox sweep —
+/// bead gc-72e.3.2 removed the delivery loop and its five-second interval with
+/// it, and this comment outlived the thing it compared itself to.)
 ///
 /// A task in this process rather than a cron job, which is bead gc-mnn's
 /// reasoning: a second thing the deployment already does cannot drift out of
 /// the deployment, and a job nobody owns eventually belongs to nobody.
 const REAP_EVERY: Duration = Duration::from_mins(15);
+
+/// How often the exported counts are read back from the store.
+///
+/// Bead gc-5px. Far shorter than [`REAP_EVERY`] and it can afford to be: this
+/// reads three summary tables whose size is bounded by how many rooms the
+/// tenants have configured, not by how much traffic there has been, so a pass
+/// is three small ordered scans. Retention's own question is a `GROUP BY` over
+/// every outstanding row, which is why the two are not one task.
+///
+/// Five seconds rather than at scrape time, which is the arrangement the whole
+/// bead turns on: a scrape must never touch the store, because a monitoring
+/// system polling every fifteen seconds would become load on the thing it is
+/// monitoring and would go quiet exactly when the database is in trouble. The
+/// cost is that a count is up to five seconds stale — finer than any scrape
+/// interval worth configuring, and a trade nobody has to think about again.
+const COUNT_EVERY: Duration = Duration::from_secs(5);
 
 /// Retention, and the only report anybody gets that a tenant has stopped.
 ///
@@ -404,6 +422,12 @@ fn reaping(
                     // to count against. A summary line would make it a number
                     // with nothing to trace back to the push that caused it.
                     //
+                    // The COUNT of them is not kept here any more (bead
+                    // gc-5px). The sweep writes it in the transaction that
+                    // deletes the rows, so a line logged and a number exported
+                    // can no longer disagree — and the number survives this
+                    // pod, which it did not when this loop held it.
+                    //
                     // The trace is what makes it traceable (gc-4oo.5); the
                     // Events are deliberately not here, because an alert's
                     // summary and labels are other people's words.
@@ -418,8 +442,6 @@ fn reaping(
                              reached it first"
                         );
                     }
-                    backlog.dropped(reaped.uncollected.len());
-
                     // One line per tenant that is behind, at warn rather than
                     // error: it is not yet a loss, which is the distinction the
                     // whole job rests on. Nothing is logged for a tenant that
@@ -446,6 +468,60 @@ fn reaping(
                 // stands forever and somebody eventually acts on it.
                 Ok(_) => backlog.found(&[]),
                 Err(why) => tracing::error!(%why, "cannot apply retention"),
+            }
+            tokio::time::sleep(every).await;
+        }
+    })
+}
+
+/// Reads the counts back from the store, so a scrape never has to.
+///
+/// Bead gc-5px, and the shape is [`reaping`]'s: a task writes what a scrape
+/// reads. The three numbers it carries used to be accumulated in this process,
+/// which made each of them one replica's share of the truth and made an
+/// ordinary apply erase the count of a real loss — while the rows that prove it
+/// survived in the database.
+///
+/// THE FIRST PASS IS IMMEDIATE, so a pod that has just started reports the
+/// cluster's real totals rather than zeros for its first interval. It is not
+/// waited on before the listener is announced: readiness must not depend on the
+/// database (bead gc-28a), and a fresh pod exporting a zero for five seconds
+/// costs nothing — each pod is its own series, so there is no counter going
+/// backwards for anybody to see.
+///
+/// A FAILED READ LEAVES THE LAST ANSWER STANDING, which the port asks for and
+/// is the one decision in here. These are counters: one that fell to zero
+/// because a query timed out would read as a cluster that had lost its history,
+/// and somebody would go looking for the deployment that caused it. Logged at
+/// warn rather than error, and on the transition only — a store that is down
+/// stays down for many passes, and gc-mbr already decided that a per-attempt
+/// line floods the log somebody is reading to find the one that matters.
+fn counting(
+    handover: Arc<dyn Handover>,
+    told: Arc<Outcomes>,
+    every: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut answering = true;
+        loop {
+            match handover.counted().await {
+                Ok(counted) => {
+                    told.counted(counted);
+                    if !answering {
+                        answering = true;
+                        tracing::info!("the store is answering what each room was told again");
+                    }
+                }
+                Err(why) => {
+                    if answering {
+                        answering = false;
+                        tracing::warn!(
+                            %why,
+                            "cannot read what each room was told; the exported counts \
+                             are the last ones the store gave"
+                        );
+                    }
+                }
             }
             tokio::time::sleep(every).await;
         }
@@ -494,9 +570,23 @@ fn exported(backlog: &Backlog, told: &Outcomes) -> String {
     writeln!(
         out,
         "webhook_proxy_uncollected_dropped_total {}",
-        backlog.losses()
+        told.never_collected()
     )
     .expect("writing to a String cannot fail");
+    // PER TENANT AS WELL, SINCE BEAD gc-5px, and the bare line above is their
+    // sum rather than a separate number. The bare one stays because an alert
+    // has to be writable without knowing which tenants exist; the labelled ones
+    // are new because the bare one cannot say whose agent stopped collecting,
+    // and that is the first thing anybody asks next.
+    for one in told.dropped() {
+        writeln!(
+            out,
+            "webhook_proxy_uncollected_dropped_total{{tenant=\"{}\"}} {}",
+            escaped(&one.tenant),
+            one.count
+        )
+        .expect("writing to a String cannot fail");
+    }
 
     for (name, help, kind) in [
         (
@@ -539,12 +629,20 @@ fn exported(backlog: &Backlog, told: &Outcomes) -> String {
         .expect("writing to a String cannot fail");
     writeln!(out, "webhook_proxy_room_abandoned_total {}", told.losses())
         .expect("writing to a String cannot fail");
-    for ((tenant, room, why), count) in told.abandoned() {
+    for one in told.abandoned() {
+        // THE REASON IS ESCAPED TOO, SINCE BEAD gc-5px, and it was not before.
+        // It used to be a `&'static str` from a closed set of four words, so
+        // escaping it would have been dead code. It now comes back from the
+        // store as text, and a value this process did not choose goes through
+        // the same escaping as every other one — the alternative is an
+        // unparseable scrape the day something else writes that column.
         writeln!(
             out,
-            "webhook_proxy_room_abandoned_total{{tenant=\"{}\",room=\"{}\",reason=\"{why}\"}} {count}",
-            escaped(&tenant),
-            escaped(&room)
+            "webhook_proxy_room_abandoned_total{{tenant=\"{}\",room=\"{}\",reason=\"{}\"}} {}",
+            escaped(&one.tenant),
+            escaped(&one.room),
+            escaped(&one.reason),
+            one.count
         )
         .expect("writing to a String cannot fail");
     }
@@ -560,12 +658,13 @@ fn exported(backlog: &Backlog, told: &Outcomes) -> String {
     .expect("writing to a String cannot fail");
     writeln!(out, "# TYPE webhook_proxy_room_delivered_total counter")
         .expect("writing to a String cannot fail");
-    for ((tenant, room), count) in told.delivered() {
+    for one in told.delivered() {
         writeln!(
             out,
-            "webhook_proxy_room_delivered_total{{tenant=\"{}\",room=\"{}\"}} {count}",
-            escaped(&tenant),
-            escaped(&room)
+            "webhook_proxy_room_delivered_total{{tenant=\"{}\",room=\"{}\"}} {}",
+            escaped(&one.tenant),
+            escaped(&one.room),
+            one.count
         )
         .expect("writing to a String cannot fail");
     }
@@ -829,26 +928,26 @@ async fn run() -> Result<(), Unstartable> {
     // about them is a webhook. What authenticates them is the service mesh, and
     // `collecting`'s own documentation says what that assumption costs if it
     // does not hold.
-    // What each room was told, shared: the report path writes it and the scrape
-    // reads it. In this process because the tenant agents that learn these
-    // outcomes have no scrape endpoint and bead gc-72e forbade them one, so an
-    // abandoned dispatch was visible in one pod's log and nowhere else — and
-    // gone with that pod (bead gc-556).
-    let outcomes = Arc::new(Outcomes::new());
-
     let collecting = collecting::Collecting::new(
         Arc::clone(&handover),
         Arc::new(SystemClock),
         routing.tenants().clone(),
-        Arc::clone(&outcomes),
     );
 
-    // One backlog, shared: the retention task writes it and the scrape reads it.
-    // A scrape must never touch the store (see `exported`), so what /metrics
-    // says about a tenant is as fresh as the last pass and no fresher — which is
-    // the right trade for a number measured in days.
+    // THREE SHARED PLACES AND TWO TASKS THAT FILL THEM, because a scrape must
+    // never touch the store (see `exported`): what /metrics says is as fresh as
+    // the last pass of whichever task wrote it and no fresher.
+    //
+    // The backlog is retention's, every fifteen minutes, which is the right
+    // trade for a number measured in days. The counts are their own task every
+    // five seconds, because they answer "did we lose anything" and because a
+    // summary table is cheap enough to ask that often (bead gc-5px). Both used
+    // to be written by whatever happened to be in the request path, which is
+    // what made them one replica's share of the truth.
     let backlog = Arc::new(Backlog::new());
+    let outcomes = Arc::new(Outcomes::new());
     let reaped = reaping(Arc::clone(&handover), Arc::clone(&backlog), REAP_EVERY);
+    let tallied = counting(Arc::clone(&handover), Arc::clone(&outcomes), COUNT_EVERY);
 
     let counted = Arc::clone(&backlog);
     let told = Arc::clone(&outcomes);
@@ -937,6 +1036,10 @@ async fn run() -> Result<(), Unstartable> {
     // on the next start instead. Nothing waits on this and nothing is half
     // done — a sweep deletes and reports in one statement.
     reaped.abort();
+    // The same, and even less is at stake: this task only ever READS. A pass
+    // that does not happen leaves the last counts in a process that is about to
+    // exit, and the next pod reads the same numbers out of the same store.
+    tallied.abort();
 
     Ok(())
 }

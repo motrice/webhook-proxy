@@ -394,9 +394,9 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use application::ports::{
-        Behind, Claimed, Clock, Discharged, Handover, Ids, MalformedProof, Offered, Proofs,
-        Reoffered, Report, SecretUnavailable, StorageUnavailable, Swept, TenantId, Translator,
-        Untranslatable,
+        Behind, Claimed, Clock, Counted, Discharged, Handover, Ids, MalformedProof, Offered,
+        Proofs, Reoffered, Report, SecretUnavailable, StorageUnavailable, Swept, TenantId,
+        Translator, Untranslatable,
     };
     use async_trait::async_trait;
     use axum::Router;
@@ -608,6 +608,10 @@ mod tests {
 
     #[async_trait]
     impl Handover for Store {
+        async fn counted(&self) -> Result<Counted, StorageUnavailable> {
+            Ok(Counted::default())
+        }
+
         async fn offer(&self, _offered: &Offered) -> Result<(), StorageUnavailable> {
             if self.available {
                 Ok(())

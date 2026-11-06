@@ -6,8 +6,8 @@
 //! had been borrowed from.
 
 use application::ports::{
-    Behind, Claimed, Discharged, Handover, Offered, Reoffered, Report, RoomOutcome,
-    StorageUnavailable, Swept, TenantId, Uncollected,
+    Behind, Claimed, Counted, Discharged, Handover, Offered, PerReason, PerRoom, PerTenant,
+    Reoffered, Report, RoomOutcome, StorageUnavailable, Swept, TenantId, Uncollected,
 };
 use async_trait::async_trait;
 use domain::{Correlation, DeliveryId, OriginId, Timestamp};
@@ -87,6 +87,18 @@ impl PostgresHandover {
 const COLUMNS: &str = "delivery, tenant, origin, events, trace, span, state, replayed, \
      (EXTRACT(EPOCH FROM accepted_at) * 1000)::BIGINT AS accepted_at_ms";
 
+/// One count, as a number that cannot be negative.
+///
+/// `BIGINT` is signed and these columns only ever grow from one, so a negative
+/// value means somebody has been editing the database by hand. Clamped to zero
+/// rather than refused: the counts an operator is reading are worth more than
+/// the one row that was tampered with, and a scrape that failed outright would
+/// take the other two tables down with it.
+fn counts(row: &sqlx::postgres::PgRow, column: &str) -> Result<u64, StorageUnavailable> {
+    let count: i64 = row.try_get(column).map_err(|_| StorageUnavailable)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// Reads one row back into what the port speaks.
 fn offered(row: &sqlx::postgres::PgRow) -> Result<Offered, StorageUnavailable> {
     let delivery: String = row.try_get("delivery").map_err(|_| StorageUnavailable)?;
@@ -126,6 +138,75 @@ fn offered(row: &sqlx::postgres::PgRow) -> Result<Offered, StorageUnavailable> {
 
 #[async_trait]
 impl Handover for PostgresHandover {
+    async fn counted(&self) -> Result<Counted, StorageUnavailable> {
+        // THREE SMALL SELECTS AND NO AGGREGATION, which is what a summary table
+        // buys and the reason this can be asked far more often than `behind`
+        // can. A row exists per (tenant, room) and per reason, so the size of
+        // the answer is bounded by how many rooms the tenants have configured
+        // rather than by how much traffic there has been.
+        //
+        // Ordered so the exported text is stable between scrapes. Nothing reads
+        // the order, and that is exactly why it is worth fixing: a diff of two
+        // scrapes should show what changed, not how the planner felt.
+        let delivered = sqlx::query(
+            "SELECT tenant, room, deliveries FROM room_delivered ORDER BY tenant, room",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| StorageUnavailable)?;
+
+        let abandoned = sqlx::query(
+            "SELECT tenant, room, reason, losses FROM room_abandoned \
+             ORDER BY tenant, room, reason",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| StorageUnavailable)?;
+
+        let dropped =
+            sqlx::query("SELECT tenant, dropped FROM uncollected_dropped ORDER BY tenant")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| StorageUnavailable)?;
+
+        Ok(Counted {
+            delivered: delivered
+                .iter()
+                .map(|row| {
+                    Ok(PerRoom {
+                        tenant: row.try_get("tenant").map_err(|_| StorageUnavailable)?,
+                        room: row.try_get("room").map_err(|_| StorageUnavailable)?,
+                        count: counts(row, "deliveries")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageUnavailable>>()?,
+            abandoned: abandoned
+                .iter()
+                .map(|row| {
+                    Ok(PerReason {
+                        tenant: row.try_get("tenant").map_err(|_| StorageUnavailable)?,
+                        room: row.try_get("room").map_err(|_| StorageUnavailable)?,
+                        // Read as text, which the port explains: the four
+                        // spellings are a published interface and this build
+                        // must be able to report a row an earlier one wrote,
+                        // including under a word it no longer knows.
+                        reason: row.try_get("reason").map_err(|_| StorageUnavailable)?,
+                        count: counts(row, "losses")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageUnavailable>>()?,
+            dropped: dropped
+                .iter()
+                .map(|row| {
+                    Ok(PerTenant {
+                        tenant: row.try_get("tenant").map_err(|_| StorageUnavailable)?,
+                        count: counts(row, "dropped")?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageUnavailable>>()?,
+        })
+    }
+
     async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
         // One statement, so there is no half-written row to reason about. The
         // Events go in together for the reason the migration gives.
@@ -258,6 +339,15 @@ impl Handover for PostgresHandover {
         // the NULL check is what makes a second report of the same Delivery
         // answer NotOutstanding rather than overwriting the first, so an agent
         // whose reply was lost can send it again without erasing what it said.
+        // ONE TRANSACTION OVER THE ROW AND THE COUNTS, which is bead gc-5px
+        // and is what makes the counts trustworthy rather than merely durable:
+        // there is no window in which a Delivery is settled and uncounted, and
+        // no way for a count to record something that did not discharge. It
+        // also carries the no-double-count guarantee for free — the counting
+        // below is reached only when the UPDATE actually discharged something,
+        // so an agent re-sending a report whose reply was lost adds nothing.
+        let mut writing = self.pool.begin().await.map_err(|_| StorageUnavailable)?;
+
         let settled = sqlx::query(
             "UPDATE handover \
              SET reported_at = to_timestamp($4::BIGINT / 1000.0), report = $3, \
@@ -268,16 +358,55 @@ impl Handover for PostgresHandover {
         .bind(tenant.as_str())
         .bind(written_report(report))
         .bind(at.millis_since_epoch())
-        .execute(&self.pool)
+        .execute(&mut *writing)
         .await
         .map_err(|_| StorageUnavailable)?
         .rows_affected();
 
         if settled == 0 {
-            Ok(Discharged::NotOutstanding)
-        } else {
-            Ok(Discharged::Settled)
+            // Nothing to commit, and nothing to count. Rolled back explicitly
+            // rather than by dropping the handle, so a reader does not have to
+            // know that dropping one rolls back.
+            writing.rollback().await.map_err(|_| StorageUnavailable)?;
+            return Ok(Discharged::NotOutstanding);
         }
+
+        if let Report::Reached(rooms) = report {
+            for (room, outcome) in rooms {
+                // `+ 1` ON THE STORED VALUE rather than on anything this
+                // process read, so two replicas reporting at the same moment
+                // cannot both write the same number. The row is created on
+                // first sight: a count that only existed once somebody had
+                // configured it would miss the first thing that happened.
+                let counted = match outcome {
+                    RoomOutcome::Delivered => sqlx::query(
+                        "INSERT INTO room_delivered (tenant, room, deliveries) \
+                         VALUES ($1, $2, 1) \
+                         ON CONFLICT (tenant, room) \
+                         DO UPDATE SET deliveries = room_delivered.deliveries + 1",
+                    )
+                    .bind(tenant.as_str())
+                    .bind(room.as_str()),
+                    RoomOutcome::Abandoned(why) => sqlx::query(
+                        "INSERT INTO room_abandoned (tenant, room, reason, losses) \
+                         VALUES ($1, $2, $3, 1) \
+                         ON CONFLICT (tenant, room, reason) \
+                         DO UPDATE SET losses = room_abandoned.losses + 1",
+                    )
+                    .bind(tenant.as_str())
+                    .bind(room.as_str())
+                    .bind(why.spelled()),
+                };
+
+                counted
+                    .execute(&mut *writing)
+                    .await
+                    .map_err(|_| StorageUnavailable)?;
+            }
+        }
+
+        writing.commit().await.map_err(|_| StorageUnavailable)?;
+        Ok(Discharged::Settled)
     }
 
     async fn reoffer(&self, delivery: &DeliveryId) -> Result<Reoffered, StorageUnavailable> {
@@ -318,6 +447,16 @@ impl Handover for PostgresHandover {
         // The uncollected rows and the settled ones go in the same pass
         // because they are the same rule — kept for a month from acceptance —
         // and separating them would invite the two periods to drift apart.
+        //
+        // IN A TRANSACTION SINCE BEAD gc-5px, because the count of what was
+        // dropped is now written here too. `RETURNING` closed the window
+        // between the rows going and anybody knowing which; this closes the one
+        // between knowing and having counted. If the count cannot be written
+        // the deletion does not happen either, which is what the port already
+        // promises: nothing was deleted, and the caller tries again next pass
+        // rather than reconciling a half-finished sweep.
+        let mut sweeping = self.pool.begin().await.map_err(|_| StorageUnavailable)?;
+
         let rows = sqlx::query(
             "DELETE FROM handover \
              WHERE accepted_at < to_timestamp($1::BIGINT / 1000.0) \
@@ -326,7 +465,7 @@ impl Handover for PostgresHandover {
                        reported_at IS NULL AS uncollected",
         )
         .bind(accepted_before.millis_since_epoch())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *sweeping)
         .await
         .map_err(|_| StorageUnavailable)?;
 
@@ -352,6 +491,29 @@ impl Handover for PostgresHandover {
             });
         }
 
+        // ONE STATEMENT PER TENANT RATHER THAN PER ROW, and `+ EXCLUDED.dropped`
+        // rather than `+ 1`: a month's worth of one tenant's uncollected work
+        // is deleted in a single pass, and that pass should not be as many round
+        // trips as it found rows.
+        let mut lost_per_tenant: std::collections::BTreeMap<&str, i64> =
+            std::collections::BTreeMap::new();
+        for one in &swept.uncollected {
+            *lost_per_tenant.entry(one.tenant.as_str()).or_default() += 1;
+        }
+        for (whose, how_many) in lost_per_tenant {
+            sqlx::query(
+                "INSERT INTO uncollected_dropped (tenant, dropped) VALUES ($1, $2) \
+                 ON CONFLICT (tenant) \
+                 DO UPDATE SET dropped = uncollected_dropped.dropped + EXCLUDED.dropped",
+            )
+            .bind(whose)
+            .bind(how_many)
+            .execute(&mut *sweeping)
+            .await
+            .map_err(|_| StorageUnavailable)?;
+        }
+
+        sweeping.commit().await.map_err(|_| StorageUnavailable)?;
         Ok(swept)
     }
 
@@ -1175,6 +1337,315 @@ mod tests {
                 .await
                 .expect("asked"),
             Reoffered::NotStored
+        );
+    }
+
+    #[tokio::test]
+    async fn a_count_is_in_the_database_and_not_in_the_process() {
+        // BEAD gc-5px, and the one property that bead is about. These three
+        // counts lived in process memory beside the metrics endpoint, which
+        // made them wrong in two ways nothing in the exported text admitted
+        // to: with two replicas behind a Service — the shape bead gc-f7t
+        // declared supported — a scrape reached one pod and got that pod's
+        // share under a name that reads as cluster-wide, and an ordinary apply
+        // zeroed the count of a real loss while the rows that prove it
+        // survived right here.
+        //
+        // ASSERTED AGAINST A SECOND STORE, because that is what makes the
+        // claim falsifiable. A `PostgresHandover` holds a pool and nothing
+        // else, so a second one that answers the first one's numbers can only
+        // be reading them from the database — which is at once the other
+        // replica and the restarted pod. A test that asked the same instance
+        // would pass against process memory too, and would therefore prove
+        // nothing at all.
+        let store = handover().await;
+        for (id, when) in [("d-1", 1), ("d-2", 2)] {
+            store
+                .offer(&offered(id, "wallet-lab-prod", when, vec![a_push(id)]))
+                .await
+                .expect("stored");
+        }
+
+        for (id, rooms) in [
+            (
+                "d-1",
+                vec![
+                    (
+                        domain::DestinationId::new("oncall-room").expect("an identity"),
+                        RoomOutcome::Delivered,
+                    ),
+                    (
+                        domain::DestinationId::new("quiet-room").expect("an identity"),
+                        RoomOutcome::Abandoned(DispatchFailed::Unreachable),
+                    ),
+                ],
+            ),
+            (
+                "d-2",
+                vec![(
+                    domain::DestinationId::new("oncall-room").expect("an identity"),
+                    RoomOutcome::Delivered,
+                )],
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .report(
+                        &tenant("wallet-lab-prod"),
+                        &DeliveryId::new(id).expect("an identity"),
+                        &Report::Reached(rooms),
+                        at(10),
+                    )
+                    .await
+                    .expect("asked"),
+                Discharged::Settled
+            );
+        }
+
+        let another_replica = PostgresHandover::using(store.pool_for_test().clone());
+        let counted = another_replica.counted().await.expect("asked");
+
+        assert_eq!(
+            counted
+                .delivered
+                .iter()
+                .map(|one| (one.tenant.as_str(), one.room.as_str(), one.count))
+                .collect::<Vec<_>>(),
+            vec![("wallet-lab-prod", "oncall-room", 2)],
+            "{counted:?}"
+        );
+        assert_eq!(
+            counted
+                .abandoned
+                .iter()
+                .map(|one| (
+                    one.tenant.as_str(),
+                    one.room.as_str(),
+                    one.reason.as_str(),
+                    one.count
+                ))
+                .collect::<Vec<_>>(),
+            vec![("wallet-lab-prod", "quiet-room", "unreachable", 1)],
+            "{counted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_that_arrives_twice_is_counted_once() {
+        // The API deliberately allows a second report: an agent whose reply was
+        // lost on the way back must be able to send it again, and bead gc-556
+        // settled that counting per REQUEST would turn one loss into as many as
+        // the agent had attempts to tell us about it. A number that inflates
+        // under exactly the conditions somebody is investigating is worse than
+        // no number.
+        //
+        // What keeps that true here is the transaction and the order of the two
+        // statements inside it: the counting is reached only after the UPDATE
+        // reports that it discharged a row, and `reported_at IS NULL` is what
+        // makes the second UPDATE discharge nothing.
+        let store = handover().await;
+        store
+            .offer(&offered("d-1", "wallet-lab-prod", 1, vec![a_push("x")]))
+            .await
+            .expect("stored");
+        let delivery = DeliveryId::new("d-1").expect("an identity");
+        let same_again = Report::Reached(vec![(
+            domain::DestinationId::new("oncall-room").expect("an identity"),
+            RoomOutcome::Abandoned(DispatchFailed::Rejected),
+        )]);
+
+        assert_eq!(
+            store
+                .report(&tenant("wallet-lab-prod"), &delivery, &same_again, at(2))
+                .await
+                .expect("asked"),
+            Discharged::Settled
+        );
+        assert_eq!(
+            store
+                .report(&tenant("wallet-lab-prod"), &delivery, &same_again, at(3))
+                .await
+                .expect("asked"),
+            Discharged::NotOutstanding,
+            "the second report was not refused, so this test proves nothing"
+        );
+
+        let counted = store.counted().await.expect("asked");
+        assert_eq!(
+            counted.abandoned.iter().map(|one| one.count).sum::<u64>(),
+            1,
+            "one loss was counted twice: {counted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_swept_away_before_anyone_collected_it_is_counted_against_its_tenant() {
+        // The sweep's half of bead gc-5px. This count was an `AtomicU64` in
+        // `Backlog`, read by the bare `webhook_proxy_uncollected_dropped_total`
+        // — so it had both defects at once, and the first one worse than the
+        // room counters did: both replicas run retention, so whichever wins the
+        // DELETE holds the whole number and the other reports zero.
+        //
+        // Counted in the same transaction as the deletion, so there is no
+        // window in which rows are gone and nothing knows how many — which is
+        // the same reason `RETURNING` is used to report them at all.
+        let store = handover().await;
+        for (id, whose) in [
+            ("d-1", "wallet-lab-prod"),
+            ("d-2", "wallet-lab-prod"),
+            ("d-3", "wallet-hsm-prod"),
+        ] {
+            store
+                .offer(&offered(id, whose, 1, vec![a_push(id)]))
+                .await
+                .expect("stored");
+        }
+        // One of them reported, so the sweep has a settled row to tell from an
+        // uncollected one: a settled row is not a loss and must not be counted.
+        store
+            .report(
+                &tenant("wallet-lab-prod"),
+                &DeliveryId::new("d-2").expect("an identity"),
+                &Report::RoutedToNothing,
+                at(2),
+            )
+            .await
+            .expect("reported");
+
+        let swept = store.sweep(at(3)).await.expect("swept");
+        assert_eq!(
+            swept.uncollected.len(),
+            2,
+            "the sweep deleted the wrong rows"
+        );
+
+        let counted = PostgresHandover::using(store.pool_for_test().clone())
+            .counted()
+            .await
+            .expect("asked");
+        assert_eq!(
+            counted
+                .dropped
+                .iter()
+                .map(|one| (one.tenant.as_str(), one.count))
+                .collect::<Vec<_>>(),
+            vec![("wallet-hsm-prod", 1), ("wallet-lab-prod", 1)],
+            "a settled row was counted as a loss, or a loss was not counted: {counted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_tenants_with_a_room_of_the_same_name_are_not_one_number() {
+        // MOVED HERE FROM `outcomes.rs` BY BEAD gc-5px along with the counting.
+        // A room identity is unique only within the tenant that configured it,
+        // so `oncall-room` is a different room for each of these two teams.
+        // Collapsing them would add two teams' numbers together and page the
+        // wrong one, and here the thing that keeps them apart is a primary key
+        // — which is worth asserting against the real server rather than
+        // trusting the DDL to mean what it reads as.
+        let store = handover().await;
+        for (id, whose) in [("d-1", "wallet-lab-prod"), ("d-2", "wallet-hsm-prod")] {
+            store
+                .offer(&offered(id, whose, 1, vec![a_push(id)]))
+                .await
+                .expect("stored");
+            store
+                .report(
+                    &tenant(whose),
+                    &DeliveryId::new(id).expect("an identity"),
+                    &Report::Reached(vec![(
+                        domain::DestinationId::new("oncall-room").expect("an identity"),
+                        RoomOutcome::Delivered,
+                    )]),
+                    at(2),
+                )
+                .await
+                .expect("reported");
+        }
+
+        let counted = store.counted().await.expect("asked");
+        assert_eq!(
+            counted
+                .delivered
+                .iter()
+                .map(|one| (one.tenant.as_str(), one.room.as_str(), one.count))
+                .collect::<Vec<_>>(),
+            vec![
+                ("wallet-hsm-prod", "oncall-room", 1),
+                ("wallet-lab-prod", "oncall-room", 1),
+            ],
+            "{counted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_counted_here_is_a_credential_either() {
+        // The same guarantee `nothing_stored_here_is_a_credential` keeps for
+        // `handover`, extended to the three tables bead gc-5px added, and for
+        // the same reason: bead gc-81d forbids this side holding a secret value
+        // or a secret NAME, and the way that is kept true is that there is no
+        // column one could be in. Asserted against the schema so a column added
+        // later fails this before anything writes to it.
+        //
+        // The plausible future mistake is specific: a `url` or `webhook` column
+        // beside `room`, so a dashboard could link from a failing room straight
+        // to the thing that failed. That link is exactly what a Destination
+        // being a name with no address exists to prevent.
+        let store = handover().await;
+        for (table, expected) in [
+            ("room_delivered", vec!["deliveries", "room", "tenant"]),
+            ("room_abandoned", vec!["losses", "reason", "room", "tenant"]),
+            ("uncollected_dropped", vec!["dropped", "tenant"]),
+        ] {
+            let mut columns: Vec<String> = sqlx::query(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+            )
+            .bind(table)
+            .fetch_all(store.handover.pool_for_test())
+            .await
+            .expect("asked")
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect();
+            columns.sort();
+
+            assert_eq!(
+                columns, expected,
+                "the {table} table gained or lost a column"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_sweeps_a_month_apart_add_up_rather_than_replacing_each_other() {
+        // MOVED HERE FROM `backlog.rs` BY BEAD gc-5px, where it was asserted
+        // about an `AtomicU64`. A loss that scrolled past is still a loss, so
+        // this is a running total and not a per-pass number — which is the one
+        // way `ON CONFLICT DO UPDATE` could have been written wrongly: `SET
+        // dropped = EXCLUDED.dropped` compiles, runs, and silently reports only
+        // the most recent sweep.
+        let store = handover().await;
+        for (id, when) in [("d-1", 1), ("d-2", 2)] {
+            store
+                .offer(&offered(id, "wallet-lab-prod", when, vec![a_push(id)]))
+                .await
+                .expect("stored");
+        }
+
+        assert_eq!(
+            store.sweep(at(2)).await.expect("swept").uncollected.len(),
+            1
+        );
+        assert_eq!(
+            store.sweep(at(3)).await.expect("swept").uncollected.len(),
+            1
+        );
+
+        let counted = store.counted().await.expect("asked");
+        assert_eq!(
+            counted.dropped.iter().map(|one| one.count).sum::<u64>(),
+            2,
+            "the second sweep replaced the first one's count: {counted:?}"
         );
     }
 }

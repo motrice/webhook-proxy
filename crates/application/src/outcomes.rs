@@ -1,4 +1,5 @@
-//! What each room was told, as its tenant reported it.
+//! What each room was told, as its tenant reported it, and what nobody was
+//! ever told because nobody collected it.
 //!
 //! Bead gc-556, and the thing it fixes is worth stating: an abandoned dispatch
 //! used to be visible in exactly one place — the agent's own log, in one pod,
@@ -21,195 +22,203 @@
 //! - The counter lives in the platform, so it survives an agent restart —
 //!   which is the specific failure that made the log useless: a routine apply
 //!   rolled the agent and took the only evidence of a real loss with it.
+//!
+//! AND NOT IN THIS PROCESS EITHER, SINCE BEAD gc-5px. That last sentence was
+//! true of the agent and false of the platform: these were three counters in
+//! process memory, so the apply that rolled the PROXY destroyed the same
+//! evidence one layer up, and two replicas behind a Service each held a share
+//! of numbers that read as cluster-wide. The store counts them now
+//! ([`crate::ports::Handover::counted`]) and this type holds the last answer it
+//! gave, so a scrape never touches the database — the same arrangement, and for
+//! the same reasons, as [`crate::Backlog`].
+//!
+//! THE DROPPED COUNT MOVED HERE FROM [`crate::Backlog`] in that bead, and the
+//! reason is which half of `Backlog` it belonged to. What is left there is an
+//! exception list replaced wholesale every pass: a tenant that has caught up
+//! must stop being reported. A count of Deliveries deleted uncollected is the
+//! opposite — monotone, cumulative, and now read from the same store answer as
+//! the other two. Keeping it beside the gauge would have meant one task writing
+//! two types from one answer, and a reader having to learn that `losses` meant
+//! something different in each.
 
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::ports::RoomOutcome;
+use crate::ports::{Counted, PerReason, PerRoom, PerTenant};
 
-/// Deliveries each room was told about, and the ones it was not.
+/// The store's last word on what each room was told, and what was dropped.
 ///
-/// Read by the metrics endpoint and written when a report is accepted. Keyed by
-/// the tenant AND the room, because a room identity is only unique within the
-/// tenant that configured it: two tenants may each have an `oncall-room`, and
-/// collapsing them would add two teams' numbers together.
+/// Read by the metrics endpoint and written by the task that asks the store on
+/// an interval, which is why it is shared rather than owned: a scrape must
+/// never touch the store, because a monitoring system polling every fifteen
+/// seconds would become load on the thing it is monitoring and would go quiet
+/// exactly when the database is in trouble — which is when somebody is looking.
+///
+/// So what a scrape reads is at most one interval old. That is the whole cost
+/// of these numbers being right at all, and it is a cost an operator can act on:
+/// a number that is five seconds stale and cluster-wide beats one that is
+/// current, one replica's share, and reset by the last deployment.
 #[derive(Debug, Default)]
 pub struct Outcomes {
-    /// Rooms that were told, by (tenant, room).
-    delivered: Mutex<BTreeMap<(String, String), u64>>,
-    /// Rooms that were not, by (tenant, room, reason). EVERY ONE IS A LOSS.
+    /// The last answer, whole.
     ///
-    /// The reason is part of the key rather than a separate total, because the
-    /// four are not interchangeable to whoever acts on one: a room that refused
-    /// needs a configuration change, a room that was never reached needs the
-    /// network looked at, and `Intercepted` means something answered on the
-    /// room's behalf and the room never saw it at all.
-    abandoned: Mutex<BTreeMap<(String, String, &'static str), u64>>,
+    /// ONE LOCK OVER ALL THREE COUNTS rather than one each, because they are
+    /// read together by one scrape and written together by one pass: three
+    /// locks would let a scrape land between two of them and export a
+    /// `delivered` from this pass beside an `abandoned` from the one before.
+    counted: Mutex<Counted>,
 }
 
 impl Outcomes {
-    /// Nothing counted yet.
+    /// Nothing read yet.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Records one terminal statement about one room.
+    /// The store's latest answer, in place of the one before it.
     ///
-    /// Called ONLY for a report that discharged something. A report that
-    /// arrives twice — an agent whose first reply was lost — must not count
-    /// twice, and the store is what knows the difference: it answers
-    /// `NotOutstanding` the second time.
-    pub fn reported(&self, tenant: &str, room: &str, outcome: RoomOutcome) {
-        match outcome {
-            RoomOutcome::Delivered => {
-                if let Ok(mut counted) = self.delivered.lock() {
-                    *counted
-                        .entry((tenant.to_owned(), room.to_owned()))
-                        .or_default() += 1;
-                }
-            }
-            RoomOutcome::Abandoned(why) => {
-                if let Ok(mut counted) = self.abandoned.lock() {
-                    *counted
-                        .entry((tenant.to_owned(), room.to_owned(), why.spelled()))
-                        .or_default() += 1;
-                }
-            }
+    /// REPLACED WHOLESALE rather than merged, and this is the one thing an
+    /// implementation here could get wrong: the store answers absolute totals,
+    /// so merging would add every count to itself on the second pass. It is
+    /// also what lets a key disappear — a room nobody has configured since the
+    /// counts were last trimmed stops being exported rather than standing
+    /// forever.
+    pub fn counted(&self, counted: Counted) {
+        if let Ok(mut held) = self.counted.lock() {
+            *held = counted;
         }
     }
 
     /// Every room that was told, with how many times.
     #[must_use]
-    pub fn delivered(&self) -> Vec<((String, String), u64)> {
-        self.delivered.lock().map_or_else(
-            |_| Vec::new(),
-            |counted| counted.iter().map(|(at, n)| (at.clone(), *n)).collect(),
-        )
+    pub fn delivered(&self) -> Vec<PerRoom> {
+        self.counted
+            .lock()
+            .map_or_else(|_| Vec::new(), |counted| counted.delivered.clone())
     }
 
     /// Every room that was not told, with why and how many times.
     #[must_use]
-    pub fn abandoned(&self) -> Vec<((String, String, &'static str), u64)> {
-        self.abandoned.lock().map_or_else(
-            |_| Vec::new(),
-            |counted| counted.iter().map(|at| (at.0.clone(), *at.1)).collect(),
-        )
+    pub fn abandoned(&self) -> Vec<PerReason> {
+        self.counted
+            .lock()
+            .map_or_else(|_| Vec::new(), |counted| counted.abandoned.clone())
     }
 
-    /// Every loss reported so far, across every tenant and room.
+    /// Every Delivery deleted before its tenant ever collected it, by tenant.
+    #[must_use]
+    pub fn dropped(&self) -> Vec<PerTenant> {
+        self.counted
+            .lock()
+            .map_or_else(|_| Vec::new(), |counted| counted.dropped.clone())
+    }
+
+    /// Every loss a tenant has reported, across every tenant and room.
     ///
     /// The one number an alert can be written against without knowing which
     /// rooms exist.
     #[must_use]
     pub fn losses(&self) -> u64 {
-        self.abandoned
-            .lock()
-            .map_or(0, |counted| counted.values().sum())
+        self.counted.lock().map_or(0, |counted| {
+            counted.abandoned.iter().map(|one| one.count).sum()
+        })
+    }
+
+    /// Every Delivery deleted before anybody collected it, across every tenant.
+    ///
+    /// The same kind of number as [`Self::losses`] and for the same reason, and
+    /// a loss just as much: nobody was told anything at all about these.
+    #[must_use]
+    pub fn never_collected(&self) -> u64 {
+        self.counted.lock().map_or(0, |counted| {
+            counted.dropped.iter().map(|one| one.count).sum()
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Outcomes;
-    use crate::ports::{DispatchFailed, RoomOutcome};
+    use crate::ports::{Counted, PerReason, PerRoom, PerTenant};
 
     #[test]
-    fn a_room_that_was_told_is_counted_against_its_own_tenant() {
-        // Keyed by tenant AND room, because a room identity is unique only
-        // within the tenant that configured it. Two tenants with an
-        // `oncall-room` each must not be one number.
-        let counted = Outcomes::new();
+    fn the_newest_answer_replaces_the_one_before_it_rather_than_adding_to_it() {
+        // THE PROPERTY THAT CHANGED IN BEAD gc-5px, and the one worth a test of
+        // its own, because the method it replaced did the opposite. This used to
+        // accumulate: a report arrived and the number went up by one. It now
+        // holds whatever the store last said, and the store says an absolute
+        // total — so an implementation that merged instead of replacing would
+        // double every count on the second pass, and the metric would look like
+        // traffic doubling rather than like a bug.
+        let told = Outcomes::new();
+        let answer = |delivered: u64| Counted {
+            delivered: vec![PerRoom {
+                tenant: "devsecops".to_owned(),
+                room: "oncall-room".to_owned(),
+                count: delivered,
+            }],
+            abandoned: Vec::new(),
+            dropped: Vec::new(),
+        };
 
-        counted.reported("devsecops", "oncall-room", RoomOutcome::Delivered);
-        counted.reported("devsecops", "oncall-room", RoomOutcome::Delivered);
-        counted.reported("platform", "oncall-room", RoomOutcome::Delivered);
+        told.counted(answer(7));
+        told.counted(answer(9));
 
-        let delivered = counted.delivered();
-        assert_eq!(delivered.len(), 2, "{delivered:?}");
         assert_eq!(
-            delivered
+            told.delivered()
                 .iter()
-                .find(|((tenant, _), _)| tenant == "devsecops")
-                .map(|(_, n)| *n),
-            Some(2)
+                .map(|one| one.count)
+                .collect::<Vec<_>>(),
+            vec![9],
+            "two passes were added together instead of the second replacing the first"
         );
-        assert_eq!(
-            delivered
-                .iter()
-                .find(|((tenant, _), _)| tenant == "platform")
-                .map(|(_, n)| *n),
-            Some(1)
-        );
-        assert_eq!(counted.losses(), 0, "a delivery was counted as a loss");
     }
 
     #[test]
-    fn a_loss_keeps_its_reason_rather_than_being_one_total() {
-        // The distinction an operator acts on: a room that refused needs a
-        // configuration change, a room that was never reached needs the network
-        // looked at. One `abandoned_total` would have cost exactly that.
-        let counted = Outcomes::new();
+    fn a_bare_total_is_every_rooms_number_added_up() {
+        // THE LINE AN ALERT CAN BE WRITTEN AGAINST WITHOUT KNOWING WHICH ROOMS
+        // EXIST, which is why the labelled series are not enough on their own:
+        // a rule naming a room that has not been configured yet never fires.
+        //
+        // Summed HERE and not in the store, deliberately. The store answers the
+        // labelled rows and nothing else, so there is exactly one place where
+        // the relationship between a total and its parts is decided, and it is
+        // the place with a test on it.
+        let told = Outcomes::new();
+        told.counted(Counted {
+            delivered: Vec::new(),
+            abandoned: vec![
+                PerReason {
+                    tenant: "devsecops".to_owned(),
+                    room: "oncall-room".to_owned(),
+                    reason: "timed_out".to_owned(),
+                    count: 2,
+                },
+                PerReason {
+                    tenant: "platform".to_owned(),
+                    room: "oncall-room".to_owned(),
+                    reason: "rejected".to_owned(),
+                    count: 1,
+                },
+            ],
+            dropped: vec![
+                PerTenant {
+                    tenant: "devsecops".to_owned(),
+                    count: 4,
+                },
+                PerTenant {
+                    tenant: "platform".to_owned(),
+                    count: 1,
+                },
+            ],
+        });
 
-        counted.reported(
-            "devsecops",
-            "oncall-room",
-            RoomOutcome::Abandoned(DispatchFailed::Rejected),
-        );
-        counted.reported(
-            "devsecops",
-            "oncall-room",
-            RoomOutcome::Abandoned(DispatchFailed::TimedOut),
-        );
-        counted.reported(
-            "devsecops",
-            "oncall-room",
-            RoomOutcome::Abandoned(DispatchFailed::TimedOut),
-        );
-
-        let abandoned = counted.abandoned();
-        assert_eq!(abandoned.len(), 2, "{abandoned:?}");
-        assert_eq!(
-            abandoned
-                .iter()
-                .find(|((_, _, why), _)| *why == "timed_out")
-                .map(|(_, n)| *n),
-            Some(2)
-        );
-        assert_eq!(
-            abandoned
-                .iter()
-                .find(|((_, _, why), _)| *why == "rejected")
-                .map(|(_, n)| *n),
-            Some(1)
-        );
-        // And the one number an alert can name without knowing the rooms.
-        assert_eq!(counted.losses(), 3);
-    }
-
-    #[test]
-    fn every_reason_has_a_label_of_its_own() {
-        // A fifth DispatchFailed variant would not compile against
-        // `DispatchFailed::spelled` until somebody chose its word, which is the
-        // point: these words are a published interface — a stored row, a wire
-        // format and a metric label — and a new one should be decided rather
-        // than derived.
-        let counted = Outcomes::new();
-        for why in [
-            DispatchFailed::Rejected,
-            DispatchFailed::Intercepted,
-            DispatchFailed::Unreachable,
-            DispatchFailed::TimedOut,
-        ] {
-            counted.reported("a-tenant", "a-room", RoomOutcome::Abandoned(why));
-        }
-
-        let labels: Vec<&str> = counted
-            .abandoned()
-            .iter()
-            .map(|((_, _, why), _)| *why)
-            .collect();
-        assert_eq!(labels.len(), 4, "two reasons share a label: {labels:?}");
-        assert_eq!(counted.losses(), 4);
+        assert_eq!(told.losses(), 3, "the losses of two tenants did not add up");
+        // A DIFFERENT KIND OF LOSS AND A SEPARATE NUMBER. These were never told
+        // to anybody at all — no room refused them and no network swallowed
+        // them, their tenant never came for them — so folding them into
+        // `losses` would send somebody reading a dashboard to look at a room
+        // that was working fine.
+        assert_eq!(told.never_collected(), 5);
     }
 }
