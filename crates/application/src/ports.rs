@@ -614,6 +614,108 @@ pub struct Behind {
     pub oldest: Timestamp,
 }
 
+/// Everything the store has counted, as of the moment it was asked.
+///
+/// WHY THE STORE COUNTS THESE AND NOT THE PROCESS, which is bead gc-5px and the
+/// only reason this type exists. They used to be three counters in process
+/// memory beside the metrics endpoint, which made them wrong in two ways a
+/// reader could not see. With two replicas behind a Service — the shape bead
+/// gc-f7t declared supported — a scrape reaches one pod and gets that pod's
+/// share, under names that read as cluster-wide. And an ordinary apply zeroes
+/// the count of a real loss while the rows that prove it survive in the
+/// database. That second one is the exact failure gc-556 was written against,
+/// with the word "agent" replaced by "platform".
+///
+/// So a count belongs wherever the store is, and each implementation keeps that
+/// to the extent its store can: the durable one is correct under any replica
+/// count and across a restart, and the in-memory one is per-process for the
+/// same reason everything else in it is.
+///
+/// NOT DERIVED FROM THE HANDOVER ROWS, and this is the thing a reader will
+/// wonder about, because [`Handover::behind`] derives its gauges exactly that
+/// way and the rows are right there: a report is stored, so these could be a
+/// `GROUP BY` over it. Retention deletes a settled row a month after it was
+/// accepted, so a count taken from those rows would go DOWN — and a Prometheus
+/// counter that decreases makes `increase()` nonsense over every window that
+/// spans the drop. These are counters, so they are counted and kept.
+///
+/// THE FIELD NAMES ARE THE METRIC NAMES, deliberately, because an operator
+/// reading `webhook_proxy_room_abandoned_total` in a dashboard and somebody
+/// reading this type should be looking at the same thing. The row types are
+/// named for their KEYS instead, which is the whole design content of this
+/// bead: what each count may be summed over.
+///
+/// COUNTS AND NAMES AND NOTHING ELSE. A tenant is a namespace, a room is a name
+/// its tenant chose, and a Destination is a name with no address by
+/// construction — so there is nothing here an address or a secret could be in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Counted {
+    /// Rooms that were told, with how many times.
+    pub delivered: Vec<PerRoom>,
+    /// Rooms that were not, with why. EVERY ONE IS A LOSS.
+    pub abandoned: Vec<PerReason>,
+    /// Deliveries deleted before anyone collected them. Losses as well.
+    pub dropped: Vec<PerTenant>,
+}
+
+/// A count keyed by the tenant and the room.
+///
+/// BOTH, because a room identity is unique only within the tenant that
+/// configured it: two tenants may each have an `oncall-room`, and collapsing
+/// them would add two teams' numbers together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerRoom {
+    /// Whose room it is.
+    pub tenant: String,
+    /// The name that tenant gave it.
+    pub room: String,
+    /// How many.
+    pub count: u64,
+}
+
+/// A count keyed by the tenant, the room, and the reason the tenant gave.
+///
+/// The reason is part of the key rather than a separate total, because the four
+/// are not interchangeable to whoever acts on one: a room that refused needs a
+/// configuration change, a room that was never reached needs the network looked
+/// at, and `intercepted` means something answered on the room's behalf and the
+/// room never saw it at all.
+///
+/// THE REASON IS TEXT COMING BACK where it was a [`DispatchFailed`] going in,
+/// and the asymmetry is deliberate. [`DispatchFailed::spelled`] is still the
+/// only writer and the inbound boundary refuses a spelling it does not know, so
+/// the four words are decided in one place and no fifth can be stored. What
+/// this protects against is the other direction: a build reading a row an
+/// EARLIER build wrote must not be able to fail on a spelling it no longer
+/// knows. Refusing such a row would hide a loss and an "other" bucket would
+/// absorb the disagreement and keep counting, so an unrecognised spelling
+/// arrives as itself, where somebody can see it and ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerReason {
+    /// Whose room it is.
+    pub tenant: String,
+    /// The name that tenant gave it.
+    pub room: String,
+    /// How the tenant said the attempt ended, in the tenant's own spelling.
+    pub reason: String,
+    /// How many.
+    pub count: u64,
+}
+
+/// A count keyed by the tenant alone.
+///
+/// The key of a Delivery nobody collected, and the reason it cannot be keyed by
+/// room: it never reached one, so there is no room to name. It is the third kind
+/// of loss bead gc-g9x enumerated, and the only one that happens without
+/// anybody having attempted anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerTenant {
+    /// Whose Deliveries they were.
+    pub tenant: String,
+    /// How many.
+    pub count: u64,
+}
+
 /// Whether a re-offer found a Delivery to offer again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reoffered {
@@ -791,6 +893,28 @@ pub trait Handover: Send + Sync {
     /// [`StorageUnavailable`] if the store could not be asked.
     async fn behind(&self, accepted_before: Timestamp) -> Result<Vec<Behind>, StorageUnavailable>;
 
+    /// Everything this store has counted, across every tenant.
+    ///
+    /// ASKED ON AN INTERVAL AND NEVER AT SCRAPE TIME, for the reason
+    /// [`Self::behind`] gives: a monitoring system polling every fifteen
+    /// seconds must not become load on the thing it is monitoring, and the
+    /// numbers must not go quiet exactly when the database is in trouble, which
+    /// is when somebody is looking. What a scrape reads is the last answer to
+    /// this, which makes a count at most one interval old — and that is the
+    /// whole cost of it being right at all.
+    ///
+    /// NO TENANT, like [`Self::behind`] and for the same reason: it answers an
+    /// operator's counters, and no request can reach it. Scoping it would mean
+    /// asking once per configured tenant for the same answer.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageUnavailable`] if the store could not be asked. The caller keeps
+    /// the last answer rather than publishing zeros: these are counters, and one
+    /// that fell to zero because a query failed would read as a cluster that had
+    /// lost its history.
+    async fn counted(&self) -> Result<Counted, StorageUnavailable>;
+
     /// What this tenant has not yet discharged, oldest first, at most `limit`.
     ///
     /// Oldest first because that is the order it should be collected in, and
@@ -810,6 +934,42 @@ pub trait Handover: Send + Sync {
         tenant: &TenantId,
         limit: usize,
     ) -> Result<Vec<Offered>, StorageUnavailable>;
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::DispatchFailed;
+
+    #[test]
+    fn every_reason_has_a_label_of_its_own() {
+        // MOVED HERE FROM `outcomes.rs` BY BEAD gc-5px, because that is where
+        // its subject is. It was written about the in-process counter's keys
+        // (gc-556); the counting moved to the store, but the claim was never
+        // really about counting — it is about these four words, which are a
+        // published interface: a stored row, a wire format and a metric label.
+        //
+        // A fifth `DispatchFailed` variant would not compile against `spelled`
+        // until somebody chose its word, which is the point: a new one should be
+        // decided rather than derived.
+        let labels: Vec<&str> = [
+            DispatchFailed::Rejected,
+            DispatchFailed::Intercepted,
+            DispatchFailed::Unreachable,
+            DispatchFailed::TimedOut,
+        ]
+        .iter()
+        .map(|why| why.spelled())
+        .collect();
+
+        let mut distinct = labels.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            labels.len(),
+            "two reasons share a label, so a dashboard would add them together: {labels:?}"
+        );
+    }
 }
 
 #[cfg(test)]

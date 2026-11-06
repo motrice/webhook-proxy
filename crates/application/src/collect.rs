@@ -140,8 +140,8 @@ mod tests {
 
     use super::{Collect, Refused};
     use crate::ports::{
-        Behind, Claimed, Clock, Discharged, Handover, Offered, Reoffered, Report, RoomOutcome,
-        StorageUnavailable, Swept, TenantId,
+        Behind, Claimed, Clock, Counted, Discharged, Handover, Offered, Reoffered, Report,
+        RoomOutcome, StorageUnavailable, Swept, TenantId,
     };
 
     fn at(millis: i64) -> Timestamp {
@@ -205,6 +205,10 @@ mod tests {
 
     #[async_trait]
     impl Handover for Owed {
+        async fn counted(&self) -> Result<Counted, StorageUnavailable> {
+            Ok(Counted::default())
+        }
+
         async fn offer(&self, offered: &Offered) -> Result<(), StorageUnavailable> {
             self.held
                 .lock()

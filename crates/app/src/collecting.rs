@@ -44,7 +44,7 @@
 use std::sync::Arc;
 
 use application::ports::{Clock, DispatchFailed, Handover, Report, RoomOutcome, TenantId};
-use application::{Collect, NotCollected, Outcomes};
+use application::{Collect, NotCollected};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -77,12 +77,6 @@ pub struct Collecting {
     handover: Arc<dyn Handover>,
     clock: Arc<dyn Clock>,
     tenants: Arc<std::collections::BTreeSet<TenantId>>,
-    /// What each room was told, shared with the scrape endpoint.
-    ///
-    /// Here rather than in the agent because an agent has no scrape endpoint
-    /// and bead gc-72e forbade it one; the outcomes already cross the wire in
-    /// every report (bead gc-556).
-    outcomes: Arc<Outcomes>,
 }
 
 impl Collecting {
@@ -92,13 +86,11 @@ impl Collecting {
         handover: Arc<dyn Handover>,
         clock: Arc<dyn Clock>,
         tenants: std::collections::BTreeSet<TenantId>,
-        outcomes: Arc<Outcomes>,
     ) -> Self {
         Self {
             handover,
             clock,
             tenants: Arc::new(tenants),
-            outcomes,
         }
     }
 
@@ -287,22 +279,16 @@ async fn report(
         .report(&caller, &delivery, &report)
         .await
     {
-        Ok(application::ports::Discharged::Settled) => {
-            // COUNTED HERE AND NOWHERE EARLIER, because this is the only place
-            // that knows the report discharged something. A report that arrives
-            // twice — an agent whose first reply was lost, which this API
-            // explicitly allows — answers `NotOutstanding` below and must not
-            // count again, or a single loss becomes as many losses as the agent
-            // had attempts to tell us about it (bead gc-556).
-            if let Report::Reached(rooms) = &report {
-                for (room, outcome) in rooms {
-                    collecting
-                        .outcomes
-                        .reported(caller.as_str(), room.as_str(), *outcome);
-                }
-            }
-            (StatusCode::NO_CONTENT, Json(Value::Null))
-        }
+        // NOTHING IS COUNTED HERE ANY MORE, and the absence is the point of
+        // bead gc-5px. This handler used to add one to an in-process counter on
+        // its way out, which made the number one replica's share and made a
+        // routine apply erase it. The store counts it inside the same
+        // transaction that discharges the row, so the no-double-count rule this
+        // code was carefully written for — an agent re-sending a report whose
+        // reply was lost gets `NotOutstanding` below and must not count twice —
+        // is now kept by the `reported_at IS NULL` guard that decides the
+        // answer, rather than by this `match` arm remembering to.
+        Ok(application::ports::Discharged::Settled) => (StatusCode::NO_CONTENT, Json(Value::Null)),
         // One answer for three cases — another tenant's Delivery, one already
         // reported, one that never existed — because a caller that could tell
         // them apart could ask after another tenant's Delivery identities and
